@@ -63,7 +63,7 @@ async def _on_text(client: Client, message: Message):
     if user and user.is_banned:
         return
     uid = message.from_user.id
-    kb = await forcesub.ensure_joined(client, uid)
+    kb = await forcesub.ensure_joined(client, uid, chat_id=message.chat.id)
     if kb:
         await message.reply_text(
             "📢 <b>Join our channels to use the bot</b>",

@@ -111,7 +111,8 @@ async def _deliver(client: Client, query):
     if await is_banned(uid):
         await query.message.reply_text("⛔ You are banned.")
         return
-    kb = await forcesub.ensure_joined(client, uid)
+    kb = await forcesub.ensure_joined(client, uid,
+                                      chat_id=query.message.chat.id)
     if kb:
         await query.message.reply_text(
             "📢 <b>Join our channels to download</b>", reply_markup=kb)
@@ -179,7 +180,8 @@ async def _spell(client: Client, query):
 
 
 async def _fsub_retry(client: Client, query):
-    kb = await forcesub.ensure_joined(client, query.from_user.id)
+    kb = await forcesub.ensure_joined(client, query.from_user.id,
+                                      chat_id=query.message.chat.id)
     if kb:
         await query.answer("❌ You haven't joined all channels yet.",
                            show_alert=True)

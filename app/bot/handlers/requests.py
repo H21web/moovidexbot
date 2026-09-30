@@ -20,7 +20,8 @@ async def _request(client: Client, message: Message):
     user = await track_user(message)
     if user and user.is_banned:
         return
-    kb = await forcesub.ensure_joined(client, message.from_user.id)
+    kb = await forcesub.ensure_joined(client, message.from_user.id,
+                                      chat_id=message.chat.id)
     if kb:
         await message.reply_text("📢 <b>Join our channels first</b>",
                                  reply_markup=kb)

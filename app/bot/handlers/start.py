@@ -48,7 +48,8 @@ async def _start(client: Client, message: Message):
         return
     asyncio.create_task(log_event("start", user_id=message.from_user.id,
                                   chat_id=message.chat.id))
-    kb = await forcesub.ensure_joined(client, message.from_user.id)
+    kb = await forcesub.ensure_joined(client, message.from_user.id,
+                                      chat_id=message.chat.id)
     if kb:
         await message.reply_text(
             "📢 <b>Please join our channels first</b>, then tap Try Again.",

@@ -71,8 +71,11 @@ async def effective_autodelete(chat_id: int) -> int:
         async with factory() as s:
             g = (await s.execute(
                 select(Group).where(Group.id == chat_id))).scalar_one_or_none()
-            if g and g.settings.get("autodelete_seconds"):
-                return int(g.settings["autodelete_seconds"])
+            if g is not None:
+                raw = (g.settings or {}).get("autodelete_seconds")
+                if raw is not None:
+                    # Explicit group value (including 0 = Off) wins.
+                    return int(raw)
     except Exception as exc:
         log.debug("effective_autodelete failed: %s", exc)
     return int(await rt.aget_setting("AUTO_DELETE_SECONDS") or 0)
