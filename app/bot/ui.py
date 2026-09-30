@@ -128,6 +128,36 @@ def index_stop_kb(job_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def ix_setup_cancel_kb() -> InlineKeyboardMarkup:
+    """Cancel button shown during interactive /index setup."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data="ixs:cancel"),
+    ]])
+
+
+def ix_setup_kb(pending: dict) -> InlineKeyboardMarkup:
+    """Options panel for interactive /index setup."""
+    opts = pending["opts"]
+
+    def fmt(key: str, off: str = "off") -> str:
+        v = opts.get(key) or 0
+        return f"{v:,}" if v else off
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start indexing",
+                              callback_data="ixs:start")],
+        [InlineKeyboardButton(f"⏭ Skip: {fmt('skip')}",
+                              callback_data="ixs:opt:skip"),
+         InlineKeyboardButton(f"🔢 Limit: {fmt('limit')}",
+                              callback_data="ixs:opt:limit")],
+        [InlineKeyboardButton(f"⬇️ From msg: {fmt('from_id', '—')}",
+                              callback_data="ixs:opt:from_id"),
+         InlineKeyboardButton(f"⬆️ To msg: {fmt('to_id', '—')}",
+                              callback_data="ixs:opt:to_id")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="ixs:cancel")],
+    ])
+
+
 def start_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🔍 Search movies",

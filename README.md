@@ -28,7 +28,10 @@ No `TG_SESSION`, no second login, no forwarding.
 - 🎥 Web player (`/watch`) + `/dl` with **HTTP Range seeking — any file size**
   (Bot API downloads cap at 20 MB; MTProto has no cap; CDN-hosted files
   are followed, AES-decrypted and hash-verified)
-- 📥 `/index` — historical backfill at ~100+ files/sec on the bot client:
+- 📥 `/index` — historical backfill at ~100+ files/sec on the bot client.
+  Send `/index` with no arguments for the interactive button setup
+  (forward a message from the channel, or send its link / @username / id,
+  then tweak skip/limit/from/to and hit Start), or one-shot:
   `/index @chan`, `skip=`, `from=`, `to=`, `limit=`, `/index cancel`,
   live progress bar, 🛑 inline stop button, PostgreSQL checkpoints (resume)
 - 🤖 Live auto-index — new posts in channels where the bot is admin

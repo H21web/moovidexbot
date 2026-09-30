@@ -18,7 +18,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from pyrogram import Client
+from pyrogram import Client, raw, utils
 from pyrogram.errors import FloodWait
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -142,31 +142,97 @@ def format_progress(scanned: int, indexed: int, skipped: int, errors: int,
     )
 
 
-async def resolve_channel(client: Client, ref: str):
-    """Resolve @username / invite link / id, with dialog scan for privates.
+def normalize_channel_ref(text: str) -> str | int:
+    """Turn user input into something get_chat/resolve understands.
+
+    Accepts: t.me/c/12345/67 links, t.me/+invite / t.me/joinchat links,
+    t.me/username links, @username, -10012345 ids, 10012345 or 12345 ids.
+    Returns an int id when the input is numeric, else the original string.
+    """
+    text = (text or "").strip()
+    m = re.search(r"t\.me/c/(\d+)", text)
+    if m:
+        return int("-100" + m.group(1))
+    m = re.search(r"t\.me/(?:\+|joinchat/)([\w-]+)", text)
+    if m:
+        return text  # invite link — get_chat handles via CheckChatInvite
+    m = re.search(r"t\.me/([A-Za-z][\w]{3,})", text)
+    if m:
+        return "@" + m.group(1)
+    s = text.strip()
+    if re.fullmatch(r"-?\d{5,}", s):
+        num = int(s)
+        if num > 0:
+            digits = str(num)
+            if digits.startswith("100"):
+                digits = digits[3:]
+            num = -int("100" + digits)
+        return num
+    return text
+
+
+async def resolve_channel(client: Client, ref: str | int):
+    """Resolve @username / invite link / id — including private channels.
 
     Works on the bot client — the bot must be admin/member of the
     channel for private-channel resolution to succeed.
+
+    Strategy (in order):
+    1. ``get_chat`` with a numeric id as int — Pyrogram then resolves via
+       ``channels.GetChannels`` with access_hash=0, which Telegram honors
+       for channels the bot can access. (Passing the id as a *string*
+       misfires: resolve_peer treats digit-strings as phone numbers.)
+    2. Dialog scan (title / username / id match).
+    3. Raw ``channels.GetChannels`` with access_hash=0 + fetch_peers.
     """
-    ref = ref.strip()
+    if isinstance(ref, str):
+        ref = normalize_channel_ref(ref)
+    last_exc: Exception | None = None
+
+    # 1) direct get_chat — int ids take the GetChannels path
     try:
         return await client.get_chat(ref)
-    except Exception:
-        pass
-    # Private channel: scan dialogs for a title/id match.
-    needle = ref.lstrip("@").lower()
+    except Exception as exc:
+        last_exc = exc
+        log.warning("get_chat(%r) failed: %r", ref, exc)
+
+    # 2) dialog scan for private channels
     try:
+        target_id = ref if isinstance(ref, int) else None
+        needle = "" if isinstance(ref, int) else str(ref).lstrip("@").lower()
         async for dialog in client.get_dialogs():
             chat = dialog.chat
             if chat is None:
                 continue
-            title = (getattr(chat, "title", "") or "").lower()
-            uname = (getattr(chat, "username", "") or "").lower()
-            if needle in (uname, title) or ref == str(chat.id):
+            if target_id is not None and chat.id == target_id:
                 return chat
+            if needle:
+                title = (getattr(chat, "title", "") or "").lower()
+                uname = (getattr(chat, "username", "") or "").lower()
+                if needle in (uname, title):
+                    return chat
     except Exception as exc:
-        log.debug("dialog scan failed: %s", exc)
-    raise ValueError(f"channel not found / bot is not admin: {ref}")
+        last_exc = exc
+        log.warning("dialog scan failed for %r: %r", ref, exc)
+
+    # 3) raw GetChannels with access_hash=0 (bot is admin/member)
+    if isinstance(ref, int):
+        try:
+            raw_id = utils.get_channel_id(ref)
+            r = await client.invoke(
+                raw.functions.channels.GetChannels(
+                    id=[raw.types.InputChannel(
+                        channel_id=raw_id, access_hash=0)]
+                )
+            )
+            await client.fetch_peers(r.chats)
+            return await client.get_chat(ref)
+        except Exception as exc:
+            last_exc = exc
+            log.warning("raw GetChannels failed for %r: %r", ref, exc)
+
+    raise ValueError(
+        f"channel not found / bot is not admin: {ref} ({last_exc})")
 
 
 async def run_index_job(job: state.IndexJob, client: Client,

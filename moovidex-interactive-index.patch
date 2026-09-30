@@ -1,0 +1,574 @@
+diff --git a/README.md b/README.md
+index 4382a3e..4b9dc72 100644
+--- a/README.md
++++ b/README.md
+@@ -28,7 +28,10 @@ No `TG_SESSION`, no second login, no forwarding.
+ - 🎥 Web player (`/watch`) + `/dl` with **HTTP Range seeking — any file size**
+   (Bot API downloads cap at 20 MB; MTProto has no cap; CDN-hosted files
+   are followed, AES-decrypted and hash-verified)
+-- 📥 `/index` — historical backfill at ~100+ files/sec on the bot client:
++- 📥 `/index` — historical backfill at ~100+ files/sec on the bot client.
++  Send `/index` with no arguments for the interactive button setup
++  (forward a message from the channel, or send its link / @username / id,
++  then tweak skip/limit/from/to and hit Start), or one-shot:
+   `/index @chan`, `skip=`, `from=`, `to=`, `limit=`, `/index cancel`,
+   live progress bar, 🛑 inline stop button, PostgreSQL checkpoints (resume)
+ - 🤖 Live auto-index — new posts in channels where the bot is admin
+diff --git a/app/bot/handlers/index.py b/app/bot/handlers/index.py
+index da2e070..459ab60 100644
+--- a/app/bot/handlers/index.py
++++ b/app/bot/handlers/index.py
+@@ -8,17 +8,24 @@ SINGLE bot client over MTProto:
+   no user session needed).
+ * new posts in channels where the bot is admin are auto-indexed live
+   as they arrive.
++
++Two ways to index history:
++
++1. Interactive: send ``/index`` with no arguments and follow the
++   buttons — forward a message from the channel, or send its link /
++   @username / id, then tweak skip/limit/from/to and hit Start.
++2. Direct: ``/index @channel skip=1000 limit=5000`` (one shot).
+ """
+ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import re
+ import uuid
+ from datetime import datetime, timezone
+ 
+-from pyrogram import Client, filters
+-from pyrogram.enums import ParseMode
+-from pyrogram.types import Message
++from pyrogram import Client, StopPropagation, filters
++from pyrogram.types import CallbackQuery, Message
+ from sqlalchemy import select
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+ 
+@@ -30,7 +37,9 @@ from app.db import get_session_factory
+ from app.indexer import (
+     extract_record,
+     format_progress,
++    normalize_channel_ref,
+     parse_index_args,
++    resolve_channel,
+     run_index_job,
+ )
+ from app.models import BackfillJob, File
+@@ -39,6 +48,7 @@ log = logging.getLogger(__name__)
+ 
+ USAGE = (
+     "📥 <b>/index usage</b>\n\n"
++    "<code>/index</code> — interactive setup (buttons)\n"
+     "<code>/index @channel</code> — index full history\n"
+     "<code>/index @channel skip=1000</code>\n"
+     "<code>/index @channel from=5000 to=90000</code>\n"
+@@ -48,41 +58,57 @@ USAGE = (
+     "New posts in admin channels are auto-indexed live."
+ )
+ 
++SETUP_PROMPT = (
++    "📥 <b>New index</b>\n\n"
++    "Send me the channel — any of these:\n"
++    "• Forward a message <b>from the channel</b>\n"
++    "• Channel link: <code>t.me/c/...</code> or <code>t.me/+...</code>\n"
++    "• <code>@username</code> or <code>-100...</code> ID\n\n"
++    "Direct form still works too:\n"
++    "<code>/index @channel limit=5000</code>"
++)
+ 
+-@admin_only
+-async def _index(client: Client, message: Message):
+-    args = parse_index_args(message.text or "")
++OPT_LABELS = {
++    "skip": "Skip — messages to skip from the newest",
++    "limit": "Limit — max files to index",
++    "from_id": "From message ID",
++    "to_id": "To message ID",
++}
+ 
+-    # --- /index cancel ---
+-    if (message.text or "").strip().lower() in ("/index cancel", "/cancel"):
+-        stopped = 0
+-        for job_id, job in list(state._index_jobs.items()):
+-            if job.task and not job.task.done():
+-                job.cancel_event.set()
+-                stopped += 1
+-        await message.reply_text(
+-            f"🛑 Stopped {stopped} job(s)." if stopped else "No running jobs.")
+-        return
+ 
+-    if not args["channel"]:
+-        # show active job or usage
+-        for job in state._index_jobs.values():
+-            if job.task and not job.task.done():
+-                await message.reply_text(
+-                    f"📥 Indexing <b>{job.channel_ref}</b>…\n"
+-                    f"Use <code>/index cancel</code> to stop.")
+-                return
+-        await message.reply_text(USAGE)
+-        return
++def extract_channel_ref(message: Message):
++    """Channel ref from a forwarded message, else the message text/caption."""
++    fwd = message.forward_from_chat
++    if fwd is not None:
++        return fwd.id
++    text = (message.text or message.caption or "").strip()
++    return text or None
+ 
+-    channel_ref = args["channel"]
+-    # one job per channel at a time
+-    for job in state._index_jobs.values():
+-        if (job.channel_ref == channel_ref and job.task
+-                and not job.task.done()):
+-            await message.reply_text("⚠️ Already indexing this channel.")
+-            return
+ 
++def _setup_text(pending: dict) -> str:
++    opts = pending["opts"]
++
++    def fmt(v: int, off: str = "—") -> str:
++        return f"{v:,}" if v else off
++
++    return (
++        f"📁 <b>{pending['title']}</b>\n"
++        f"<code>{pending['chat_id']}</code>\n\n"
++        "⚙️ <b>Options</b> — tap a button to change:\n"
++        f"⏭ Skip: <b>{fmt(opts['skip'], '0')}</b> · "
++        f"🔢 Limit: <b>{fmt(opts['limit'])}</b>\n"
++        f"⬇️ From msg: <b>{fmt(opts['from_id'])}</b> · "
++        f"⬆️ To msg: <b>{fmt(opts['to_id'])}</b>\n\n"
++        "Tap <b>▶️ Start indexing</b> when ready.\n"
++        "⚠️ The bot must be <b>admin</b> in the channel."
++    )
++
++
++async def _start_job(client: Client, progress_msg: Message,
++                     channel_ref: str, skip: int = 0,
++                     from_id: int = 0, to_id: int = 0,
++                     limit: int = 0) -> None:
++    """Create the DB job row and launch run_index_job as a task."""
+     factory = get_session_factory(settings.DATABASE_URL)
+     async with factory() as session:
+         db_job = BackfillJob(
+@@ -95,30 +121,210 @@ async def _index(client: Client, message: Message):
+         await session.commit()
+         job_id = db_job.id
+ 
+-    prog = await message.reply_text(
++    await progress_msg.edit_text(
+         f"📥 <i>Starting index of {channel_ref}…</i>\n"
+         f"<i>Bot must be admin in the channel.</i>",
+         reply_markup=ui.index_stop_kb(job_id))
+ 
+     async def on_progress(text: str):
+         try:
+-            await prog.edit_text(text, reply_markup=ui.index_stop_kb(job_id))
++            await progress_msg.edit_text(
++                text, reply_markup=ui.index_stop_kb(job_id))
+         except Exception:
+             pass
+ 
+     job = state.IndexJob(job_id=job_id, channel_ref=channel_ref,
+-                         progress_msg=prog)
++                         progress_msg=progress_msg)
+     state.job_register(job)
+     # NOTE: `client` here IS the bot client — it reads channel history
+     # itself via MTProto (works when the bot is admin of the channel).
+     job.task = asyncio.create_task(run_index_job(
+         job, client, channel_ref,
+-        skip=args["skip"], from_id=args["from_id"],
+-        to_id=args["to_id"], limit=args["limit"],
++        skip=skip, from_id=from_id, to_id=to_id, limit=limit,
+         on_progress=on_progress))
+     log.info("started index job %d for %s", job_id, channel_ref)
+ 
+ 
++def _already_indexing(channel_ref: str) -> bool:
++    norm = str(normalize_channel_ref(channel_ref))
++    for job in state._index_jobs.values():
++        if not job.task or job.task.done():
++            continue
++        if (job.channel_ref == channel_ref
++                or str(normalize_channel_ref(job.channel_ref)) == norm):
++            return True
++    return False
++
++
++@admin_only
++async def _index(client: Client, message: Message):
++    uid = message.from_user.id
++    text = (message.text or "").strip()
++
++    # --- /index cancel ---
++    if text.lower() in ("/index cancel", "/cancel"):
++        state.pending_clear(uid)
++        stopped = 0
++        for job_id, job in list(state._index_jobs.items()):
++            if job.task and not job.task.done():
++                job.cancel_event.set()
++                stopped += 1
++        await message.reply_text(
++            f"🛑 Stopped {stopped} job(s)." if stopped else "No running jobs.")
++        return
++
++    args = parse_index_args(text)
++
++    # --- interactive setup when no channel given ---
++    if not args["channel"]:
++        state.pending_set(uid, {"step": "channel"})
++        await message.reply_text(SETUP_PROMPT,
++                                 reply_markup=ui.ix_setup_cancel_kb())
++        return
++
++    # --- direct one-shot form: /index @channel skip=.. ... ---
++    channel_ref = args["channel"]
++    if _already_indexing(channel_ref):
++        await message.reply_text("⚠️ Already indexing this channel.")
++        return
++
++    prog = await message.reply_text("📥 <i>Starting…</i>")
++    await _start_job(client, prog, channel_ref,
++                     skip=args["skip"], from_id=args["from_id"],
++                     to_id=args["to_id"], limit=args["limit"])
++
++
++async def _index_interactive(client: Client, message: Message):
++    """Catch follow-up messages while an admin is in /index setup.
++
++    Runs in group -1 so it sees the message before the search handler;
++    raises StopPropagation only when it actually consumes the message.
++    """
++    uid = message.from_user.id if message.from_user else None
++    if not uid or not settings.is_admin(uid):
++        return
++    pending = state.pending_get(uid)
++    if not pending:
++        return
++    text = (message.text or message.caption or "").strip()
++    if text.startswith("/"):
++        return  # let command handlers process it
++
++    step = pending.get("step")
++
++    # --- step 1: waiting for the channel ---
++    if step == "channel":
++        ref = extract_channel_ref(message)
++        if ref is None:
++            await message.reply_text(
++                "⚠️ I couldn't read a channel from that.\n"
++                "Forward a message <b>from the channel</b>, or send its "
++                "link / @username / ID.",
++                reply_markup=ui.ix_setup_cancel_kb())
++            raise StopPropagation
++        resolving = await message.reply_text("🔍 Resolving channel…")
++        try:
++            chat = await resolve_channel(client, ref)
++        except ValueError as exc:
++            await resolving.edit_text(
++                f"❌ {exc}\n\n"
++                "Make sure the bot is <b>admin</b> in the channel, "
++                "then send the channel again.",
++                reply_markup=ui.ix_setup_cancel_kb())
++            raise StopPropagation
++        try:
++            await resolving.delete()
++        except Exception:
++            pass
++        pending.update({
++            "step": "options",
++            "chat_id": chat.id,
++            "title": getattr(chat, "title", None) or str(chat.id),
++            "opts": {"skip": 0, "from_id": 0, "to_id": 0, "limit": 0},
++        })
++        panel = await message.reply_text(
++            _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
++        pending["panel_msg_id"] = panel.id
++        raise StopPropagation
++
++    # --- step 2: waiting for a number for one option ---
++    if step and step.startswith("opt:"):
++        key = step[4:]
++        digits = re.sub(r"[^\d]", "", text)
++        if not digits and text != "0":
++            await message.reply_text(
++                "⚠️ Send a plain number (0 = off).",
++                reply_markup=ui.ix_setup_cancel_kb())
++            raise StopPropagation
++        pending["opts"][key] = int(digits or 0)
++        pending["step"] = "options"
++        try:
++            await client.edit_message_text(
++                message.chat.id, pending["panel_msg_id"],
++                _setup_text(pending),
++                reply_markup=ui.ix_setup_kb(pending))
++        except Exception:
++            pass
++        await message.reply_text(
++            f"✅ {OPT_LABELS.get(key, key)} = "
++            f"<b>{pending['opts'][key]:,}</b>")
++        raise StopPropagation
++
++
++async def _ixs(client: Client, query: CallbackQuery):
++    """Setup-panel buttons: ixs:cancel | ixs:start | ixs:opt:<key>."""
++    uid = query.from_user.id
++    if not settings.is_admin(uid):
++        await query.answer("⛔ Admins only.", show_alert=True)
++        return
++    data = query.data or ""
++    pending = state.pending_get(uid)
++
++    if data == "ixs:cancel":
++        state.pending_clear(uid)
++        await query.message.edit_text("❌ Index setup cancelled.")
++        await query.answer()
++        return
++
++    if pending is None:
++        await query.answer("Session expired — send /index again.",
++                           show_alert=True)
++        return
++
++    if data == "ixs:start":
++        opts = pending["opts"]
++        chat_id = pending["chat_id"]
++        if _already_indexing(str(chat_id)):
++            await query.answer("⚠️ Already indexing this channel.",
++                               show_alert=True)
++            return
++        state.pending_clear(uid)
++        await query.answer("Starting…")
++        try:
++            await query.message.edit_reply_markup(None)
++        except Exception:
++            pass
++        prog = await query.message.reply_text("📥 <i>Starting…</i>")
++        await _start_job(client, prog, str(chat_id),
++                         skip=opts["skip"], from_id=opts["from_id"],
++                         to_id=opts["to_id"], limit=opts["limit"])
++        return
++
++    if data.startswith("ixs:opt:"):
++        key = data.split(":")[2]
++        if key not in OPT_LABELS:
++            await query.answer()
++            return
++        pending["step"] = f"opt:{key}"
++        await query.message.reply_text(
++            f"✏️ Send a number for <b>{OPT_LABELS[key]}</b>\n"
++            "(0 = off):")
++        await query.answer()
++        return
++
++    await query.answer()
++
++
+ async def _auto_index(client: Client, message: Message):
+     """Index new channel posts live (bot receives these as admin)."""
+     try:
+@@ -136,5 +342,8 @@ async def _auto_index(client: Client, message: Message):
+ 
+ 
+ def register(bot: Client) -> None:
++    # interactive setup interceptor runs first; consumes only setup msgs
++    bot.on_message(filters.private, group=-1)(_index_interactive)
+     bot.on_message(filters.private & filters.command("index"))(_index)
++    bot.on_callback_query(filters.regex(r"^ixs:"))(_ixs)
+     bot.on_message(filters.channel)(_auto_index)
+diff --git a/app/bot/ui.py b/app/bot/ui.py
+index 1202146..86d064f 100644
+--- a/app/bot/ui.py
++++ b/app/bot/ui.py
+@@ -128,6 +128,36 @@ def index_stop_kb(job_id: int) -> InlineKeyboardMarkup:
+     ]])
+ 
+ 
++def ix_setup_cancel_kb() -> InlineKeyboardMarkup:
++    """Cancel button shown during interactive /index setup."""
++    return InlineKeyboardMarkup([[
++        InlineKeyboardButton("❌ Cancel", callback_data="ixs:cancel"),
++    ]])
++
++
++def ix_setup_kb(pending: dict) -> InlineKeyboardMarkup:
++    """Options panel for interactive /index setup."""
++    opts = pending["opts"]
++
++    def fmt(key: str, off: str = "off") -> str:
++        v = opts.get(key) or 0
++        return f"{v:,}" if v else off
++
++    return InlineKeyboardMarkup([
++        [InlineKeyboardButton("▶️ Start indexing",
++                              callback_data="ixs:start")],
++        [InlineKeyboardButton(f"⏭ Skip: {fmt('skip')}",
++                              callback_data="ixs:opt:skip"),
++         InlineKeyboardButton(f"🔢 Limit: {fmt('limit')}",
++                              callback_data="ixs:opt:limit")],
++        [InlineKeyboardButton(f"⬇️ From msg: {fmt('from_id', '—')}",
++                              callback_data="ixs:opt:from_id"),
++         InlineKeyboardButton(f"⬆️ To msg: {fmt('to_id', '—')}",
++                              callback_data="ixs:opt:to_id")],
++        [InlineKeyboardButton("❌ Cancel", callback_data="ixs:cancel")],
++    ])
++
++
+ def start_kb() -> InlineKeyboardMarkup:
+     rows = [
+         [InlineKeyboardButton("🔍 Search movies",
+diff --git a/app/indexer.py b/app/indexer.py
+index ed4cc16..525e552 100644
+--- a/app/indexer.py
++++ b/app/indexer.py
+@@ -18,7 +18,7 @@ import re
+ import time
+ from datetime import datetime, timezone
+ 
+-from pyrogram import Client
++from pyrogram import Client, raw, utils
+ from pyrogram.errors import FloodWait
+ from sqlalchemy import select, update
+ from sqlalchemy.dialects.postgresql import insert as pg_insert
+@@ -142,31 +142,97 @@ def format_progress(scanned: int, indexed: int, skipped: int, errors: int,
+     )
+ 
+ 
+-async def resolve_channel(client: Client, ref: str):
+-    """Resolve @username / invite link / id, with dialog scan for privates.
++def normalize_channel_ref(text: str) -> str | int:
++    """Turn user input into something get_chat/resolve understands.
++
++    Accepts: t.me/c/12345/67 links, t.me/+invite / t.me/joinchat links,
++    t.me/username links, @username, -10012345 ids, 10012345 or 12345 ids.
++    Returns an int id when the input is numeric, else the original string.
++    """
++    text = (text or "").strip()
++    m = re.search(r"t\.me/c/(\d+)", text)
++    if m:
++        return int("-100" + m.group(1))
++    m = re.search(r"t\.me/(?:\+|joinchat/)([\w-]+)", text)
++    if m:
++        return text  # invite link — get_chat handles via CheckChatInvite
++    m = re.search(r"t\.me/([A-Za-z][\w]{3,})", text)
++    if m:
++        return "@" + m.group(1)
++    s = text.strip()
++    if re.fullmatch(r"-?\d{5,}", s):
++        num = int(s)
++        if num > 0:
++            digits = str(num)
++            if digits.startswith("100"):
++                digits = digits[3:]
++            num = -int("100" + digits)
++        return num
++    return text
++
++
++async def resolve_channel(client: Client, ref: str | int):
++    """Resolve @username / invite link / id — including private channels.
+ 
+     Works on the bot client — the bot must be admin/member of the
+     channel for private-channel resolution to succeed.
++
++    Strategy (in order):
++    1. ``get_chat`` with a numeric id as int — Pyrogram then resolves via
++       ``channels.GetChannels`` with access_hash=0, which Telegram honors
++       for channels the bot can access. (Passing the id as a *string*
++       misfires: resolve_peer treats digit-strings as phone numbers.)
++    2. Dialog scan (title / username / id match).
++    3. Raw ``channels.GetChannels`` with access_hash=0 + fetch_peers.
+     """
+-    ref = ref.strip()
++    if isinstance(ref, str):
++        ref = normalize_channel_ref(ref)
++    last_exc: Exception | None = None
++
++    # 1) direct get_chat — int ids take the GetChannels path
+     try:
+         return await client.get_chat(ref)
+-    except Exception:
+-        pass
+-    # Private channel: scan dialogs for a title/id match.
+-    needle = ref.lstrip("@").lower()
++    except Exception as exc:
++        last_exc = exc
++        log.warning("get_chat(%r) failed: %r", ref, exc)
++
++    # 2) dialog scan for private channels
+     try:
++        target_id = ref if isinstance(ref, int) else None
++        needle = "" if isinstance(ref, int) else str(ref).lstrip("@").lower()
+         async for dialog in client.get_dialogs():
+             chat = dialog.chat
+             if chat is None:
+                 continue
+-            title = (getattr(chat, "title", "") or "").lower()
+-            uname = (getattr(chat, "username", "") or "").lower()
+-            if needle in (uname, title) or ref == str(chat.id):
++            if target_id is not None and chat.id == target_id:
+                 return chat
++            if needle:
++                title = (getattr(chat, "title", "") or "").lower()
++                uname = (getattr(chat, "username", "") or "").lower()
++                if needle in (uname, title):
++                    return chat
+     except Exception as exc:
+-        log.debug("dialog scan failed: %s", exc)
+-    raise ValueError(f"channel not found / bot is not admin: {ref}")
++        last_exc = exc
++        log.warning("dialog scan failed for %r: %r", ref, exc)
++
++    # 3) raw GetChannels with access_hash=0 (bot is admin/member)
++    if isinstance(ref, int):
++        try:
++            raw_id = utils.get_channel_id(ref)
++            r = await client.invoke(
++                raw.functions.channels.GetChannels(
++                    id=[raw.types.InputChannel(
++                        channel_id=raw_id, access_hash=0)]
++                )
++            )
++            await client.fetch_peers(r.chats)
++            return await client.get_chat(ref)
++        except Exception as exc:
++            last_exc = exc
++            log.warning("raw GetChannels failed for %r: %r", ref, exc)
++
++    raise ValueError(
++        f"channel not found / bot is not admin: {ref} ({last_exc})")
+ 
+ 
+ async def run_index_job(job: state.IndexJob, client: Client,
+diff --git a/app/state.py b/app/state.py
+index dc8a8dc..d348fbc 100644
+--- a/app/state.py
++++ b/app/state.py
+@@ -52,6 +52,26 @@ def results_get(token: str) -> dict | None:
+     return None
+ 
+ 
++# --- interactive /index setup sessions: admin user id -> dict ---
++# {"step": "channel" | "options" | "opt:<key>",
++#  "chat_id": int, "title": str,
++#  "opts": {"skip": int, "from_id": int, "to_id": int, "limit": int},
++#  "panel_msg_id": int | None}
++_index_pending: dict[int, dict] = {}
++
++
++def pending_get(user_id: int) -> dict | None:
++    return _index_pending.get(user_id)
++
++
++def pending_set(user_id: int, data: dict) -> None:
++    _index_pending[user_id] = data
++
++
++def pending_clear(user_id: int) -> None:
++    _index_pending.pop(user_id, None)
++
++
+ # --- /index job registry (shared between engine and handlers) ---
+ @dataclass
+ class IndexJob:

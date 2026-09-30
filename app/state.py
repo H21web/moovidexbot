@@ -52,6 +52,26 @@ def results_get(token: str) -> dict | None:
     return None
 
 
+# --- interactive /index setup sessions: admin user id -> dict ---
+# {"step": "channel" | "options" | "opt:<key>",
+#  "chat_id": int, "title": str,
+#  "opts": {"skip": int, "from_id": int, "to_id": int, "limit": int},
+#  "panel_msg_id": int | None}
+_index_pending: dict[int, dict] = {}
+
+
+def pending_get(user_id: int) -> dict | None:
+    return _index_pending.get(user_id)
+
+
+def pending_set(user_id: int, data: dict) -> None:
+    _index_pending[user_id] = data
+
+
+def pending_clear(user_id: int) -> None:
+    _index_pending.pop(user_id, None)
+
+
 # --- /index job registry (shared between engine and handlers) ---
 @dataclass
 class IndexJob:
