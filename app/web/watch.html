@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ — Moovidex</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0b0e14; color: #e8ecf1; font-family: system-ui, sans-serif;
+         min-height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 14px 16px; border-bottom: 1px solid #1c2330; }
+  header h1 { font-size: 16px; font-weight: 600; white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; }
+  header p { font-size: 12px; color: #8b95a7; margin-top: 4px; }
+  main { flex: 1; display: flex; flex-direction: column; padding: 16px;
+         gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; }
+  .player-wrap { background: #000; border-radius: 12px; overflow: hidden;
+                 aspect-ratio: 16/9; display: flex; align-items: center;
+                 justify-content: center; }
+  video { width: 100%; height: 100%; background: #000; }
+  .notice { background: #1a2230; border: 1px solid #2a3a55; border-radius: 12px;
+            padding: 14px; font-size: 14px; line-height: 1.5; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btn { flex: 1 1 140px; text-align: center; padding: 12px; border-radius: 10px;
+         font-size: 15px; font-weight: 600; text-decoration: none; border: none;
+         cursor: pointer; }
+  .btn-primary { background: #2aabee; color: #fff; }
+  .btn-ghost { background: #1a2230; color: #e8ecf1; border: 1px solid #2a3a55; }
+  .progress { height: 8px; background: #1a2230; border-radius: 4px;
+              overflow: hidden; display: none; }
+  .progress > div { height: 100%; width: 0%; background: #2aabee; }
+  .pct { font-size: 13px; color: #8b95a7; display: none; }
+  footer { text-align: center; padding: 12px; font-size: 12px; color: #5b6577; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">__TITLE__</h1>
+  <p id="meta"></p>
+</header>
+<main>
+  <div class="player-wrap" id="playerWrap">
+    <video id="player" controls playsinline preload="metadata" style="display:none">
+      <source id="src" src="__DL_URL__" type="video/mp4">
+    </video>
+    <div class="notice" id="cantPlay" style="display:none">
+      ⚠️ Your browser can't play this format directly.<br>
+      Use an external player or download it below.
+    </div>
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-primary" id="dlBtn">⬇️ Download</button>
+    <button class="btn btn-ghost" id="copyBtn">🔗 Copy link</button>
+  </div>
+  <div class="progress" id="prog"><div id="bar"></div></div>
+  <div class="pct" id="pct"></div>
+  <div class="btn-row" id="extRow" style="display:none">
+    <a class="btn btn-ghost" id="mxBtn" href="#">▶️ MX Player</a>
+    <a class="btn btn-ghost" id="vlcBtn" href="#">▶️ VLC</a>
+  </div>
+</main>
+<footer>Moovidex • streamed via MTProto</footer>
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { try { tg.expand(); tg.ready(); } catch (e) {} }
+  var PLAYABLE = "__PLAYABLE__" === "true";
+  var DL_URL = "__DL_URL__";
+  var SIZE = parseInt("__SIZE__", 10) || 0;
+  var title = document.getElementById('title').textContent;
+
+  function fmtSize(n) {
+    if (!n) return '';
+    var u = ['B','KB','MB','GB','TB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(1) + ' ' + u[i];
+  }
+  document.getElementById('meta').textContent = fmtSize(SIZE);
+
+  var player = document.getElementById('player');
+  if (PLAYABLE) {
+    player.style.display = 'block';
+  } else {
+    document.getElementById('cantPlay').style.display = 'block';
+  }
+
+  // External players (Android intents)
+  var isAndroid = /android/i.test(navigator.userAgent);
+  if (isAndroid) {
+    document.getElementById('extRow').style.display = 'flex';
+    var enc = encodeURIComponent(DL_URL);
+    var encTitle = encodeURIComponent(title);
+    document.getElementById('mxBtn').href =
+      'intent:' + DL_URL + '#Intent;package=com.mxtech.videoplayer.ad;type=video/*;S.title=' + encTitle + ';end';
+    document.getElementById('vlcBtn').href =
+      'intent:' + DL_URL + '#Intent;package=org.videolan.vlc;type=video/*;S.title=' + encTitle + ';end';
+  }
+
+  document.getElementById('copyBtn').onclick = function () {
+    (navigator.clipboard ? navigator.clipboard.writeText(DL_URL)
+                        : Promise.reject()).then(
+      function () { flash('🔗 Link copied'); },
+      function () { prompt('Copy link:', DL_URL); });
+  };
+
+  // Download: stream straight to disk (no RAM blowup for big files).
+  // Primary: File System Access API -> pipe the fetch body into a file
+  // handle. Fallback: plain navigation, the browser streams to disk itself.
+  document.getElementById('dlBtn').onclick = async function () {
+    var prog = document.getElementById('prog'),
+        bar = document.getElementById('bar'),
+        pct = document.getElementById('pct');
+    prog.style.display = 'block'; pct.style.display = 'block';
+
+    function showProgress(received) {
+      if (SIZE) {
+        var p = Math.min(100, received / SIZE * 100);
+        bar.style.width = p + '%';
+        pct.textContent = p.toFixed(1) + '% • ' + fmtSize(received) + ' / ' + fmtSize(SIZE);
+      } else { pct.textContent = fmtSize(received); }
+    }
+
+    // Plain-browser fallback: let it download natively (streams to disk).
+    function nativeDownload() {
+      var a = document.createElement('a');
+      a.href = DL_URL;
+      a.download = title;
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { a.remove(); }, 4000);
+      pct.textContent = '⬇️ Download started in browser…';
+    }
+
+    try {
+      if (!window.showSaveFilePicker) { nativeDownload(); return; }
+      var handle = await window.showSaveFilePicker({ suggestedName: title });
+      var writable = await handle.createWritable();
+      var res = await fetch(DL_URL);
+      if (!res.ok || !res.body) throw new Error('download failed');
+      var reader = res.body.getReader(), received = 0;
+      for (;;) {
+        var r = await reader.read();
+        if (r.done) break;
+        await writable.write(r.value);
+        received += r.value.length;
+        showProgress(received);
+      }
+      await writable.close();
+      flash('✅ Download complete');
+    } catch (e) {
+      // User cancelled the picker, or streaming failed -> native fallback.
+      try { nativeDownload(); } catch (e2) { window.location.href = DL_URL; }
+    }
+  };
+
+  function flash(msg) {
+    if (tg && tg.showPopup) { try { tg.showPopup({ message: msg }); return; } catch (e) {} }
+    pct.style.display = 'block'; pct.textContent = msg;
+  }
+})();
+</script>
+</body>
+</html>
