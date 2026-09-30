@@ -8,7 +8,9 @@ Speed: ~100+ files/sec (metadata only — nothing is downloaded).
 
 Features: live progress UI, skip=/from=/to=/limit=, /index cancel +
 inline stop button, PostgreSQL checkpoints (resume after restart),
-duplicate-safe (``ON CONFLICT DO NOTHING`` on file_id).
+duplicate-safe (``ON CONFLICT DO NOTHING`` on file_id and on
+(file_name, file_size) — reposts get fresh file_ids, so name+size is the
+real duplicate key; duplicates count into "skipped").
 """
 from __future__ import annotations
 
@@ -87,14 +89,17 @@ def extract_record(msg, channel_id: int) -> dict | None:
 
 
 async def _bulk_insert(rows: list[dict]) -> int:
-    """Insert rows, ignoring duplicates. Returns inserted count."""
+    """Insert rows, ignoring duplicates (file_id OR name+size).
+
+    Returns inserted count — the rest were duplicates.
+    """
     if not rows:
         return 0
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as session:
-        stmt = pg_insert(File).values(rows).on_conflict_do_nothing(
-            index_elements=["file_id"]
-        )
+        # no index_elements: ANY unique violation (file_id or the
+        # (file_name, file_size) constraint) skips the row
+        stmt = pg_insert(File).values(rows).on_conflict_do_nothing()
         result = await session.execute(stmt)
         await session.commit()
         return result.rowcount or 0
@@ -263,10 +268,12 @@ async def run_index_job(job: state.IndexJob, client: Client,
                 log.debug("progress edit failed: %s", exc)
 
     async def flush():
-        nonlocal indexed, batch
+        nonlocal indexed, skipped, batch
         if batch:
             try:
-                indexed += await _bulk_insert(batch)
+                inserted = await _bulk_insert(batch)
+                indexed += inserted
+                skipped += len(batch) - inserted  # duplicates
             except Exception as exc:
                 log.warning("bulk insert failed (%d rows): %s", len(batch), exc)
                 errors += len(batch)

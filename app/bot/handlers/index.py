@@ -333,8 +333,7 @@ async def _auto_index(client: Client, message: Message):
             return
         factory = get_session_factory(settings.DATABASE_URL)
         async with factory() as session:
-            stmt = pg_insert(File).values(rec).on_conflict_do_nothing(
-                index_elements=["file_id"])
+            stmt = pg_insert(File).values(rec).on_conflict_do_nothing()
             await session.execute(stmt)
             await session.commit()
     except Exception as exc:

@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -28,6 +29,13 @@ class File(Base):
     """One indexed Telegram file. file_id is the MTProto file_id string."""
 
     __tablename__ = "files"
+
+    # Same filename + same size = same file (reposts get new file_ids,
+    # so file_id alone can't catch them). DB-wide dedup.
+    __table_args__ = (
+        UniqueConstraint("file_name", "file_size",
+                         name="uq_files_name_size"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     file_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
