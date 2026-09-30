@@ -226,7 +226,7 @@ async def run_index_job(job: state.IndexJob, client: Client,
         await edit_progress(force=True)
 
         n = 0
-        async for msg in client.get_chat_history(chat.id, offset_id=offset_id or None):
+        async for msg in client.get_chat_history(chat.id, offset_id=offset_id):
             if job.cancel_event.is_set():
                 break
             if not msg or msg.id in seen_in_run:
