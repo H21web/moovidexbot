@@ -3,9 +3,11 @@
 Both historical backfill (``/index``) and live auto-index run on the
 SINGLE bot client over MTProto:
 
-* bots CAN read channel history via ``messages.getHistory`` — the bot
-  must be **admin** in the channel (same as Tech VJ-style bots;
-  no user session needed).
+* bots can NOT use ``messages.getHistory`` — so history is walked with
+  ``channels.GetMessages`` in ID batches (bot-allowed). The end of
+  history is bootstrapped from a message the admin forwards (or a post
+  link), the same trick DreamX-family bots use. The bot must be
+  **admin** in the channel; no user session needed.
 * new posts in channels where the bot is admin are auto-indexed live
   as they arrive.
 
@@ -14,7 +16,8 @@ Two ways to index history:
 1. Interactive: send ``/index`` with no arguments and follow the
    buttons — forward a message from the channel, or send its link /
    @username / id, then tweak skip/limit/from/to and hit Start.
-2. Direct: ``/index @channel skip=1000 limit=5000`` (one shot).
+2. Direct: ``/index @channel`` — resolves the channel, then asks for
+   one forwarded message / post link to bootstrap the latest message id.
 """
 from __future__ import annotations
 
@@ -49,7 +52,8 @@ log = logging.getLogger(__name__)
 USAGE = (
     "📥 <b>/index usage</b>\n\n"
     "<code>/index</code> — interactive setup (buttons)\n"
-    "<code>/index @channel</code> — index full history\n"
+    "<code>/index @channel</code> — resolve channel, then forward a\n"
+    "message / post link to bootstrap the latest msg id\n"
     "<code>/index @channel skip=1000</code>\n"
     "<code>/index @channel from=5000 to=90000</code>\n"
     "<code>/index @channel limit=5000</code>\n"
@@ -76,13 +80,29 @@ OPT_LABELS = {
 }
 
 
-def extract_channel_ref(message: Message):
-    """Channel ref from a forwarded message, else the message text/caption."""
+# t.me/c/<cid>/<mid> and t.me/<username>/<mid> post links
+POST_LINK_RE = re.compile(r"t\.me/(?:c/(\d+)|([A-Za-z0-9_]+))/(\d+)")
+
+
+def extract_bootstrap(message: Message):
+    """(channel ref, latest message id) from a forwarded msg or post link.
+
+    The message id bootstraps the end of history (DreamX-style): bots
+    can't list history, they can only fetch known IDs, so the admin
+    supplies the newest one by forwarding any message / post link.
+    Returns (ref, 0) when no message id could be read.
+    """
     fwd = message.forward_from_chat
     if fwd is not None:
-        return fwd.id
+        return fwd.id, message.forward_from_message_id or 0
     text = (message.text or message.caption or "").strip()
-    return text or None
+    m = POST_LINK_RE.search(text)
+    if m:
+        mid = int(m.group(3))
+        if m.group(1):  # t.me/c/<cid>/<mid>
+            return int("-100" + m.group(1)), mid
+        return "@" + m.group(2), mid
+    return (text or None), 0
 
 
 def _setup_text(pending: dict) -> str:
@@ -91,9 +111,13 @@ def _setup_text(pending: dict) -> str:
     def fmt(v: int, off: str = "—") -> str:
         return f"{v:,}" if v else off
 
+    latest = pending.get("last_msg_id") or 0
+    latest_line = (f"📍 Latest msg: <b>{latest:,}</b>\n\n"
+                   if latest else "")
     return (
         f"📁 <b>{pending['title']}</b>\n"
         f"<code>{pending['chat_id']}</code>\n\n"
+        f"{latest_line}"
         "⚙️ <b>Options</b> — tap a button to change:\n"
         f"⏭ Skip: <b>{fmt(opts['skip'], '0')}</b> · "
         f"🔢 Limit: <b>{fmt(opts['limit'])}</b>\n"
@@ -107,7 +131,7 @@ def _setup_text(pending: dict) -> str:
 async def _start_job(client: Client, progress_msg: Message,
                      channel_ref: str, skip: int = 0,
                      from_id: int = 0, to_id: int = 0,
-                     limit: int = 0) -> None:
+                     limit: int = 0, last_msg_id: int = 0) -> None:
     """Create the DB job row and launch run_index_job as a task."""
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as session:
@@ -136,12 +160,13 @@ async def _start_job(client: Client, progress_msg: Message,
     job = state.IndexJob(job_id=job_id, channel_ref=channel_ref,
                          progress_msg=progress_msg)
     state.job_register(job)
-    # NOTE: `client` here IS the bot client — it reads channel history
-    # itself via MTProto (works when the bot is admin of the channel).
+    # NOTE: `client` here IS the bot client — it fetches channel
+    # messages by ID via channels.GetMessages (bot-allowed). The bot must
+    # be admin in the channel. `last_msg_id` bootstraps the end of history.
     job.task = asyncio.create_task(run_index_job(
         job, client, channel_ref,
         skip=skip, from_id=from_id, to_id=to_id, limit=limit,
-        on_progress=on_progress))
+        last_msg_id=last_msg_id, on_progress=on_progress))
     log.info("started index job %d for %s", job_id, channel_ref)
 
 
@@ -182,16 +207,36 @@ async def _index(client: Client, message: Message):
                                  reply_markup=ui.ix_setup_cancel_kb())
         return
 
-    # --- direct one-shot form: /index @channel skip=.. ... ---
+    # --- direct form: /index @channel ... -> resolve, then bootstrap ---
     channel_ref = args["channel"]
     if _already_indexing(channel_ref):
         await message.reply_text("⚠️ Already indexing this channel.")
         return
-
-    prog = await message.reply_text("📥 <i>Starting…</i>")
-    await _start_job(client, prog, channel_ref,
-                     skip=args["skip"], from_id=args["from_id"],
-                     to_id=args["to_id"], limit=args["limit"])
+    resolving = await message.reply_text("🔍 Resolving channel…")
+    try:
+        chat = await resolve_channel(client, channel_ref)
+    except ValueError as exc:
+        await resolving.edit_text(f"❌ {exc}")
+        return
+    try:
+        await resolving.delete()
+    except Exception:
+        pass
+    title = getattr(chat, "title", None) or str(chat.id)
+    state.pending_set(uid, {
+        "step": "bootstrap",
+        "chat_id": chat.id,
+        "title": title,
+        "opts": {"skip": args["skip"], "from_id": args["from_id"],
+                 "to_id": args["to_id"], "limit": args["limit"]},
+    })
+    await message.reply_text(
+        f"📁 <b>{title}</b> resolved.\n\n"
+        "📍 One more thing: forward <b>any one message</b> from that "
+        "channel here (or send a post link like "
+        "<code>t.me/c/123/456</code>) — I need the latest message id "
+        "to know where history ends.",
+        reply_markup=ui.ix_setup_cancel_kb())
 
 
 async def _index_interactive(client: Client, message: Message):
@@ -214,7 +259,7 @@ async def _index_interactive(client: Client, message: Message):
 
     # --- step 1: waiting for the channel ---
     if step == "channel":
-        ref = extract_channel_ref(message)
+        ref, last_msg_id = extract_bootstrap(message)
         if ref is None:
             await message.reply_text(
                 "⚠️ I couldn't read a channel from that.\n"
@@ -236,16 +281,47 @@ async def _index_interactive(client: Client, message: Message):
             await resolving.delete()
         except Exception:
             pass
+        title = getattr(chat, "title", None) or str(chat.id)
         pending.update({
-            "step": "options",
             "chat_id": chat.id,
-            "title": getattr(chat, "title", None) or str(chat.id),
+            "title": title,
             "opts": {"skip": 0, "from_id": 0, "to_id": 0, "limit": 0},
         })
+        if not last_msg_id:
+            # Bare @username/ID: channel known, but we still need the
+            # latest message id — ask for one forwarded message / post link.
+            pending["step"] = "bootstrap"
+            await message.reply_text(
+                f"📁 <b>{title}</b> resolved.\n\n"
+                "📍 Now forward <b>any one message</b> from that "
+                "channel here (or send a post link like "
+                "<code>t.me/c/123/456</code>) — I need the latest message "
+                "id to know where history ends.",
+                reply_markup=ui.ix_setup_cancel_kb())
+            raise StopPropagation
+        pending.update({"step": "options", "last_msg_id": last_msg_id})
         panel = await message.reply_text(
             _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
         pending["panel_msg_id"] = panel.id
         raise StopPropagation
+
+    # --- step 1b: waiting for a forwarded message / post link ---
+    if step == "bootstrap":
+        _ref, last_msg_id = extract_bootstrap(message)
+        if not last_msg_id:
+            await message.reply_text(
+                "⚠️ That had no message id. Forward <b>any one "
+                "message</b> from the channel, or send a post link "
+                "(<code>t.me/.../&lt;msg_id&gt;</code>).",
+                reply_markup=ui.ix_setup_cancel_kb())
+            raise StopPropagation
+        pending["last_msg_id"] = last_msg_id
+        pending["step"] = "options"
+        panel = await message.reply_text(
+            _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
+        pending["panel_msg_id"] = panel.id
+        raise StopPropagation
+
 
     # --- step 2: waiting for a number for one option ---
     if step and step.startswith("opt:"):
@@ -294,6 +370,7 @@ async def _ixs(client: Client, query: CallbackQuery):
     if data == "ixs:start":
         opts = pending["opts"]
         chat_id = pending["chat_id"]
+        last_msg_id = pending.get("last_msg_id", 0)
         if _already_indexing(str(chat_id)):
             await query.answer("⚠️ Already indexing this channel.",
                                show_alert=True)
@@ -307,7 +384,8 @@ async def _ixs(client: Client, query: CallbackQuery):
         prog = await query.message.reply_text("📥 <i>Starting…</i>")
         await _start_job(client, prog, str(chat_id),
                          skip=opts["skip"], from_id=opts["from_id"],
-                         to_id=opts["to_id"], limit=opts["limit"])
+                         to_id=opts["to_id"], limit=opts["limit"],
+                         last_msg_id=last_msg_id)
         return
 
     if data.startswith("ixs:opt:"):

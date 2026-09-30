@@ -1,8 +1,10 @@
 """Historical /index engine — pure MTProto, single bot client.
 
-The BOT client reads channel history directly via MTProto
-(``messages.getHistory``) — this works when the bot is **admin** of the
-channel, exactly like Tech VJ-style bots. No user session needed.
+The BOT client fetches channel messages by ID batches via
+``channels.GetMessages`` (bot-allowed) — NOT ``messages.getHistory``
+(which Telegram blocks for bots). The end of history is bootstrapped
+from a message the admin forwards (or a post link), the same trick
+DreamX-family bots use. No user session needed.
 
 Speed: ~100+ files/sec (metadata only — nothing is downloaded).
 
@@ -130,15 +132,19 @@ async def _checkpoint(job_id: int, scanned: int, indexed: int,
 
 
 def format_progress(scanned: int, indexed: int, skipped: int, errors: int,
-                    elapsed: float, channel: str, done: bool = False) -> str:
+                    elapsed: float, channel: str, done: bool = False,
+                    pos: int = 0, total: int = 0) -> str:
     rate = scanned / elapsed if elapsed > 0 else 0.0
     mins, secs = divmod(int(elapsed), 60)
     pct_bar = "▰" * 10 if done else "▰" * min(10, int(rate / 10))
     bar = (pct_bar + "▱" * (10 - len(pct_bar))) if not done else "▰" * 10
     head = "✅ Indexing complete" if done else "📥 Indexing"
+    where = (f"📍 Message <b>{pos:,}</b> / {total:,}\n"
+             if total and not done else "")
     return (
         f"{head} {channel}\n"
         f"{bar}\n\n"
+        f"{where}"
         f"📦 Indexed: <b>{indexed:,}</b>\n"
         f"🔍 Scanned: <b>{scanned:,}</b>\n"
         f"⏭️ Skipped: <b>{skipped:,}</b>\n"
@@ -240,18 +246,28 @@ async def resolve_channel(client: Client, ref: str | int):
         f"channel not found / bot is not admin: {ref} ({last_exc})")
 
 
+# IDs fetched per channels.GetMessages call (DreamX-family bots use 200).
+FETCH_BATCH = 200
+
+
 async def run_index_job(job: state.IndexJob, client: Client,
                        channel_ref: str, skip: int = 0,
                        from_id: int = 0, to_id: int = 0,
-                       limit: int = 0,
+                       limit: int = 0, last_msg_id: int = 0,
                        on_progress=None) -> None:
-    """Walk channel history and index files. Runs as an asyncio task."""
+    """Walk channel messages by ID batches and index files.
+
+    Runs as an asyncio task. Uses channels.GetMessages in ID batches
+    (bot-allowed) instead of messages.GetHistory (blocked for bots).
+    ``last_msg_id`` bootstraps the end of history — taken from a message
+    the admin forwarded (or a post link), the same trick DreamX-family
+    bots use. Resume continues from the stored ``offset_id``.
+    """
     job_id = job.job_id
     t0 = time.time()
     scanned = indexed = skipped = errors = 0
     offset_id = 0
     last_edit = 0.0
-    seen_in_run: set[int] = set()
     batch: list[dict] = []
     channel_label = channel_ref
 
@@ -263,7 +279,8 @@ async def run_index_job(job: state.IndexJob, client: Client,
             try:
                 await on_progress(format_progress(
                     scanned, indexed, skipped, errors,
-                    now - t0, channel_label))
+                    now - t0, channel_label,
+                    pos=offset_id, total=end_id))
             except Exception as exc:
                 log.debug("progress edit failed: %s", exc)
 
@@ -294,45 +311,85 @@ async def run_index_job(job: state.IndexJob, client: Client,
             scanned, indexed = row.total_scanned, row.total_indexed
             skipped, errors = row.total_skipped, row.total_errors
 
+        # End bound: bootstrapped from the forwarded message / post link
+        # (bots can't list history, so the admin supplies the latest id).
+        end_id = to_id or last_msg_id
+        if to_id and last_msg_id:
+            end_id = min(to_id, last_msg_id)
+        if not end_id:
+            raise RuntimeError(
+                "cannot determine the latest message id — forward a message "
+                "from the channel or send a post link")
+        start_id = max(from_id or 1, offset_id + 1)
+        if start_id > end_id:
+            await _checkpoint(job_id, scanned, indexed, skipped, errors,
+                              offset_id, status="done")
+            if on_progress:
+                try:
+                    await on_progress(
+                        "✅ Nothing new to index — already reached message "
+                        f"<b>{end_id:,}</b>.")
+                except Exception:
+                    pass
+            log.info("index job %d: nothing to do (start %d > end %d)",
+                     job_id, start_id, end_id)
+            return
+
         await _checkpoint(job_id, scanned, indexed, skipped, errors,
                           offset_id, status="running")
         await edit_progress(force=True)
 
         n = 0
-        async for msg in client.get_chat_history(chat.id, offset_id=offset_id):
+        cur = start_id
+        while cur <= end_id:
             if job.cancel_event.is_set():
-                break
-            if not msg or msg.id in seen_in_run:
-                continue
-            seen_in_run.add(msg.id)
-            n += 1
-            if n <= skip:
-                continue
-            if from_id and msg.id < from_id:
-                continue
-            if to_id and msg.id > to_id:
                 break
             if limit and scanned >= limit:
                 break
-
-            offset_id = msg.id
-            scanned += 1
+            ids = list(range(cur, min(cur + FETCH_BATCH, end_id + 1)))
             try:
-                rec = extract_record(msg, channel_id)
-                if rec is None:
-                    skipped += 1
-                else:
-                    batch.append(rec)
-                    if len(batch) >= settings.INDEX_BATCH_SIZE:
-                        await flush()
+                msgs = await client.get_messages(channel_id, ids)
+            except FloodWait as exc:
+                log.info("index job %d: floodwait %ss on get_messages",
+                         job_id, exc.value)
+                await asyncio.sleep(exc.value + 1)
+                continue
             except Exception as exc:
-                log.debug("extract failed for msg %d: %s", msg.id, exc)
-                errors += 1
-
-            if scanned % CHECKPOINT_EVERY == 0:
-                await flush()
+                log.warning("get_messages failed for %d ids: %s",
+                            len(ids), exc)
+                errors += len(ids)
+                scanned += len(ids)
+                cur = ids[-1] + 1
+                offset_id = ids[-1]
                 await _checkpoint(job_id, scanned, indexed, skipped,
                                   errors, offset_id)
+                continue
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+            for msg in msgs:
+                if job.cancel_event.is_set():
+                    break
+                n += 1
+                if n <= skip:
+                    continue
+                if limit and scanned >= limit:
+                    break
+                scanned += 1
+                try:
+                    rec = extract_record(msg, channel_id)
+                    if rec is None:
+                        skipped += 1  # deleted, non-media, or duplicate
+                    else:
+                        batch.append(rec)
+                except Exception as exc:
+                    log.debug("extract failed: %s", exc)
+                    errors += 1
+
+            await flush()
+            cur = ids[-1] + 1
+            offset_id = ids[-1]
+            await _checkpoint(job_id, scanned, indexed, skipped,
+                              errors, offset_id)
             await edit_progress()
 
         await flush()

@@ -15,10 +15,13 @@ Telegram  ◄──MTProto──►  Bot client (bot token) — ONE client, ever
                              • historical /index backfill (~100+/sec)
 ```
 
-**One client is enough.** The bot reads channel history itself via
-`messages.getHistory` — this works when the bot is **admin** of the
-channel (same as Tech VJ-style bots; verified from their source).
-No `TG_SESSION`, no second login, no forwarding.
+**One client is enough — and bot-only.** Telegram blocks bots from
+`messages.getHistory` (`[400 BOT_METHOD_INVALID]`, proven on a live
+Render run), so history is walked by **message ID**: the admin forwards
+any channel message (or a post link) to bootstrap the latest message id,
+and the bot fetches IDs in batches of 200 via `channels.GetMessages`
+(the bot-allowed call DreamX-family bots use). No `TG_SESSION`, no user
+login, no forwarding. The bot must be **admin** in the channel.
 
 ## Features
 
