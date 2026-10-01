@@ -74,7 +74,7 @@ SETUP_PROMPT = (
 )
 
 OPT_LABELS = {
-    "skip": "Skip — messages to skip from the newest",
+    "skip": "Skip — oldest messages to skip",
     "limit": "Limit — max files to index",
     "from_id": "From message ID",
     "to_id": "To message ID",
