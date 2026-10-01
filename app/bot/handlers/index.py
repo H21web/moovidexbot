@@ -249,6 +249,7 @@ async def _index_interactive(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else None
     if not uid or not settings.is_admin(uid):
         return
+    text = (message.text or message.caption or "").strip()
     pending = await state.pending_get(uid)
     if not pending:
         # Diagnostic: the classic symptom of a lost session is a number
@@ -259,7 +260,6 @@ async def _index_interactive(client: Client, message: Message):
                 "(is migration 0004 applied? is only ONE bot instance "
                 "running?)", text, uid)
         return
-    text = (message.text or message.caption or "").strip()
     if text.startswith("/"):
         return  # let command handlers process it
 
