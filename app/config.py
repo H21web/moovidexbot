@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""         # empty = AI features disabled gracefully
     AI_MODEL: str = "llama-3.3-70b-versatile"
     AI_PARSE_MODEL: str = "llama-3.1-8b-instant"  # fast model for v7 query parsing
+    # If the primary model is unknown to Groq for this key (404
+    # model_not_found), groq_complete() walks this list in order.
+    AI_FALLBACK_MODELS: str = ("llama-3.1-8b-instant,openai/gpt-oss-20b,"
+                               "openai/gpt-oss-120b,qwen/qwen3.6-27b")
     WEBSEARCH_API_URL: str = "https://moovidex.alwaysdata.net"  # web search API for ai_web_answer
     # Max AI actions per user per day (one AI search/chat ≈ 2 Groq calls).
     AI_DAILY_QUOTA: int = 20

@@ -292,6 +292,11 @@ async def v8_search(user_id: int, q: str) -> dict:
     items = sort_best_first(items)
 
     files = _query_season_episode(parsed, items)
+    # v8.1: the most-downloaded file wins best pick (when any downloads
+    # exist); otherwise the current best-logic order stands.
+    top_dl = max(files, key=lambda f: f.get("downloads") or 0, default=None)
+    if top_dl and (top_dl.get("downloads") or 0) > 0:
+        files = [top_dl] + [f for f in files if f.get("id") != top_dl.get("id")]
     best = files[0]
 
     meta = await enrich_mod.enrich_title(title or q, parsed.get("year"),

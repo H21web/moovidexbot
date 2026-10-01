@@ -51,6 +51,11 @@ class File(Base):
     title_key: Mapped[str | None] = mapped_column(Text, index=True)
     views: Mapped[int | None] = mapped_column(Integer)
     forwards: Mapped[int | None] = mapped_column(Integer)
+    # v8.1: how many times the bot actually delivered this file
+    # (bot PM deliveries + explicit ⬇ Download link hits). Drives the
+    # "most downloaded = best pick" rule.
+    downloads: Mapped[int] = mapped_column(Integer, nullable=False,
+                                          server_default="0", default=0)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

@@ -181,55 +181,80 @@ async def quota_use(user_id: int) -> None:
 
 # ------------------------------------------------------------------ groq
 
+def _candidate_models(explicit: str | None) -> list[str]:
+    """Primary model first, then the fallback list (deduped, in order)."""
+    models: list[str] = []
+    for m in [explicit or settings.AI_MODEL,
+              *((settings.AI_FALLBACK_MODELS or "").split(","))]:
+        m = (m or "").strip()
+        if m and m not in models:
+            models.append(m)
+    return models
+
+
+def _is_model_not_found(exc: httpx.HTTPStatusError) -> bool:
+    """True when Groq says the model id is unknown for this key."""
+    if exc.response.status_code != 404:
+        return False
+    try:
+        return (exc.response.json().get("error", {}).get("code")
+                == "model_not_found")
+    except Exception:
+        return True  # a 404 on this route is almost always the model
+
+
 async def groq_complete(system: str, user: str,
                         max_tokens: int = 512,
                         json_mode: bool = False,
                         model: str | None = None) -> str | None:
-    """One Groq chat call. Returns the text or None on any failure."""
+    """One Groq chat call. Returns the text or None on any failure.
+
+    Walks the model cascade on ``model_not_found`` — a key that lost
+    access to one model usually still serves another. Auth, rate-limit
+    and network errors stop the walk (retrying those is pointless).
+    """
     if not is_configured():
         return None
-    payload: dict = {
-        "model": model or settings.AI_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.7,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    try:
-        resp = await _get_client().post("/v1/chat/completions", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return (data["choices"][0]["message"]["content"] or "").strip() or None
-    except httpx.HTTPStatusError as exc:
-        # Log Groq's own error body — it names the real cause
-        # (model_not_found, invalid key, rate limit...).
-        body = ""
+    tried: list[str] = []
+    for m in _candidate_models(model):
+        payload: dict = {
+            "model": m,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         try:
-            body = (exc.response.text or "")[:300]
-        except Exception:
-            pass
-        log.warning("groq call failed: %s | groq says: %s", exc, body)
-        # 404 from Groq's OpenAI-compatible route almost always means the
-        # model id is unknown there — retry once with the fast fallback.
-        if (exc.response.status_code == 404
-                and (model or settings.AI_MODEL) != settings.AI_PARSE_MODEL):
+            resp = await _get_client().post("/v1/chat/completions",
+                                            json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if m != (model or settings.AI_MODEL):
+                log.info("groq serving via fallback model %s", m)
+            return ((data["choices"][0]["message"]["content"] or "")
+                    .strip() or None)
+        except httpx.HTTPStatusError as exc:
+            # Log Groq's own error body — it names the real cause.
+            body = ""
             try:
-                payload["model"] = settings.AI_PARSE_MODEL
-                resp = await _get_client().post("/v1/chat/completions",
-                                               json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                return (data["choices"][0]["message"]["content"] or "").strip() or None
-            except Exception as exc2:  # noqa: BLE001
-                log.warning("groq fallback model also failed: %s", exc2)
-        return None
-    except Exception as exc:  # noqa: BLE001 - AI must never break the bot
-        log.warning("groq call failed: %s", exc)
-        return None
+                body = (exc.response.text or "")[:300]
+            except Exception:
+                pass
+            log.warning("groq call failed (model %s): %s | groq says: %s",
+                        m, exc, body)
+            if not _is_model_not_found(exc):
+                return None
+            tried.append(m)
+            continue
+        except Exception as exc:  # noqa: BLE001 - AI must never break bot
+            log.warning("groq call failed: %s", exc)
+            return None
+    log.warning("groq: no working model among %s", tried or _candidate_models(model))
+    return None
 
 
 def _parse_json(text: str | None) -> dict:

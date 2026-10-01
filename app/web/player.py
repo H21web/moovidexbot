@@ -22,7 +22,7 @@ from app import streamer
 from app import tmdb
 from app.bot import app as bot_app
 from app.config import settings
-from app.db import get_session_factory
+from app.db import bump_file_downloads, get_session_factory
 from app.indexer import _media_of
 from app.models import File
 from app.web.tokens import parse_watch_token
@@ -216,6 +216,13 @@ async def download(token: str, request: Request):
     client = bot_app.bot
     if not client:
         raise HTTPException(503, "bot not ready")
+    # v8.1: explicit ⬇ Download hits (list link has ?dl=1) count toward the
+    # per-file download counter. Web-player streams carry no marker, so
+    # plays are never counted as downloads. HEAD/range-resumes don't count.
+    if (request.method == "GET"
+            and request.query_params.get("dl") == "1"
+            and not request.headers.get("range")):
+        asyncio.create_task(bump_file_downloads(f.id))
     size = f.file_size or 0
     if size <= 0:
         raise HTTPException(404, "unknown file size")

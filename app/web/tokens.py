@@ -35,8 +35,12 @@ def watch_url(file_db_id: int, user_id: int) -> str | None:
 
 
 def dl_url(file_db_id: int, user_id: int) -> str | None:
-    """Direct download link for a file (Tech VJ style: stream + download URLs)."""
+    """Direct download link for a file (Tech VJ style: stream + download URLs).
+
+    ``?dl=1`` marks an explicit download hit so the /dl route can count it
+    (the web player's stream URL has no such marker — plays ≠ downloads).
+    """
     base = (settings.WEB_URL or "").rstrip("/")
     if not base:
         return None
-    return f"{base}/dl/{make_watch_token(file_db_id, user_id)}"
+    return f"{base}/dl/{make_watch_token(file_db_id, user_id)}?dl=1"

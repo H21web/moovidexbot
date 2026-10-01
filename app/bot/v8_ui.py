@@ -180,15 +180,17 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     if ai_note:
         parts.append(f"💡 <i>{esc(ai_note)}</i>")
     parts.append("")
-    flt = " · ".join(
-        f"{dict(V8_FILTERS).get(k, k)}: {v}" for k, v in filters.items() if v)
-    head = f"📋 <b>All files ({total})</b>"
-    if flt:
-        head += f"\n🔎 <i>{esc(flt)}</i>"
-    parts.append(head)
-    start = page * V8_PAGE_SIZE
-    for i, f in enumerate(files, start=start + 1):
-        parts.append(_v8_file_line(i, f, user_id, bot_username))
+    # v8.1: no other files besides the best pick -> skip the list section.
+    if files:
+        flt = " · ".join(
+            f"{dict(V8_FILTERS).get(k, k)}: {v}" for k, v in filters.items() if v)
+        head = f"📋 <b>All files ({total})</b>"
+        if flt:
+            head += f"\n🔎 <i>{esc(flt)}</i>"
+        parts.append(head)
+        start = page * V8_PAGE_SIZE
+        for i, f in enumerate(files, start=start + 1):
+            parts.append(_v8_file_line(i, f, user_id, bot_username))
     text = "\n".join(parts)
     # Telegram hard limit: 4096 chars.
     if len(text) > 4000:

@@ -18,7 +18,7 @@ from app.bot import forcesub, ui, v8_ui
 from app.bot.handlers.common import is_banned
 from app.bot.handlers.groups import effective_autodelete
 from app.config import settings
-from app.db import get_session_factory
+from app.db import bump_file_downloads, get_session_factory
 from app.models import File
 from app.tmdb import get_movie
 from app.web.tokens import watch_url
@@ -132,6 +132,8 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
     )
     asyncio.create_task(log_event("download", user_id=uid,
                                   chat_id=sent.chat.id))
+    # v8.1: per-file download counter (drives "most downloaded = best pick").
+    asyncio.create_task(bump_file_downloads(f.id))
     # PM deliveries fall back to the global auto-delete default
     # (no per-group row exists for a user id).
     ad = await effective_autodelete(target_id)

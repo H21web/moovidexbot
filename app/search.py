@@ -49,6 +49,7 @@ TRIGRAM_THRESHOLD = 0.25
 ITEM_FIELDS = (
     "id", "file_id", "file_name", "file_size", "mime_type", "caption",
     "channel_id", "message_id", "quality", "language", "title_key",
+    "downloads",
 )
 
 # Tags stripped before relevance comparison (ported from v1 pm_filter).
