@@ -206,25 +206,31 @@ def _is_model_not_found(exc: httpx.HTTPStatusError) -> bool:
 async def groq_complete(system: str, user: str,
                         max_tokens: int = 512,
                         json_mode: bool = False,
-                        model: str | None = None) -> str | None:
+                        model: str | None = None,
+                        messages: list[dict] | None = None,
+                        temperature: float = 0.7) -> str | None:
     """One Groq chat call. Returns the text or None on any failure.
 
     Walks the model cascade on ``model_not_found`` — a key that lost
     access to one model usually still serves another. Auth, rate-limit
     and network errors stop the walk (retrying those is pointless).
+
+    Pass ``messages`` (full chat history) instead of ``system``/``user``
+    for multi-turn calls — the cascade still applies.
     """
     if not is_configured():
         return None
     tried: list[str] = []
     for m in _candidate_models(model):
+        base_messages = (messages if messages is not None else [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])
         payload: dict = {
             "model": m,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": base_messages,
             "max_tokens": max_tokens,
-            "temperature": 0.7,
+            "temperature": temperature,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -508,19 +514,10 @@ async def ai_chat(user_id: int, text: str) -> tuple[str | None, str]:
     messages.extend(hist)
     messages.append({"role": "user", "content": text[:1000]})
 
-    payload = {
-        "model": settings.AI_MODEL,
-        "messages": messages,
-        "max_tokens": 300,
-        "temperature": 0.8,
-    }
-    reply: str | None = None
-    try:
-        resp = await _get_client().post("/v1/chat/completions", json=payload)
-        resp.raise_for_status()
-        reply = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("groq chat failed: %s", exc)
+    # v8.3: go through groq_complete so the model cascade applies here too
+    # (this path used to post with the dead default model directly).
+    reply = await groq_complete("", "", max_tokens=300, messages=messages,
+                                temperature=0.8)
     if not reply:
         return None, "failed"
     await quota_use(user_id)

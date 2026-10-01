@@ -1,4 +1,4 @@
-"""Text search (private + groups) — v8: keyword-first + enriched + AI touches."""
+"""Text search (private + groups) — v9: smart search + AI intent router + AI assist."""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +9,8 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 
-from app import ai, ai_search, personalize, state
+from app import ai, personalize, state
+from app import ai_assist, intent as intent_mod, search_v9
 from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui, v8_ui
@@ -82,36 +83,43 @@ async def _send_results(client: Client, chat_id: int, token: str,
             await autodelete.schedule(int(chat_id), sent.id, ad)
 
 
-async def _no_results_pm(client: Client, message: Message, q: str):
+async def _no_results_pm(client: Client, message: Message, q: str,
+                        suggestions: list[str] | None = None):
     """No-results flow for PM: TMDB correction -> spell suggestions.
 
-    v8.6: no AI-search button — the AI search already ran automatically
-    (ai_suggest_title retry inside _v8_search_flow). If we're here,
-    everything fell back -> show no results.
+    v9: the AI recovery chain (title correction -> retry) already ran
+    inside _v9_search_flow. ``suggestions`` lets the caller pass
+    pre-computed spell suggestions so they aren't looked up twice.
     """
     kb = None
     text = "❌ <b>No results found.</b>"
-    # Never send raw user text to TMDB: resolve a clean title first
-    # (local extraction -> TMDB -> web-search fallback).
-    tm = await resolve_title(q)
-    if tm and tm.get("title"):
-        year = f" ({tm['year']})" if tm.get("year") else ""
-        text = (
-            f"🤔 Did you mean <b>{ui.esc(tm['title'])}</b>{year}?\n"
-            "📭 That file is not in the database."
-            + ("\n🎞 Use /request to ask for it!"
-               if settings.REQUEST_CHANNEL else "")
-        )
-    else:
+    if suggestions is None:
+        # Never send raw user text to TMDB: resolve a clean title first
+        # (local extraction -> TMDB -> web-search fallback).
+        tm = await resolve_title(q)
+        if tm and tm.get("title"):
+            year = f" ({tm['year']})" if tm.get("year") else ""
+            text = (
+                f"🤔 Did you mean <b>{ui.esc(tm['title'])}</b>{year}?\n"
+                "📭 That file is not in the database."
+                + ("\n🎞 Use /request to ask for it!"
+                   if settings.REQUEST_CHANNEL else "")
+            )
+            await message.reply_text(text, reply_markup=kb)
+            return
         try:
             factory = get_session_factory(settings.DATABASE_URL)
             async with factory() as s:
                 suggestions = await suggest(s, q)
         except Exception:  # noqa: BLE001
             suggestions = []
-        if suggestions:
-            text += "\nDid you mean:"
-            kb = ui.spell_kb(suggestions)
+    if suggestions:
+        text += "\nDid you mean:"
+        kb = ui.spell_kb(suggestions)
+    else:
+        text += ("\n🎞 Try /request to ask for it!"
+                 if settings.REQUEST_CHANNEL
+                 else "\nTry a different spelling.")
     await message.reply_text(text, reply_markup=kb)
 
 
@@ -176,54 +184,109 @@ async def render_v8_results(client: Client, message: Message,
         log.debug("v8 render edit failed", exc_info=True)
 
 
-async def _v8_search_flow(client: Client, message: Message,
-                         uid: int, q: str) -> bool:
-    """v8 PM search: keyword-first, enriched, AI-enhanced. True = handled.
+async def _judge_uncertain(client: Client, message: Message, uid: int,
+                          q: str, res: dict,
+                          waiter) -> tuple[dict, bool]:
+    """Run the AI judge on an 'uncertain' result set.
 
-    Runs with or without AI configured — AI only adds the verdict line
-    and the no-result title suggestion. Falls back to the classic
-    no-results card when nothing is found.
+    Returns ``(res, replied)`` — ``replied`` is True when the bot already
+    answered (nothing genuinely matched), so the caller stops.
     """
-    wait = await message.reply_text("🔍 <i>Searching…</i>")
+    if res.get("status") != "uncertain" or not res.get("files"):
+        return res, False
+    judged = await ai_assist.assist_uncertain(uid, q, res["files"])
+    action = judged.get("action")
+    if action == "filtered" and judged.get("files"):
+        res = dict(res)
+        res["files"] = judged["files"]
+        res["best"] = judged["files"][0]
+        res["status"] = "ok"
+        return res, False
+    if action == "none_match":
+        try:
+            await waiter.delete()
+        except Exception:
+            pass
+        note = ui.esc(judged.get("note") or "")
+        await waiter._client.send_message(
+            waiter.chat.id,
+            "\u274c <b>No results found.</b>\n"
+            f"\U0001F916 <i>{note}</i>"
+            + ("\n\U0001F39E Use /request to ask for it!"
+               if settings.REQUEST_CHANNEL else ""),
+        )
+        return res, True
+    return res, False  # as_is -> show the weak hits as-is
+
+
+async def _v9_search_flow(client: Client, message: Message,
+                         uid: int, q: str) -> bool:
+    """v9 PM search: smart search + AI assist on uncertain/no results.
+
+    Always handles the message (True) except on unexpected failure.
+    AI assists exactly where search is unsure: judging weak candidate
+    sets, and the no-results recovery chain (title correction -> retry
+    -> spell suggestions). Works with AI off — the flow degrades to
+    plain keyword search.
+    """
+    wait = await message.reply_text("\U0001F50D <i>Searching…</i>")
     try:
-        res = await ai_search.v8_search(uid, q)
+        res = await search_v9.smart_search(uid, q)
     except Exception:  # noqa: BLE001
-        log.exception("v8 search failed")
+        log.exception("v9 search failed")
         try:
             await wait.delete()
         except Exception:
             pass
         return False
 
-    if res["status"] != "ok" or not res.get("best"):
-        # No results: one AI retry with a suggested title, then classic.
-        retry_q = None
-        try:
-            retry_q = await ai_search.ai_suggest_title(uid, q)
-        except Exception:  # noqa: BLE001
-            log.debug("ai suggest title failed", exc_info=True)
-        if retry_q and retry_q.lower() != q.lower():
+    res, replied = await _judge_uncertain(client, message, uid, q,
+                                          res, wait)
+    if replied:
+        return True
+
+    suggestions: list[str] | None = None
+    if res.get("status") != "ok" or not res.get("best"):
+        # AI recovery chain: correct the title -> retry once.
+        fix = await ai_assist.assist_no_results(uid, q)
+        if fix.get("action") == "retry":
             try:
-                res2 = await ai_search.v8_search(uid, retry_q)
+                res2 = await search_v9.smart_search(uid, fix["query"])
             except Exception:  # noqa: BLE001
+                log.debug("v9 retry search failed", exc_info=True)
                 res2 = {"status": "no_results"}
-            if res2["status"] == "ok" and res2.get("best"):
-                res = res2
-                q = retry_q
-        if res["status"] != "ok" or not res.get("best"):
-            await wait.delete()
-            return False  # classic flow: _no_results_pm
+            if res2.get("best"):
+                res, q = res2, fix["query"]
+                res, replied = await _judge_uncertain(
+                    client, message, uid, q, res, wait)
+                if replied:
+                    return True
+        elif fix.get("action") == "suggest":
+            suggestions = fix.get("suggestions")
+        if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
+            try:
+                await wait.delete()
+            except Exception:
+                pass
+            await _no_results_pm(client, message, q,
+                                 suggestions=suggestions)
+            return True
 
     asyncio.create_task(ai.remember(uid, "user", q))
+    from app import enrich as enrich_mod
+    meta = await enrich_mod.enrich_title(res["title"] or q,
+                                         res["parsed"].get("year"), uid)
+    ai_note = await ai_assist.ai_verdict(uid, res["best"],
+                                         res["title"] or q)
     token = state.v8_put({
         "files": res["files"],
         "best": res["best"],
-        "meta": res.get("meta"),
+        "meta": meta,
         "query": q,
         "user_id": uid,
         "filters": {},
         "filter_opts": v8_ui.v8_filter_options(res["files"]),
-        "ai_note": res.get("ai_note"),
+        "ai_note": ai_note,
     })
     await render_v8_results(client, wait, token, uid, page=0)
     return True
@@ -248,17 +311,31 @@ async def _on_text(client: Client, message: Message):
     pm = _is_pm(message.chat.id)
     asyncio.create_task(log_event("search", user_id=uid,
                                   chat_id=message.chat.id))
-    # v8: PM search always goes through the v8 flow (keyword-first,
-    # enriched, AI-enhanced when available). Chat-intent messages keep
-    # the AI chat path.
-    if pm and ai.detect_intent(q) != "chat":
-        if await _v8_search_flow(client, message, uid, q):
+    # v9: AI intent router — no more what/when prefix matching. AI works
+    # whether or not there are results; every message gets a real route.
+    if pm:
+        intent = await intent_mod.classify(uid, q)
+        log.info("v9 intent %r -> %s", q[:60], intent)
+        if intent in ("movie_search", "other"):
+            if await _v9_search_flow(client, message, uid, q):
+                return
+        elif intent == "question":
+            # ai_chat keeps the memory itself — no separate remember here.
+            if ai.is_configured():
+                await _ai_chat_reply(client, message, uid, q)
+            else:
+                await message.reply_text(
+                    "\U0001F916 AI is off right now — "
+                    "send me a movie name to search \U0001F50D")
             return
-    # v6: question-like messages in PM go to the AI chat (ai_chat keeps
-    # the memory itself — no separate remember here).
-    if pm and ai.is_configured() and ai.detect_intent(q) == "chat":
-        await _ai_chat_reply(client, message, uid, q)
-        return
+        elif intent == "greeting":
+            await message.reply_text(
+                "\U0001F44B Hey! Send me a movie or series name \U0001F50D")
+            return
+        elif intent == "request":
+            await message.reply_text(
+                "\U0001F39E To request a movie, use /request &lt;movie name&gt;")
+            return
     if pm:
         asyncio.create_task(ai.remember(uid, "user", q))
     wait = await message.reply_text("🔍 <i>Searching…</i>")
