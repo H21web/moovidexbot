@@ -1,6 +1,6 @@
 """v7 AI search: understand -> find -> recommend. Fast by design.
 
-One small Groq call (llama-3.1-8b-instant, JSON) turns messy human text
+One small Groq call (gpt-oss-20b, JSON) turns messy human text
 ("kgf movie undo", "play avatar 3") into a structured query. The DB search
 runs in parallel with the parse; TMDB enriches only the top hits; the best
 file is picked with the user's own taste (personalize). If Groq is off or

@@ -42,12 +42,11 @@ class Settings(BaseSettings):
 
     # --- AI (Groq) — v6 super update ---
     GROQ_API_KEY: str = ""         # empty = AI features disabled gracefully
-    AI_MODEL: str = "llama-3.3-70b-versatile"
-    AI_PARSE_MODEL: str = "llama-3.1-8b-instant"  # fast model for v7 query parsing
-    # If the primary model is unknown to Groq for this key (404
-    # model_not_found), groq_complete() walks this list in order.
-    AI_FALLBACK_MODELS: str = ("llama-3.1-8b-instant,openai/gpt-oss-20b,"
-                               "openai/gpt-oss-120b,qwen/qwen3.6-27b")
+    AI_MODEL: str = "openai/gpt-oss-20b"  # the one working model on our key
+    AI_PARSE_MODEL: str = "openai/gpt-oss-20b"  # fast model for v7 query parsing
+    # Dead llama models removed (Groq retired them — 404 even on fresh keys).
+    # Single working model only: no wasted fallback attempts.
+    AI_FALLBACK_MODELS: str = ""
     WEBSEARCH_API_URL: str = "https://moovidex.alwaysdata.net"  # web search API for ai_web_answer
     # Max AI actions per user per day (one AI search/chat ≈ 2 Groq calls).
     AI_DAILY_QUOTA: int = 20

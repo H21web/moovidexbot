@@ -1,0 +1,46 @@
+diff --git a/.env.example b/.env.example
+index 530db25..f02aa35 100644
+--- a/.env.example
++++ b/.env.example
+@@ -33,6 +33,6 @@ INDEX_BATCH_SIZE=500
+ 
+ # --- AI (Groq, free tier) — v6 super update. Empty = AI features off. ---
+ GROQ_API_KEY=
+-AI_MODEL=llama-3.3-70b-versatile
++AI_MODEL=openai/gpt-oss-20b
+ AI_DAILY_QUOTA=20
+ WEBSEARCH_API_URL=https://moovidex.alwaysdata.net
+diff --git a/app/ai_search.py b/app/ai_search.py
+index 76f54f3..dc2f5b2 100644
+--- a/app/ai_search.py
++++ b/app/ai_search.py
+@@ -1,6 +1,6 @@
+ """v7 AI search: understand -> find -> recommend. Fast by design.
+ 
+-One small Groq call (llama-3.1-8b-instant, JSON) turns messy human text
++One small Groq call (gpt-oss-20b, JSON) turns messy human text
+ ("kgf movie undo", "play avatar 3") into a structured query. The DB search
+ runs in parallel with the parse; TMDB enriches only the top hits; the best
+ file is picked with the user's own taste (personalize). If Groq is off or
+diff --git a/app/config.py b/app/config.py
+index bfed00c..f18ff29 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -42,12 +42,11 @@ class Settings(BaseSettings):
+ 
+     # --- AI (Groq) — v6 super update ---
+     GROQ_API_KEY: str = ""         # empty = AI features disabled gracefully
+-    AI_MODEL: str = "llama-3.3-70b-versatile"
+-    AI_PARSE_MODEL: str = "llama-3.1-8b-instant"  # fast model for v7 query parsing
+-    # If the primary model is unknown to Groq for this key (404
+-    # model_not_found), groq_complete() walks this list in order.
+-    AI_FALLBACK_MODELS: str = ("llama-3.1-8b-instant,openai/gpt-oss-20b,"
+-                               "openai/gpt-oss-120b,qwen/qwen3.6-27b")
++    AI_MODEL: str = "openai/gpt-oss-20b"  # the one working model on our key
++    AI_PARSE_MODEL: str = "openai/gpt-oss-20b"  # fast model for v7 query parsing
++    # Dead llama models removed (Groq retired them — 404 even on fresh keys).
++    # Single working model only: no wasted fallback attempts.
++    AI_FALLBACK_MODELS: str = ""
+     WEBSEARCH_API_URL: str = "https://moovidex.alwaysdata.net"  # web search API for ai_web_answer
+     # Max AI actions per user per day (one AI search/chat ≈ 2 Groq calls).
+     AI_DAILY_QUOTA: int = 20
