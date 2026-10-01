@@ -66,28 +66,11 @@ def _is_messy(raw: str, title: str) -> bool:
 
 async def _ai_parse_if_needed(user_id: int | None, raw: str,
                               parsed: dict) -> dict:
-    """Structured AI parse for messy queries only (1 quota unit)."""
+    """v9.1: local parse only — no AI on the search path (speed + quota).
+
+    AI is reserved for the no-results spell-correction chain.
+    """
     title = (parsed.get("query") or "").strip()
-    if not _is_messy(raw, title):
-        parsed = dict(parsed)
-        parsed["title"] = title or raw.strip()
-        return parsed
-    try:
-        from app import ai as ai_mod
-        if ai_mod.is_configured() and await ai_mod.quota_remaining(
-                user_id or 0) > 0:
-            ai_parsed = await ai_parse_query(raw)
-            await ai_mod.quota_use(user_id or 0)
-            merged = dict(parsed)
-            if ai_parsed.get("title"):
-                merged["title"] = ai_parsed["title"]
-            for k in ("year", "language", "quality"):
-                if ai_parsed.get(k):
-                    merged[k] = ai_parsed[k]
-            log.info("v9 ai parse: %r -> %r", raw[:60], merged.get("title"))
-            return merged
-    except Exception as exc:  # noqa: BLE001
-        log.debug("v9 ai parse failed: %s", exc)
     parsed = dict(parsed)
     parsed["title"] = title or raw.strip()
     return parsed

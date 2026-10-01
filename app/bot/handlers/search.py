@@ -184,50 +184,14 @@ async def render_v8_results(client: Client, message: Message,
         log.debug("v8 render edit failed", exc_info=True)
 
 
-async def _judge_uncertain(client: Client, message: Message, uid: int,
-                          q: str, res: dict,
-                          waiter) -> tuple[dict, bool]:
-    """Run the AI judge on an 'uncertain' result set.
-
-    Returns ``(res, replied)`` — ``replied`` is True when the bot already
-    answered (nothing genuinely matched), so the caller stops.
-    """
-    if res.get("status") != "uncertain" or not res.get("files"):
-        return res, False
-    judged = await ai_assist.assist_uncertain(uid, q, res["files"])
-    action = judged.get("action")
-    if action == "filtered" and judged.get("files"):
-        res = dict(res)
-        res["files"] = judged["files"]
-        res["best"] = judged["files"][0]
-        res["status"] = "ok"
-        return res, False
-    if action == "none_match":
-        try:
-            await waiter.delete()
-        except Exception:
-            pass
-        note = ui.esc(judged.get("note") or "")
-        await waiter._client.send_message(
-            waiter.chat.id,
-            "\u274c <b>No results found.</b>\n"
-            f"\U0001F916 <i>{note}</i>"
-            + ("\n\U0001F39E Use /request to ask for it!"
-               if settings.REQUEST_CHANNEL else ""),
-        )
-        return res, True
-    return res, False  # as_is -> show the weak hits as-is
-
-
 async def _v9_search_flow(client: Client, message: Message,
                          uid: int, q: str) -> bool:
-    """v9 PM search: smart search + AI assist on uncertain/no results.
+    """v9.1 PM search: smart search, AI only on failure + verdict.
 
     Always handles the message (True) except on unexpected failure.
-    AI assists exactly where search is unsure: judging weak candidate
-    sets, and the no-results recovery chain (title correction -> retry
-    -> spell suggestions). Works with AI off — the flow degrades to
-    plain keyword search.
+    Hot path is AI-free: keyword intent, local parse, DB sweeps, enrich,
+    verdict. AI is used only for the no-results spell-correction chain
+    and the one-line verdict (with a local fallback so it always shows).
     """
     wait = await message.reply_text("\U0001F50D <i>Searching…</i>")
     try:
@@ -240,11 +204,7 @@ async def _v9_search_flow(client: Client, message: Message,
             pass
         return False
 
-    res, replied = await _judge_uncertain(client, message, uid, q,
-                                          res, wait)
-    if replied:
-        return True
-
+    # v9.1: "uncertain" results render as-is — no AI judge (speed + quota).
     suggestions: list[str] | None = None
     if res.get("status") != "ok" or not res.get("best"):
         # AI recovery chain: correct the title -> retry once.
@@ -257,10 +217,6 @@ async def _v9_search_flow(client: Client, message: Message,
                 res2 = {"status": "no_results"}
             if res2.get("best"):
                 res, q = res2, fix["query"]
-                res, replied = await _judge_uncertain(
-                    client, message, uid, q, res, wait)
-                if replied:
-                    return True
         elif fix.get("action") == "suggest":
             suggestions = fix.get("suggestions")
         if res.get("status") not in ("ok", "uncertain") or not res.get("best"):

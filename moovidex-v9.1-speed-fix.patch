@@ -1,0 +1,360 @@
+--- a/app/intent.py
++++ b/app/intent.py
+@@ -1,51 +1,16 @@
+-"""v9 AI intent router.
++"""v9.1 intent router — keyword rules only, no AI.
+ 
+-Replaces the old prefix-based ``detect_intent`` ("what/when" words only).
+-Every non-command text message is classified by a cheap Groq call into:
+-
+-- ``movie_search`` — user wants a movie/series file
+-- ``question``     — wants an answer / chat with the AI
+-- ``greeting``     — hi/hello/thanks/bye
+-- ``request``      — asking the bot to fetch/add something
+-- ``other``        — anything else (falls back to search)
+-
+-Manglish-aware few-shot examples teach the model Malayalam chat patterns
+-("undo?", "aano?", "kaan anam"). When AI is off, over quota, or the call
+-fails, a keyword-rule fallback keeps the bot working — routing never
+-breaks search.
+-
+-Results are cached per (user_id, text) for 10 minutes so repeated texts
+-cost nothing.
++v9 called Groq on EVERY message (1-3s latency + quota burn per message),
++which starved the best-pick verdict of quota. v9.1 drops the AI call
++entirely: routing is instant and free. AI is reserved for real failures
++(no-result spell correction, enrich fallback, verdict).
+ """
+ from __future__ import annotations
+ 
+-import logging
+ import re
+-import time
+-
+-log = logging.getLogger(__name__)
+-
+-INTENT_SYSTEM = (
+-    "You classify a Telegram bot message into ONE word. Reply with ONLY "
+-    "the word, no other text.\n"
+-    "Classes:\n"
+-    "- movie_search: user wants a movie/series file "
+-    '("kgf", "kgf movie undo", "avatar 3 hindi 720p", "play kgf", '
+-    '"dheeram padam undo?", "money heist season 2")\n'
+-    "- question: user asks the bot something or wants to chat "
+-    '("bot work cheyyunno?", "ningal aara?", "best malayalam movie etha?", '
+-    '"thanks", no — thanks is greeting)\n'
+-    '- greeting: hi, hello, hey, thanks, thank you, bye ("hai", "nanni")\n'
+-    "- request: user asks the bot to get/add/find something for later "
+-    '("dheeram add cheyyamo?", "please upload kgf", "request kgf")\n'
+-    "- other: anything else\n"
+-    "Malayalam/Manglish counts: questions ending in undo/aano/alle/enth/evide "
+-    "about the BOT are question; about a MOVIE existing are movie_search."
+-)
+ 
+ _VALID = ("movie_search", "question", "greeting", "request", "other")
+ 
+-# --- keyword fallback (old detect_intent behavior, extended) ---------------
+ _QUESTION_START = re.compile(
+     r"^(what|when|where|who|whom|whose|which|why|how|is|are|do|does|did|"
+     r"can|could|will|would|should|may)\b", re.IGNORECASE)
+@@ -56,12 +21,12 @@
+     r"(aano|alle|undo\?*|aakumo|aakum)\s*\??$", re.IGNORECASE)
+ _GREET_RE = re.compile(r"^(hi+|hello|hey|hai|thanks|thank you|nanni|bye)\b",
+                        re.IGNORECASE)
+-_REQUEST_RE = re.compile(r"\b(request|add cheyy|upload|please.*(add|upload))\b",
++_REQUEST_RE = re.compile(r"\b(request|add cheyy\w*|upload|please.*(add|upload))\b",
+                          re.IGNORECASE)
+ 
+ 
+-def _fallback_intent(text: str) -> str:
+-    """Keyword rules when AI routing is unavailable."""
++def _keyword_intent(text: str) -> str:
++    """Instant keyword rules — no network, no quota."""
+     t = (text or "").strip()
+     if not t:
+         return "other"
+@@ -84,42 +49,10 @@
+     return "movie_search"
+ 
+ 
+-_cache: dict[tuple[int, str], tuple[float, str]] = {}
+-_TTL = 600
+-
+-
+ async def classify(user_id: int | None, text: str) -> str:
+     """Classify a message. Never raises; always returns a valid intent."""
+     t = (text or "").strip()
+     if len(t) < 2:
+         return "other"
+-    key = (user_id or 0, t.lower()[:120])
+-    hit = _cache.get(key)
+-    if hit and time.time() - hit[0] < _TTL:
+-        return hit[1]
+-
+-    intent = _fallback_intent(t)
+-    try:
+-        from app import ai as ai_mod
+-        if ai_mod.is_configured() and await ai_mod.quota_remaining(
+-                user_id or 0) > 0:
+-            raw = await ai_mod.groq_complete(
+-                INTENT_SYSTEM,
+-                f"Classify: {t[:150]}",
+-                max_tokens=20,
+-                temperature=0.0,
+-            )
+-            word = (raw or "").strip().lower().strip(".,!?\"'")
+-            if word in _VALID:
+-                intent = word
+-                await ai_mod.quota_use(user_id or 0)
+-            else:
+-                log.debug("intent router: unexpected %r, fallback %s",
+-                          raw, intent)
+-    except Exception as exc:  # noqa: BLE001 - routing never breaks
+-        log.debug("intent router failed, fallback %s: %s", intent, exc)
+-
+-    _cache[key] = (time.time(), intent)
+-    if len(_cache) > 2000:
+-        _cache.clear()
+-    return intent
++    intent = _keyword_intent(t)
++    return intent if intent in _VALID else "movie_search"
+--- a/app/search_v9.py
++++ b/app/search_v9.py
+@@ -66,28 +66,11 @@
+ 
+ async def _ai_parse_if_needed(user_id: int | None, raw: str,
+                               parsed: dict) -> dict:
+-    """Structured AI parse for messy queries only (1 quota unit)."""
++    """v9.1: local parse only — no AI on the search path (speed + quota).
++
++    AI is reserved for the no-results spell-correction chain.
++    """
+     title = (parsed.get("query") or "").strip()
+-    if not _is_messy(raw, title):
+-        parsed = dict(parsed)
+-        parsed["title"] = title or raw.strip()
+-        return parsed
+-    try:
+-        from app import ai as ai_mod
+-        if ai_mod.is_configured() and await ai_mod.quota_remaining(
+-                user_id or 0) > 0:
+-            ai_parsed = await ai_parse_query(raw)
+-            await ai_mod.quota_use(user_id or 0)
+-            merged = dict(parsed)
+-            if ai_parsed.get("title"):
+-                merged["title"] = ai_parsed["title"]
+-            for k in ("year", "language", "quality"):
+-                if ai_parsed.get(k):
+-                    merged[k] = ai_parsed[k]
+-            log.info("v9 ai parse: %r -> %r", raw[:60], merged.get("title"))
+-            return merged
+-    except Exception as exc:  # noqa: BLE001
+-        log.debug("v9 ai parse failed: %s", exc)
+     parsed = dict(parsed)
+     parsed["title"] = title or raw.strip()
+     return parsed
+--- a/app/ai_assist.py
++++ b/app/ai_assist.py
+@@ -1,37 +1,23 @@
+-"""v9 AI assistant — AI steps in exactly where search is uncertain.
++"""v9.1 AI assistant — AI only where search truly fails.
+ 
+-Two situations, two helpers:
++Two AI touchpoints, nothing on the hot path:
+ 
+ 1. **No results** — :func:`assist_no_results` runs the recovery chain:
+-   AI title correction -> DB spell suggestions -> give up honestly.
+-2. **Uncertain results** — :func:`assist_uncertain` shows the weak
+-   candidates to Groq and keeps only the ones that genuinely match the
+-   query, with a one-line note explaining the call.
++   AI title correction -> DB retry -> spell suggestions -> give up
++   honestly. This is the ONLY search-time AI besides the verdict.
++2. **Verdict** — :func:`ai_verdict` writes the one-line best-pick note.
++   AI first; a deterministic local line as fallback so the 💡 verdict
++   ALWAYS shows (it was starving when v9's router/parse/judge burned
++   the quota).
+ 
+-Plus :func:`ai_verdict`, the one-line best-pick recommendation.
+-
+-Every helper degrades silently when AI is off or over quota — the bot
+-never breaks because the AI couldn't answer.
++The old "uncertain" AI judge was removed in v9.1 (speed + quota).
+ """
+ from __future__ import annotations
+ 
+-import json
+ import logging
+ 
+ log = logging.getLogger(__name__)
+ 
+-JUDGE_SYSTEM = (
+-    "You judge whether file names match a movie/series search query. "
+-    "Reply with ONLY JSON, no other text.\n"
+-    'Schema: {"keep": [1, 3], "note": "one short line"}\n'
+-    "Rules:\n"
+-    "- keep = the 1-based numbers of files that are REALLY the requested "
+-    "movie/series (right title; year/language may differ).\n"
+-    "- A file is a match even if the spelling is slightly off.\n"
+-    "- If NONE match, keep is [].\n"
+-    '- note: one short line like "kept 2 of 8 — rest were other movies".'
+-)
+-
+ 
+ async def assist_no_results(user_id: int | None, q: str) -> dict:
+     """Recovery chain for empty searches.
+@@ -67,57 +53,27 @@
+     return {"action": "none"}
+ 
+ 
+-async def assist_uncertain(user_id: int | None, q: str,
+-                           candidates: list[dict]) -> dict:
+-    """AI judges weak candidates; keeps genuine matches.
+-
+-    Returns ``{"action": "filtered", "files": [...], "note": ...}``,
+-    ``{"action": "none_match", "note": ...}``, or
+-    ``{"action": "as_is"}`` when AI can't help.
+-    """
+-    if not candidates:
+-        return {"action": "as_is"}
+-    try:
+-        from app import ai as ai_mod
+-        if not ai_mod.is_configured() or await ai_mod.quota_remaining(
+-                user_id or 0) <= 0:
+-            return {"action": "as_is"}
+-        shown = candidates[:10]
+-        listing = "\n".join(
+-            f"{i + 1}. {(c.get('file_name') or '')[:90]} "
+-            f"[{c.get('quality') or '?'}/{c.get('language') or '?'}]"
+-            for i, c in enumerate(shown))
+-        raw = await ai_mod.groq_complete(
+-            JUDGE_SYSTEM,
+-            f"Query: {q[:120]}\nFiles:\n{listing}",
+-            max_tokens=200,
+-            json_mode=True,
+-        )
+-        if not raw:
+-            return {"action": "as_is"}
+-        data = json.loads(raw)
+-        keep = data.get("keep") or []
+-        note = (data.get("note") or "").strip()
+-        await ai_mod.quota_use(user_id or 0)
+-        kept = [shown[i - 1] for i in keep
+-                if isinstance(i, int) and 1 <= i <= len(shown)]
+-        if kept:
+-            log.info("v9 assist: uncertain %r -> kept %d/%d",
+-                     q[:60], len(kept), len(shown))
+-            return {"action": "filtered", "files": kept, "note": note}
+-        return {"action": "none_match",
+-                "note": note or "None of the files look like a real match."}
+-    except Exception as exc:  # noqa: BLE001
+-        log.debug("v9 assist judge failed: %s", exc)
+-        return {"action": "as_is"}
++def _local_verdict(best: dict, title: str) -> str:
++    """Deterministic verdict so the 💡 line ALWAYS renders."""
++    dl = best.get("downloads") or 0
++    if dl:
++        return f"Most downloaded pick — {dl} downloads"
++    bits = [x for x in (best.get("quality"), best.get("language")) if x]
++    if bits:
++        return f"Best {' '.join(bits)} match for \u201c{title}\u201d"
++    return f"Top match for \u201c{title}\u201d"
+ 
+ 
+ async def ai_verdict(user_id: int | None, best: dict,
+-                     title: str) -> str | None:
+-    """One-line AI note on why this file is the best pick (optional)."""
++                     title: str) -> str:
++    """One-line best-pick note. AI first, local fallback — never empty."""
+     try:
+         from app.ai_search import _ai_verdict
+-        return await _ai_verdict(user_id or 0, best, title)
++        note = await _ai_verdict(user_id or 0, best, title)
++        if note:
++            return note
+     except Exception as exc:  # noqa: BLE001
+         log.debug("v9 verdict failed: %s", exc)
+-        return None
++    note = _local_verdict(best, title or "")
++    log.info("v9 verdict: local fallback %r", note[:60])
++    return note
+--- a/app/bot/handlers/search.py
++++ b/app/bot/handlers/search.py
+@@ -184,50 +184,14 @@
+         log.debug("v8 render edit failed", exc_info=True)
+ 
+ 
+-async def _judge_uncertain(client: Client, message: Message, uid: int,
+-                          q: str, res: dict,
+-                          waiter) -> tuple[dict, bool]:
+-    """Run the AI judge on an 'uncertain' result set.
+-
+-    Returns ``(res, replied)`` — ``replied`` is True when the bot already
+-    answered (nothing genuinely matched), so the caller stops.
+-    """
+-    if res.get("status") != "uncertain" or not res.get("files"):
+-        return res, False
+-    judged = await ai_assist.assist_uncertain(uid, q, res["files"])
+-    action = judged.get("action")
+-    if action == "filtered" and judged.get("files"):
+-        res = dict(res)
+-        res["files"] = judged["files"]
+-        res["best"] = judged["files"][0]
+-        res["status"] = "ok"
+-        return res, False
+-    if action == "none_match":
+-        try:
+-            await waiter.delete()
+-        except Exception:
+-            pass
+-        note = ui.esc(judged.get("note") or "")
+-        await waiter._client.send_message(
+-            waiter.chat.id,
+-            "\u274c <b>No results found.</b>\n"
+-            f"\U0001F916 <i>{note}</i>"
+-            + ("\n\U0001F39E Use /request to ask for it!"
+-               if settings.REQUEST_CHANNEL else ""),
+-        )
+-        return res, True
+-    return res, False  # as_is -> show the weak hits as-is
+-
+-
+ async def _v9_search_flow(client: Client, message: Message,
+                          uid: int, q: str) -> bool:
+-    """v9 PM search: smart search + AI assist on uncertain/no results.
++    """v9.1 PM search: smart search, AI only on failure + verdict.
+ 
+     Always handles the message (True) except on unexpected failure.
+-    AI assists exactly where search is unsure: judging weak candidate
+-    sets, and the no-results recovery chain (title correction -> retry
+-    -> spell suggestions). Works with AI off — the flow degrades to
+-    plain keyword search.
++    Hot path is AI-free: keyword intent, local parse, DB sweeps, enrich,
++    verdict. AI is used only for the no-results spell-correction chain
++    and the one-line verdict (with a local fallback so it always shows).
+     """
+     wait = await message.reply_text("\U0001F50D <i>Searching…</i>")
+     try:
+@@ -240,11 +204,7 @@
+             pass
+         return False
+ 
+-    res, replied = await _judge_uncertain(client, message, uid, q,
+-                                          res, wait)
+-    if replied:
+-        return True
+-
++    # v9.1: "uncertain" results render as-is — no AI judge (speed + quota).
+     suggestions: list[str] | None = None
+     if res.get("status") != "ok" or not res.get("best"):
+         # AI recovery chain: correct the title -> retry once.
+@@ -257,10 +217,6 @@
+                 res2 = {"status": "no_results"}
+             if res2.get("best"):
+                 res, q = res2, fix["query"]
+-                res, replied = await _judge_uncertain(
+-                    client, message, uid, q, res, wait)
+-                if replied:
+-                    return True
+         elif fix.get("action") == "suggest":
+             suggestions = fix.get("suggestions")
+         if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
