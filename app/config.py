@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     REQUEST_CHANNEL: str = ""      # where /request posts go (@username or id)
     LOG_CHANNEL: str = ""          # admin log channel (@username or id)
 
+    # --- AI (Groq) — v6 super update ---
+    GROQ_API_KEY: str = ""         # empty = AI features disabled gracefully
+    AI_MODEL: str = "llama-3.3-70b-versatile"
+    # Max AI actions per user per day (one AI search/chat ≈ 2 Groq calls).
+    AI_DAILY_QUOTA: int = 20
+
     # --- Behaviour ---
     RESULTS_PER_PAGE: int = 8
     PROTECT_CONTENT: bool = False  # forward-protection on delivered files

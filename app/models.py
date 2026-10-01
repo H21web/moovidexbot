@@ -1,12 +1,13 @@
 """SQLAlchemy models — single squashed schema (migration 0001)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -183,3 +184,67 @@ class IndexSession(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class UserPref(Base):
+    """Per-user personalization profile (v6 super update).
+
+    ``counters`` holds behavior counters learned from downloads, e.g.
+    ``{"quality": {"1080p": 12, "720p": 3},
+       "language": {"Malayalam": 9},
+       "size": {"M": 10}, "codec": {"x264": 7},
+       "genre": {"Action": 5}}``.
+    """
+
+    __tablename__ = "user_prefs"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    downloads: Mapped[int] = mapped_column(Integer, default=0)
+    counters: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ChatMemory(Base):
+    """Per-user conversation memory for the AI chat (v6).
+
+    Last ~20 messages per user, 7-day TTL (trimmed lazily on write).
+    """
+
+    __tablename__ = "chat_memory"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    role: Mapped[str] = mapped_column(String(16))  # "user" | "assistant"
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class AiCache(Base):
+    """Global question → answer cache for Groq calls (v6).
+
+    Same question from any user is answered instantly without spending
+    quota. 30-day TTL.
+    """
+
+    __tablename__ = "ai_cache"
+
+    qkey: Mapped[str] = mapped_column(String(64), primary_key=True)
+    answer: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AiQuota(Base):
+    """Per-user daily AI action counter (v6)."""
+
+    __tablename__ = "ai_quota"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)

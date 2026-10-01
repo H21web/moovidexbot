@@ -1,4 +1,4 @@
-"""Text search (private + groups)."""
+"""Text search (private + groups) — v6: personalized + AI-assisted."""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +8,7 @@ import math
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from app import state
+from app import ai, personalize, state
 from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui
@@ -18,14 +18,22 @@ from app.config import settings
 from app.db import get_session_factory
 from app.search import group_by_title, search_files
 from app.spell import suggest
+from app.tmdb import search_title
 
 log = logging.getLogger(__name__)
 
 
-async def _do_search(client: Client, query_text: str,
-                     user_id: int) -> tuple[str, object] | tuple[None, None]:
-    """Run search, return (token, first_page_text/kb) or (None, None)."""
+def _is_pm(chat_id: int) -> bool:
+    return not str(chat_id).startswith("-")
+
+
+async def _do_search(client: Client, query_text: str, user_id: int,
+                     personal: bool = True
+                     ) -> tuple[str, object] | tuple[None, None]:
+    """Run search (+ personalization), return (token, groups) or (None, None)."""
     items, _parsed = await search_files(query_text, user_id=user_id)
+    if personal:
+        items = await personalize.rerank(items, user_id)
     groups = group_by_title(items)
     if not groups:
         return None, None
@@ -56,6 +64,67 @@ async def _send_results(client: Client, chat_id: int, token: str,
             await autodelete.schedule(int(chat_id), sent.id, ad)
 
 
+async def _no_results_pm(client: Client, message: Message, q: str):
+    """No-results flow for PM: TMDB correction -> spell suggestions ->
+    AI button. Everything in the single clean template."""
+    kb = None
+    text = "❌ <b>No results found.</b>"
+    try:
+        tm = await search_title(q)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("tmdb correction failed: %s", exc)
+        tm = None
+    if tm and tm.get("title"):
+        year = f" ({tm['year']})" if tm.get("year") else ""
+        text = (
+            f"🤔 Did you mean <b>{ui.esc(tm['title'])}</b>{year}?\n"
+            "📭 That file is not in the database."
+            + ("\n🎞 Use /request to ask for it!"
+               if settings.REQUEST_CHANNEL else "")
+        )
+    else:
+        try:
+            factory = get_session_factory(settings.DATABASE_URL)
+            async with factory() as s:
+                suggestions = await suggest(s, q)
+        except Exception:  # noqa: BLE001
+            suggestions = []
+        if suggestions:
+            text += "\nDid you mean:"
+            kb = ui.spell_kb(suggestions)
+    # On-demand AI search button (only when Groq is configured; the query
+    # lives server-side because callback data is limited to 64 bytes).
+    if ai.is_configured():
+        ai_token = ai.store_query(q)
+        ai_kb = ui.ai_search_kb(ai_token)
+        if kb is not None:
+            kb.inline_keyboard.extend(ai_kb.inline_keyboard)
+        else:
+            kb = ai_kb
+    await message.reply_text(text, reply_markup=kb)
+
+
+async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
+    """Route a question-like PM message to the Groq chat."""
+    wait = await message.reply_text("🤖 <i>thinking…</i>")
+    try:
+        reply, status = await ai.ai_chat(uid, q)
+        if status in ("ok", "cached"):
+            await wait.edit_text(reply)
+        elif status == "no_quota":
+            await wait.edit_text(
+                "🤖 Daily AI limit reached — try again tomorrow 🌙")
+        else:
+            await wait.edit_text(
+                "🤖 AI is unavailable right now — try searching instead 🔍")
+    except Exception:  # noqa: BLE001
+        log.exception("ai chat failed")
+        try:
+            await wait.edit_text("🤖 Something went wrong — try again.")
+        except Exception:
+            pass
+
+
 async def _on_text(client: Client, message: Message):
     if not message.text or message.text.startswith("/"):
         return
@@ -72,26 +141,37 @@ async def _on_text(client: Client, message: Message):
     q = message.text.strip()
     if len(q) < 2:
         return
+    pm = _is_pm(message.chat.id)
     asyncio.create_task(log_event("search", user_id=uid,
                                   chat_id=message.chat.id))
+    # v6: question-like messages in PM go to the AI chat (ai_chat keeps
+    # the memory itself — no separate remember here).
+    if pm and ai.is_configured() and ai.detect_intent(q) == "chat":
+        await _ai_chat_reply(client, message, uid, q)
+        return
+    if pm:
+        asyncio.create_task(ai.remember(uid, "user", q))
     wait = await message.reply_text("🔍 <i>Searching…</i>")
     try:
-        token, groups = await _do_search(client, q, uid)
+        token, groups = await _do_search(client, q, uid, personal=pm)
         await wait.delete()
         if not token:
-            factory = get_session_factory(settings.DATABASE_URL)
-            async with factory() as s:
-                suggestions = await suggest(s, q)
-            if suggestions:
-                await message.reply_text(
-                    "❌ <b>No results found.</b>\nDid you mean:",
-                    reply_markup=ui.spell_kb(suggestions))
+            if pm:
+                await _no_results_pm(client, message, q)
             else:
-                await message.reply_text(
-                    "❌ <b>No results found.</b>\n"
-                    + ("🎞 Try /request to ask for it!"
-                       if settings.REQUEST_CHANNEL else
-                       "Try a different spelling."))
+                factory = get_session_factory(settings.DATABASE_URL)
+                async with factory() as s:
+                    suggestions = await suggest(s, q)
+                if suggestions:
+                    await message.reply_text(
+                        "❌ <b>No results found.</b>\nDid you mean:",
+                        reply_markup=ui.spell_kb(suggestions))
+                else:
+                    await message.reply_text(
+                        "❌ <b>No results found.</b>\n"
+                        + ("🎞 Try /request to ask for it!"
+                           if settings.REQUEST_CHANNEL else
+                           "Try a different spelling."))
             return
         await _send_results(client, message.chat.id, token, q)
     except Exception as exc:

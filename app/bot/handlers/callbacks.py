@@ -11,7 +11,7 @@ from pyrogram.errors import FloodWait, PeerIdInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
-from app import state
+from app import ai, personalize, state
 from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui
@@ -66,13 +66,23 @@ async def _movie(client: Client, query):
     page = gidx // per
     await query.answer()
     poster = None
+    meta = None
     try:
         meta = await get_movie(group.get("display"), group.get("year"))
         poster = (meta or {}).get("poster_url")
     except Exception as exc:
         log.debug("tmdb failed: %s", exc)
-    text = ui.movie_card(group)
-    kb = ui.movie_kb(token, gidx, group, page)
+    # v6: in PM, mark cards as personalized + order quality buttons by taste.
+    is_pm = not str(query.message.chat.id).startswith("-")
+    qorder = None
+    if is_pm:
+        uid = data.get("user_id") or query.from_user.id
+        prefs = await personalize.get_prefs(uid)
+        if prefs["enabled"] and prefs["downloads"] >= personalize.MIN_DOWNLOADS:
+            qorder = personalize.quality_order(prefs)
+    text = ui.movie_card(group, meta=meta,
+                         personalized=bool(qorder))
+    kb = ui.movie_kb(token, gidx, group, page, qorder=qorder)
     try:
         if poster:
             await query.message.edit_text("🎬 <i>Loading…</i>")
@@ -128,6 +138,10 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
     ad = await effective_autodelete(target_id)
     if ad > 0:
         await autodelete.schedule(sent.chat.id, sent.id, ad)
+    # v6: learn from this download (fire-and-forget, plain dict — the ORM
+    # object detaches after the session closes).
+    personalize.fire_record_download(
+        uid, {"file_name": f.file_name, "file_size": f.file_size})
     return sent
 
 
@@ -270,6 +284,86 @@ async def _ixstop(client: Client, query):
     await query.answer("🛑 Stopping…", show_alert=False)
 
 
+async def _aiq(client: Client, query):
+    """🤖 AI Search button: Groq parses the query, real DB files only."""
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    token = query.data.split(":", 1)[1] if ":" in query.data else ""
+    q = ai.take_query(token)
+    if not q:
+        await query.answer("⌛ Expired — search again.", show_alert=True)
+        return
+    await query.answer("🤖 AI is thinking…")
+    try:
+        intro, groups, status = await ai.ai_search(uid, q)
+    except Exception:  # noqa: BLE001
+        log.exception("ai search failed")
+        status, intro, groups = "failed", None, []
+    if status == "ai_off":
+        await query.message.edit_text(
+            "🤖 AI search isn't configured on this bot yet.")
+        return
+    if status == "no_quota":
+        await query.message.edit_text(
+            "🤖 Daily AI limit reached — try again tomorrow 🌙")
+        return
+    if status != "ok" or not groups:
+        text = "🤖 AI couldn't find it either."
+        if settings.REQUEST_CHANNEL:
+            text += " Try /request to ask for it! 🎞"
+        await query.message.edit_text(text)
+        return
+    new_token = state.results_put(groups, q, uid)
+    g = groups[0]
+    try:
+        meta = await get_movie(g.get("display"), g.get("year"))
+    except Exception:  # noqa: BLE001
+        meta = None
+    prefs = await personalize.get_prefs(uid)
+    qorder = None
+    if prefs["enabled"] and prefs["downloads"] >= personalize.MIN_DOWNLOADS:
+        qorder = personalize.quality_order(prefs)
+    card = ui.movie_card(g, meta=meta, personalized=bool(qorder))
+    text = ((intro or "🤖 <b>AI results</b>") + "\n\n" + card)[:3800]
+    kb = ui.movie_kb(new_token, 0, g, 0, qorder=qorder,
+                     more=len(groups) > 1)
+    poster = (meta or {}).get("poster_url")
+    if poster:
+        try:
+            await query.message.reply_photo(
+                poster, caption=text[:1000], reply_markup=kb,
+                parse_mode=ParseMode.HTML)
+            await query.message.delete()
+            return
+        except Exception:  # noqa: BLE001
+            log.debug("ai card photo failed, falling back to text")
+    await query.message.edit_text(text, reply_markup=kb,
+                                  parse_mode=ParseMode.HTML)
+
+
+async def _pset(client: Client, query):
+    """Personalization toggle / reset from /settings (non-admin users)."""
+    uid = query.from_user.id
+    action = query.data.split(":", 1)[1] if ":" in query.data else ""
+    if action == "toggle":
+        prefs = await personalize.get_prefs(uid)
+        await personalize.set_enabled(uid, not prefs["enabled"])
+        await query.answer("✅ Updated")
+    elif action == "reset":
+        await personalize.reset(uid)
+        await query.answer("🗑 Taste reset")
+    else:
+        await query.answer()
+        return
+    prefs = await personalize.get_prefs(uid)
+    await query.message.edit_text(
+        ui.user_settings_text(prefs["enabled"], prefs["downloads"]),
+        reply_markup=ui.user_settings_kb(prefs["enabled"]),
+        parse_mode=ParseMode.HTML)
+
+
 def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^pg:"))(_pg)
     bot.on_callback_query(filters.regex(r"^mv:"))(_movie)
@@ -278,3 +372,5 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^sp:"))(_spell)
     bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
     bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
+    bot.on_callback_query(filters.regex(r"^aiq:"))(_aiq)
+    bot.on_callback_query(filters.regex(r"^pset:"))(_pset)

@@ -28,20 +28,39 @@ def esc(s: str | None) -> str:
     return html.escape(s or "", quote=False)
 
 
-def movie_card(group: dict, poster_url: str | None = None) -> str:
-    """HTML caption for a movie card."""
+def movie_card(group: dict, poster_url: str | None = None,
+               meta: dict | None = None,
+               personalized: bool = False) -> str:
+    """HTML caption for a movie card — the single template used everywhere.
+
+    ``meta`` is an optional TMDB dict (title/year/rating/plot/genres);
+    ``personalized`` adds the "ordered for you" note.
+    """
     files = group.get("files", [])
     langs = sorted({f.get("language") for f in files if f.get("language")})
     quals = sorted({f.get("quality") for f in files if f.get("quality")},
                    key=lambda q: (q or ""))
-    year = group.get("year")
-    title = esc(group.get("display") or "Unknown")
-    lines = [f"🎬 <b>{title}</b>" + (f" ({year})" if year else "")]
+    year = group.get("year") or (meta or {}).get("year")
+    title = esc(group.get("display") or (meta or {}).get("title") or "Unknown")
+    rating = (meta or {}).get("rating")
+    genres = (meta or {}).get("genres") or []
+    plot = (meta or {}).get("plot") or ""
+
+    lines = [f"🎬 <b>{title}</b>" + (f" ({year})" if year else "")
+             + (f"  ⭐ <b>{rating}</b>" if rating else "")]
+    if genres:
+        lines.append(f"🎭 <i>{esc(' · '.join(genres[:3]))}</i>")
     if langs:
-        lines.append(f"🗣 {' · '.join(langs)}")
+        lines.append(f"🗣 {esc(' · '.join(langs))}")
     if quals:
-        lines.append(f"📺 {' · '.join(quals)}")
-    lines.append(f"📁 {len(files)} file(s)")
+        lines.append(f"📺 {esc(' · '.join(quals))}")
+    if plot:
+        short = plot[:180].rsplit(" ", 1)[0]
+        lines.append(f"📝 <i>{esc(short)}…</i>")
+    tail = f"📁 {len(files)} file(s)"
+    if personalized:
+        tail += "  ✨ <i>ordered for your taste</i>"
+    lines.append(tail)
     return "\n".join(lines)
 
 
@@ -81,15 +100,30 @@ def results_kb(token: str, page: int, total_pages: int,
 
 
 def movie_kb(token: str, midx: int, group: dict,
-             page: int) -> InlineKeyboardMarkup:
+             page: int, qorder: list[str] | None = None,
+             more: bool = False) -> InlineKeyboardMarkup:
+    """Download buttons per file. ``qorder`` lists quality labels in the
+    user's preferred order (most-loved first); ``more`` appends a
+    "More results" row back to the paginated list."""
     rows = []
-    for i, f in enumerate(group.get("files", [])):
+    files = list(group.get("files", []))
+    if qorder:
+        rank = {q.lower(): i for i, q in enumerate(qorder)}
+
+        def _qk(f: dict) -> int:
+            return rank.get((f.get("quality") or "").lower(), 10**6)
+
+        files.sort(key=_qk)  # stable: learned taste first
+    for i, f in enumerate(files):
         q = f.get("quality") or "?"
         lang = f.get("language") or ""
         size = fmt_size(f.get("file_size"))
         label = f"📥 {q} {lang} · {size}".strip()[:60]
         rows.append([InlineKeyboardButton(
             label, callback_data=f"dl:{f['id']}")])
+    if more:
+        rows.append([InlineKeyboardButton("🔍 More results",
+                                         callback_data=f"bk:{token}:{page}")])
     rows.append([InlineKeyboardButton("⬅️ Back to results",
                                      callback_data=f"bk:{token}:{page}")])
     return InlineKeyboardMarkup(rows)
@@ -108,6 +142,37 @@ def spell_kb(suggestions: list[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(f"🔍 {s[:50]}", callback_data=f"sp:{s[:50]}")]
             for s in suggestions[:3]]
     return InlineKeyboardMarkup(rows)
+
+
+def ai_search_kb(query_token: str) -> InlineKeyboardMarkup:
+    """On-demand AI search button (shown when normal search finds nothing)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🤖 AI Search", callback_data=f"aiq:{query_token}")
+    ]])
+
+
+def user_settings_kb(enabled: bool) -> InlineKeyboardMarkup:
+    """Personalization toggle + reset for /settings (non-admin users)."""
+    state = "ON ✅" if enabled else "OFF ❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✨ Personalized search: {state}",
+                             callback_data="pset:toggle")],
+        [InlineKeyboardButton("🗑 Reset my taste",
+                             callback_data="pset:reset")],
+    ])
+
+
+def user_settings_text(enabled: bool, downloads: int) -> str:
+    state = "<b>ON</b> ✅" if enabled else "<b>OFF</b> ❌"
+    taste = (f"🧠 <b>{downloads}</b> downloads learned from"
+             if downloads else "🧠 Not enough downloads yet")
+    return (
+        "⚙️ <b>My Settings</b>\n\n"
+        f"✨ Personalized search: {state}\n"
+        f"{taste}\n\n"
+        "<i>Downloads teach me your taste (quality, language, size…) "
+        "and future results are ordered for you.</i>"
+    )
 
 
 def index_stop_kb(job_id: int) -> InlineKeyboardMarkup:

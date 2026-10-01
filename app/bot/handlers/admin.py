@@ -12,6 +12,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 
 from app.bot.handlers.common import admin_only, track_user
+from app.bot import ui
 from app import runtime as rt
 from app.config import settings
 from app.db import get_session_factory
@@ -273,6 +274,16 @@ async def _dbcheck(client: Client, message: Message):
 
 @admin_only
 async def _settings(client: Client, message: Message):
+    uid = message.from_user.id if message.from_user else None
+    if not settings.is_admin(uid):
+        # v6: regular users get their personal AI/taste settings.
+        from app import personalize
+        prefs = await personalize.get_prefs(uid)
+        await message.reply_text(
+            ui.user_settings_text(prefs["enabled"], prefs["downloads"]),
+            reply_markup=ui.user_settings_kb(prefs["enabled"]),
+            parse_mode=ParseMode.HTML)
+        return
     base = (settings.WEB_URL or "").rstrip("/")
     dash = f"{base}/admin" if base else "/admin"
     await message.reply_text(

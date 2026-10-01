@@ -135,3 +135,103 @@ async def close_client() -> None:
     if _client is not None:
         await _client.aclose()
         _client = None
+
+
+GENRE_NAME_TO_ID = {v.lower(): k for k, v in GENRE_MAP.items()}
+
+
+async def search_title(raw: str) -> dict | None:
+    """Raw TMDB title search (movie, then TV) for "did you mean?" correction.
+
+    Returns ``{"title", "year", "kind"}`` or None. Cached 30 days.
+    """
+    if not settings.TMDB_API_KEY:
+        return None
+    clean = (raw or "").strip()
+    if len(clean) < 2:
+        return None
+    key = f"searchtitle:{title_key(clean)}"
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as session:
+        row = await session.get(TmdbCache, key)
+        if row and row.payload:
+            return dict(row.payload)
+
+    payload: dict | None = None
+    try:
+        for endpoint, kind in (("/search/movie", "movie"),
+                               ("/search/tv", "series")):
+            resp = await _get_client().get(
+                endpoint,
+                params={"api_key": settings.TMDB_API_KEY, "query": clean,
+                        "include_adult": "false", "language": "en-US",
+                        "page": 1})
+            resp.raise_for_status()
+            results = resp.json().get("results") or []
+            if results:
+                m = results[0]
+                rd = m.get("release_date") or m.get("first_air_date") or ""
+                payload = {
+                    "title": m.get("title") or m.get("name") or clean,
+                    "year": extract_year(rd),
+                    "kind": kind,
+                }
+                break
+    except Exception as exc:  # noqa: BLE001
+        log.warning("TMDB title search failed for %r: %s", clean, exc)
+        return None
+
+    if payload:
+        try:
+            async with factory() as session:
+                session.add(TmdbCache(key=key, payload=payload))
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("tmdb title cache write failed: %s", exc)
+    return payload
+
+
+async def discover(genre: str | None = None, year: int | None = None,
+                   limit: int = 8) -> list[dict]:
+    """TMDB discover: popular titles for a genre/year (for AI genre browse).
+
+    Returns ``[{"title", "year"}]``. Cached 30 days.
+    """
+    if not settings.TMDB_API_KEY:
+        return []
+    gid = GENRE_NAME_TO_ID.get((genre or "").strip().lower()) if genre else None
+    key = f"discover:{gid or ''}:{year or ''}:{limit}"
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as session:
+        row = await session.get(TmdbCache, key)
+        if row and row.payload:
+            return list(row.payload.get("items", []))
+
+    items: list[dict] = []
+    try:
+        params: dict = {"api_key": settings.TMDB_API_KEY,
+                        "language": "en-US", "page": 1,
+                        "sort_by": "popularity.desc",
+                        "include_adult": "false"}
+        if gid:
+            params["with_genres"] = str(gid)
+        if year:
+            params["primary_release_year"] = str(year)
+        resp = await _get_client().get("/discover/movie", params=params)
+        resp.raise_for_status()
+        for m in (resp.json().get("results") or [])[:limit]:
+            items.append({"title": m.get("title") or "",
+                          "year": extract_year(m.get("release_date") or "")})
+        items = [i for i in items if i["title"]]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("TMDB discover failed: %s", exc)
+        return []
+
+    if items:
+        try:
+            async with factory() as session:
+                session.add(TmdbCache(key=key, payload={"items": items}))
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("tmdb discover cache write failed: %s", exc)
+    return items
