@@ -488,9 +488,7 @@ async def file_detail(request: Request, fid: int):
         for k, v in [
             ("ID", f.id), ("Name", f.file_name), ("Size", _fmt_size(f.file_size)),
             ("MIME", f.mime_type), ("Quality", f.quality),
-            ("Language", f.language), ("Duration", f.duration),
-            ("Dimensions",
-             f"{f.width}×{f.height}" if f.width else None),
+            ("Language", f.language),
             ("Channel ID", f.channel_id), ("Message ID", f.message_id),
             ("Views", f.views), ("Forwards", f.forwards),
             ("Posted at", f.posted_at), ("Indexed at", f.created_at),

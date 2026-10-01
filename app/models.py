@@ -48,9 +48,6 @@ class File(Base):
     quality: Mapped[str | None] = mapped_column(String(16), index=True)
     language: Mapped[str | None] = mapped_column(String(32), index=True)
     title_key: Mapped[str | None] = mapped_column(Text, index=True)
-    width: Mapped[int | None] = mapped_column(Integer)
-    height: Mapped[int | None] = mapped_column(Integer)
-    duration: Mapped[int | None] = mapped_column(Integer)
     views: Mapped[int | None] = mapped_column(Integer)
     forwards: Mapped[int | None] = mapped_column(Integer)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -169,3 +166,20 @@ class BotSetting(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[dict | None] = mapped_column(JSON)
+
+
+class IndexSession(Base):
+    """Interactive /index setup state — survives bot restarts.
+
+    The in-memory ``state.pending_*`` dict is only an L1 cache; this
+    table is the source of truth so a number the admin sends after a
+    button tap is never lost (and never leaks to search).
+    """
+
+    __tablename__ = "index_sessions"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    data: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

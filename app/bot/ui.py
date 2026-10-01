@@ -24,14 +24,6 @@ def fmt_size(num: int | None) -> str:
     return f"{n:.1f} TB"
 
 
-def fmt_duration(sec: int | None) -> str:
-    if not sec:
-        return ""
-    m, s = divmod(int(sec), 60)
-    h, m = divmod(m, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
-
-
 def esc(s: str | None) -> str:
     return html.escape(s or "", quote=False)
 
@@ -61,9 +53,6 @@ def file_caption(f: dict) -> str:
     if q or lang:
         bits.append(f"🎞 {q or '—'} · 🗣 {lang or '—'}")
     bits.append(f"💾 {fmt_size(f.get('file_size'))}")
-    dur = fmt_duration(f.get("duration"))
-    if dur:
-        bits.append(f"⏱ {dur}")
     return "\n".join(bits)
 
 # ---------------------------------------------------------------- keyboards

@@ -19,6 +19,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
 from app import state
+from app.bot import ui
 from app.bot.handlers.common import admin_only, track_user
 from app.config import settings
 from app.db import get_session_factory
@@ -227,9 +228,13 @@ async def _ad_set(client: Client, query):
 async def _ask_reply(client: Client, query, action: str, prompt: str):
     gid = int(query.data.split(":")[1])
     uid = query.from_user.id
-    _pending[uid] = {"action": action, "gid": gid}
-    await query.message.reply_text(prompt + "\n<i>Reply here in PM. /cancel to abort.</i>",
-                                   parse_mode=ParseMode.HTML)
+    _pending[uid] = {"action": action, "gid": gid,
+                     "panel_msg_id": query.message.id}
+    # Turn the panel itself into the prompt — no extra message.
+    await query.message.edit_text(
+        prompt + "\n<i>Reply here in PM. /cancel to abort.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ui.ix_setup_cancel_kb())
     await query.answer()
 
 
@@ -265,10 +270,28 @@ async def _pending_reply(client: Client, message: Message):
     pend = _pending.get(uid)
     if not pend or not message.text:
         return
+    from pyrogram import StopPropagation
+
+    async def _restore_panel():
+        """Edit the panel back to the updated settings (clean UI)."""
+        g = await _get_group(pend["gid"])
+        if not g:
+            return
+        try:
+            await client.edit_message_text(
+                message.chat.id, pend.get("panel_msg_id"),
+                _panel_text(g), reply_markup=_panel_kb(g),
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
     if message.text.strip() == "/cancel":
         _pending.pop(uid, None)
-        await message.reply_text("Cancelled.")
-        from pyrogram import StopPropagation
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _restore_panel()
         raise StopPropagation
     text = message.text.strip()
     gid = pend["gid"]
@@ -280,20 +303,20 @@ async def _pending_reply(client: Client, message: Message):
                      if c.strip()]
         await _save_group(gid, None,
                           mutate=lambda s: {**s, "force_sub": chans})
-        await message.reply_text(
-            f"📢 Force-sub: {', '.join(chans) if chans else 'off'}")
     elif pend["action"] == "welcome":
         if text.lower() == "off":
             await _save_group(gid, None,
                               mutate=lambda s: {k: v for k, v in s.items()
                                                 if k != "welcome"})
-            await message.reply_text("👋 Welcome cleared.")
         else:
             await _save_group(gid, None,
                               mutate=lambda s: {**s, "welcome": text[:1000]})
-            await message.reply_text("👋 Welcome text saved.")
     _pending.pop(uid, None)
-    from pyrogram import StopPropagation
+    try:
+        await message.delete()  # panel shows the new value — no clutter
+    except Exception:
+        pass
+    await _restore_panel()
     raise StopPropagation
 
 

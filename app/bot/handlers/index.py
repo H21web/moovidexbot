@@ -188,7 +188,7 @@ async def _index(client: Client, message: Message):
 
     # --- /index cancel ---
     if text.lower() in ("/index cancel", "/cancel"):
-        state.pending_clear(uid)
+        await state.pending_clear(uid)
         stopped = 0
         for job_id, job in list(state._index_jobs.items()):
             if job.task and not job.task.done():
@@ -202,7 +202,7 @@ async def _index(client: Client, message: Message):
 
     # --- interactive setup when no channel given ---
     if not args["channel"]:
-        state.pending_set(uid, {"step": "channel"})
+        await state.pending_set(uid, {"step": "channel"})
         await message.reply_text(SETUP_PROMPT,
                                  reply_markup=ui.ix_setup_cancel_kb())
         return
@@ -223,7 +223,7 @@ async def _index(client: Client, message: Message):
     except Exception:
         pass
     title = getattr(chat, "title", None) or str(chat.id)
-    state.pending_set(uid, {
+    await state.pending_set(uid, {
         "step": "bootstrap",
         "chat_id": chat.id,
         "title": title,
@@ -248,7 +248,7 @@ async def _index_interactive(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else None
     if not uid or not settings.is_admin(uid):
         return
-    pending = state.pending_get(uid)
+    pending = await state.pending_get(uid)
     if not pending:
         return
     text = (message.text or message.caption or "").strip()
@@ -303,6 +303,7 @@ async def _index_interactive(client: Client, message: Message):
         panel = await message.reply_text(
             _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
         pending["panel_msg_id"] = panel.id
+        await state.pending_set(uid, pending)
         raise StopPropagation
 
     # --- step 1b: waiting for a forwarded message / post link ---
@@ -320,6 +321,7 @@ async def _index_interactive(client: Client, message: Message):
         panel = await message.reply_text(
             _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
         pending["panel_msg_id"] = panel.id
+        await state.pending_set(uid, pending)
         raise StopPropagation
 
 
@@ -328,12 +330,25 @@ async def _index_interactive(client: Client, message: Message):
         key = step[4:]
         digits = re.sub(r"[^\d]", "", text)
         if not digits and text != "0":
-            await message.reply_text(
-                "⚠️ Send a plain number (0 = off).",
-                reply_markup=ui.ix_setup_cancel_kb())
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await client.edit_message_text(
+                    message.chat.id, pending["panel_msg_id"],
+                    f"⚠️ Send a <b>plain number</b> for "
+                    f"<b>{OPT_LABELS.get(key, key)}</b> (0 = off).",
+                    reply_markup=ui.ix_setup_cancel_kb())
+            except Exception:
+                pass
             raise StopPropagation
         pending["opts"][key] = int(digits or 0)
         pending["step"] = "options"
+        try:
+            await message.delete()  # keep the chat clean: panel shows value
+        except Exception:
+            pass
         try:
             await client.edit_message_text(
                 message.chat.id, pending["panel_msg_id"],
@@ -341,9 +356,7 @@ async def _index_interactive(client: Client, message: Message):
                 reply_markup=ui.ix_setup_kb(pending))
         except Exception:
             pass
-        await message.reply_text(
-            f"✅ {OPT_LABELS.get(key, key)} = "
-            f"<b>{pending['opts'][key]:,}</b>")
+        await state.pending_set(uid, pending)
         raise StopPropagation
 
 
@@ -354,10 +367,10 @@ async def _ixs(client: Client, query: CallbackQuery):
         await query.answer("⛔ Admins only.", show_alert=True)
         return
     data = query.data or ""
-    pending = state.pending_get(uid)
+    pending = await state.pending_get(uid)
 
     if data == "ixs:cancel":
-        state.pending_clear(uid)
+        await state.pending_clear(uid)
         await query.message.edit_text("❌ Index setup cancelled.")
         await query.answer()
         return
@@ -375,13 +388,14 @@ async def _ixs(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Already indexing this channel.",
                                show_alert=True)
             return
-        state.pending_clear(uid)
+        await state.pending_clear(uid)
         await query.answer("Starting…")
+        # Reuse the panel message for progress — one message, edited.
+        prog = query.message
         try:
-            await query.message.edit_reply_markup(None)
+            await prog.edit_text("📥 <i>Starting…</i>")
         except Exception:
-            pass
-        prog = await query.message.reply_text("📥 <i>Starting…</i>")
+            prog = await query.message.reply_text("📥 <i>Starting…</i>")
         await _start_job(client, prog, str(chat_id),
                          skip=opts["skip"], from_id=opts["from_id"],
                          to_id=opts["to_id"], limit=opts["limit"],
@@ -394,9 +408,12 @@ async def _ixs(client: Client, query: CallbackQuery):
             await query.answer()
             return
         pending["step"] = f"opt:{key}"
-        await query.message.reply_text(
+        await state.pending_set(uid, pending)
+        # Turn the panel itself into the prompt — no extra message.
+        await query.message.edit_text(
             f"✏️ Send a number for <b>{OPT_LABELS[key]}</b>\n"
-            "(0 = off):")
+            "(0 = off):",
+            reply_markup=ui.ix_setup_cancel_kb())
         await query.answer()
         return
 

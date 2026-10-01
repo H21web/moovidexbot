@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 # --- tiny TTL cache (hot search results) ---
 _hot: dict[str, tuple[float, object]] = {}
@@ -57,19 +60,91 @@ def results_get(token: str) -> dict | None:
 #  "chat_id": int, "title": str,
 #  "opts": {"skip": int, "from_id": int, "to_id": int, "limit": int},
 #  "panel_msg_id": int | None}
+#
+# The in-memory dict is only an L1 cache — the ``index_sessions`` table
+# is the source of truth, so a setup survives bot restarts and works
+# even if two instances are briefly alive at once. Sessions expire
+# after 30 minutes of inactivity.
 _index_pending: dict[int, dict] = {}
 
-
-def pending_get(user_id: int) -> dict | None:
-    return _index_pending.get(user_id)
+PENDING_TTL = 1800
 
 
-def pending_set(user_id: int, data: dict) -> None:
+async def _pending_db_get(user_id: int):
+    from sqlalchemy import select
+
+    from app.config import settings
+    from app.db import get_session_factory
+    from app.models import IndexSession
+
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        return (await s.execute(
+            select(IndexSession).where(IndexSession.user_id == user_id)
+        )).scalar_one_or_none()
+
+
+async def pending_get(user_id: int) -> dict | None:
+    data = _index_pending.get(user_id)
+    if data is not None:
+        return data
+    try:
+        from datetime import datetime, timezone
+
+        row = await _pending_db_get(user_id)
+        if row is None:
+            return None
+        updated = row.updated_at
+        if updated is not None:
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - updated).total_seconds()
+            if age > PENDING_TTL:
+                await pending_clear(user_id)
+                return None
+        data = dict(row.data or {})
+        _index_pending[user_id] = data
+        return data
+    except Exception as exc:
+        log.debug("pending_get failed: %s", exc)
+        return None
+
+
+async def pending_set(user_id: int, data: dict) -> None:
     _index_pending[user_id] = data
+    try:
+        from app.config import settings
+        from app.db import get_session_factory
+        from app.models import IndexSession
+
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            row = (await s.get(IndexSession, user_id))
+            payload = dict(data)
+            if row is None:
+                s.add(IndexSession(user_id=user_id, data=payload))
+            else:
+                row.data = payload
+            await s.commit()
+    except Exception as exc:
+        log.debug("pending_set failed: %s", exc)
 
 
-def pending_clear(user_id: int) -> None:
+async def pending_clear(user_id: int) -> None:
     _index_pending.pop(user_id, None)
+    try:
+        from app.config import settings
+        from app.db import get_session_factory
+        from app.models import IndexSession
+
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            row = await s.get(IndexSession, user_id)
+            if row is not None:
+                await s.delete(row)
+                await s.commit()
+    except Exception as exc:
+        log.debug("pending_clear failed: %s", exc)
 
 
 # --- /index job registry (shared between engine and handlers) ---

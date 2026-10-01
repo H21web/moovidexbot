@@ -92,29 +92,25 @@ async def _back(client: Client, query):
         await query.message.edit_text("⌛ Expired — search again.")
         return
     page, total_pages, start = meta
-    # If we replaced the list message with a photo, go back with a new msg.
+    # Go back by editing the same message (it may currently be a card).
     text = (f"🔍 <b>Results for</b> {ui.esc(data['query'])}\n"
             f"<i>{len(data['groups'])} found</i>")
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    await client.send_message(
-        query.message.chat.id, text,
-        reply_markup=ui.results_kb(token, page, total_pages, chunk,
-                                   page_start=start))
+    await query.message.edit_text(
+        text, reply_markup=ui.results_kb(token, page, total_pages, chunk,
+                                         page_start=start))
 
 
 async def _deliver(client: Client, query):
     await query.answer("📤 Preparing your file…")
     uid = query.from_user.id
     if await is_banned(uid):
-        await query.message.reply_text("⛔ You are banned.")
+        await query.answer("⛔ You are banned.", show_alert=True)
         return
     kb = await forcesub.ensure_joined(client, uid,
                                       chat_id=query.message.chat.id)
     if kb:
-        await query.message.reply_text(
+        # Reuse the card message: swap its content for the join prompt.
+        await query.message.edit_text(
             "📢 <b>Join our channels to download</b>", reply_markup=kb)
         return
     try:
@@ -126,37 +122,41 @@ async def _deliver(client: Client, query):
         f = (await session.execute(
             select(File).where(File.id == file_db_id))).scalar_one_or_none()
     if not f:
-        await query.message.reply_text("❌ File not found (removed?).")
+        await query.answer("❌ File not found (removed?).", show_alert=True)
         return
 
-    status = await query.message.reply_text("📤 <i>Uploading…</i>")
+    await query.message.edit_text("📤 <i>Uploading…</i>")
     try:
-        sent = await client.send_document(
+        # send_cached_media (not send_document): send_document rejects
+        # non-document file_ids ("Expected DOCUMENT, got VIDEO"), which
+        # broke delivery for every video file.
+        sent = await client.send_cached_media(
             query.message.chat.id,
-            document=f.file_id,
+            file_id=f.file_id,
             caption=ui.file_caption({
                 "file_name": f.file_name, "quality": f.quality,
-                "language": f.language, "file_size": f.file_size,
-                "duration": f.duration}),
+                "language": f.language, "file_size": f.file_size}),
             parse_mode=ParseMode.HTML,
             reply_markup=ui.file_kb(
                 f.id, watch_url(f.id, uid)),
             protect_content=settings.PROTECT_CONTENT,
         )
     except FloodWait as exc:
-        await status.edit_text(f"⏳ Flood control — retry in {exc.value}s.")
+        await query.message.edit_text(
+            f"⏳ Flood control — retry in {exc.value}s.")
         return
     except Exception as exc:
         log.warning("deliver failed for file %d: %s", f.id, exc)
-        await status.edit_text("❌ Couldn't send the file. Try again later.")
+        await query.message.edit_text(
+            "❌ Couldn't send the file. Try again later.")
         return
     try:
-        await status.delete()
+        await query.message.delete()
     except Exception:
         pass
     asyncio.create_task(log_event("download", user_id=uid,
-                                  chat_id=query.message.chat.id))
-    ad = await effective_autodelete(query.message.chat.id)
+                                  chat_id=sent.chat.id))
+    ad = await effective_autodelete(sent.chat.id)
     if ad > 0:
         await autodelete.schedule(sent.chat.id, sent.id, ad)
 
@@ -164,19 +164,21 @@ async def _deliver(client: Client, query):
 async def _spell(client: Client, query):
     suggestion = query.data.split(":", 1)[1]
     await query.answer()
-    # Re-run search with the suggestion as a fresh message flow.
-    from app.bot.handlers.search import _do_search, _send_results
+    # Re-run search with the suggestion, reusing the same message.
+    from app.bot.handlers.search import _do_search
     uid = query.from_user.id
     token, groups = await _do_search(client, suggestion, uid)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
     if not token:
-        await client.send_message(query.message.chat.id,
-                                  "❌ Still nothing found.")
+        await query.message.edit_text("❌ Still nothing found.")
         return
-    await _send_results(client, query.message.chat.id, token, suggestion)
+    per = settings.RESULTS_PER_PAGE
+    total_pages = max(1, math.ceil(len(groups) / per))
+    chunk = groups[:per]
+    await query.message.edit_text(
+        f"🔍 <b>Results for</b> {ui.esc(suggestion)}\n"
+        f"<i>{len(groups)} found</i>",
+        reply_markup=ui.results_kb(token, 0, total_pages, chunk,
+                                   page_start=0))
 
 
 async def _fsub_retry(client: Client, query):
