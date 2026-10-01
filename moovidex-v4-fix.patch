@@ -1,0 +1,150 @@
+diff --git a/app/bot/forcesub.py b/app/bot/forcesub.py
+index 3fd37cf..df52553 100644
+--- a/app/bot/forcesub.py
++++ b/app/bot/forcesub.py
+@@ -14,10 +14,37 @@ log = logging.getLogger(__name__)
+ _LEFT = (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+ 
+ 
+-async def missing_channels(client, user_id: int) -> list[str]:
++async def _group_force_sub(chat_id: int | None) -> list[str]:
++    """Extra force-sub channels configured for a connected group."""
++    if chat_id is None:
++        return []
++    try:
++        from sqlalchemy import select
++
++        from app.db import get_session_factory
++        from app.models import Group
++
++        factory = get_session_factory(settings.DATABASE_URL)
++        async with factory() as s:
++            g = (await s.execute(
++                select(Group).where(Group.id == chat_id)
++            )).scalar_one_or_none()
++            if g and g.settings:
++                return list(g.settings.get("force_sub") or [])
++    except Exception as exc:
++        log.debug("group forcesub lookup failed: %s", exc)
++    return []
++
++
++async def missing_channels(client, user_id: int,
++                           chat_id: int | None = None) -> list[str]:
+     """Return the required channels the user has NOT joined."""
++    refs = list(settings.force_sub_channels)
++    for ref in await _group_force_sub(chat_id):
++        if ref not in refs:
++            refs.append(ref)
+     missing = []
+-    for ref in settings.force_sub_channels:
++    for ref in refs:
+         try:
+             member = await client.get_chat_member(ref, user_id)
+             if member.status in _LEFT:
+@@ -39,7 +66,8 @@ def join_kb(channels: list[str]) -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(rows)
+ 
+ 
+-async def ensure_joined(client, user_id: int) -> InlineKeyboardMarkup | None:
++async def ensure_joined(client, user_id: int,
++                      chat_id: int | None = None) -> InlineKeyboardMarkup | None:
+     """None if the user joined everything, else a join keyboard."""
+-    missing = await missing_channels(client, user_id)
++    missing = await missing_channels(client, user_id, chat_id)
+     return join_kb(missing) if missing else None
+diff --git a/app/bot/handlers/callbacks.py b/app/bot/handlers/callbacks.py
+index 6bd2d88..26adf46 100644
+--- a/app/bot/handlers/callbacks.py
++++ b/app/bot/handlers/callbacks.py
+@@ -111,7 +111,8 @@ async def _deliver(client: Client, query):
+     if await is_banned(uid):
+         await query.message.reply_text("⛔ You are banned.")
+         return
+-    kb = await forcesub.ensure_joined(client, uid)
++    kb = await forcesub.ensure_joined(client, uid,
++                                      chat_id=query.message.chat.id)
+     if kb:
+         await query.message.reply_text(
+             "📢 <b>Join our channels to download</b>", reply_markup=kb)
+@@ -179,7 +180,8 @@ async def _spell(client: Client, query):
+ 
+ 
+ async def _fsub_retry(client: Client, query):
+-    kb = await forcesub.ensure_joined(client, query.from_user.id)
++    kb = await forcesub.ensure_joined(client, query.from_user.id,
++                                      chat_id=query.message.chat.id)
+     if kb:
+         await query.answer("❌ You haven't joined all channels yet.",
+                            show_alert=True)
+diff --git a/app/bot/handlers/groups.py b/app/bot/handlers/groups.py
+index d9d7d4e..a072b0c 100644
+--- a/app/bot/handlers/groups.py
++++ b/app/bot/handlers/groups.py
+@@ -71,8 +71,11 @@ async def effective_autodelete(chat_id: int) -> int:
+         async with factory() as s:
+             g = (await s.execute(
+                 select(Group).where(Group.id == chat_id))).scalar_one_or_none()
+-            if g and g.settings.get("autodelete_seconds"):
+-                return int(g.settings["autodelete_seconds"])
++            if g is not None:
++                raw = (g.settings or {}).get("autodelete_seconds")
++                if raw is not None:
++                    # Explicit group value (including 0 = Off) wins.
++                    return int(raw)
+     except Exception as exc:
+         log.debug("effective_autodelete failed: %s", exc)
+     return int(await rt.aget_setting("AUTO_DELETE_SECONDS") or 0)
+diff --git a/app/bot/handlers/requests.py b/app/bot/handlers/requests.py
+index d1804cf..003c4aa 100644
+--- a/app/bot/handlers/requests.py
++++ b/app/bot/handlers/requests.py
+@@ -20,7 +20,8 @@ async def _request(client: Client, message: Message):
+     user = await track_user(message)
+     if user and user.is_banned:
+         return
+-    kb = await forcesub.ensure_joined(client, message.from_user.id)
++    kb = await forcesub.ensure_joined(client, message.from_user.id,
++                                      chat_id=message.chat.id)
+     if kb:
+         await message.reply_text("📢 <b>Join our channels first</b>",
+                                  reply_markup=kb)
+diff --git a/app/bot/handlers/search.py b/app/bot/handlers/search.py
+index 51ade44..8d17a4a 100644
+--- a/app/bot/handlers/search.py
++++ b/app/bot/handlers/search.py
+@@ -63,7 +63,7 @@ async def _on_text(client: Client, message: Message):
+     if user and user.is_banned:
+         return
+     uid = message.from_user.id
+-    kb = await forcesub.ensure_joined(client, uid)
++    kb = await forcesub.ensure_joined(client, uid, chat_id=message.chat.id)
+     if kb:
+         await message.reply_text(
+             "📢 <b>Join our channels to use the bot</b>",
+diff --git a/app/bot/handlers/start.py b/app/bot/handlers/start.py
+index 862a2f7..5a82cf1 100644
+--- a/app/bot/handlers/start.py
++++ b/app/bot/handlers/start.py
+@@ -48,7 +48,8 @@ async def _start(client: Client, message: Message):
+         return
+     asyncio.create_task(log_event("start", user_id=message.from_user.id,
+                                   chat_id=message.chat.id))
+-    kb = await forcesub.ensure_joined(client, message.from_user.id)
++    kb = await forcesub.ensure_joined(client, message.from_user.id,
++                                      chat_id=message.chat.id)
+     if kb:
+         await message.reply_text(
+             "📢 <b>Please join our channels first</b>, then tap Try Again.",
+diff --git a/requirements.txt b/requirements.txt
+index 862651f..f912fdb 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -7,6 +7,7 @@ fastapi>=0.110
+ uvicorn[standard]>=0.29
+ itsdangerous>=2.1
+ jinja2>=3.1
++python-multipart>=0.0.12
+ 
+ # Database
+ sqlalchemy[asyncio]>=2.0

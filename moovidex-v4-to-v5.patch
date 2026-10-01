@@ -1,0 +1,599 @@
+diff -ruN a/alembic/versions/0004_v5_fixes.py b/alembic/versions/0004_v5_fixes.py
+--- a/alembic/versions/0004_v5_fixes.py	1970-01-01 00:00:00.000000000 +0000
++++ b/alembic/versions/0004_v5_fixes.py	2026-10-01 06:22:12.873092379 +0000
+@@ -0,0 +1,42 @@
++"""v5 fixes.
++
++- Drop ``files.width`` / ``files.height`` / ``files.duration`` — Telegram
++  only sends those attributes for videos, documents carry none, so the
++  columns were dead weight.
++- New ``index_sessions`` table backing the interactive /index setup flow
++  (in-memory ``state.pending_*`` is only an L1 cache now — survives
++  restarts and multi-instance deploys).
++"""
++from __future__ import annotations
++
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects.postgresql import JSONB
++
++revision = "0004"
++down_revision = "0003"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    with op.batch_alter_table("files") as batch:
++        batch.drop_column("width")
++        batch.drop_column("height")
++        batch.drop_column("duration")
++    op.create_table(
++        "index_sessions",
++        sa.Column("user_id", sa.BigInteger(), primary_key=True),
++        sa.Column("data", JSONB(), nullable=False,
++                  server_default=sa.text("'{}'::jsonb")),
++        sa.Column("updated_at", sa.DateTime(timezone=True),
++                  server_default=sa.func.now(), nullable=False),
++    )
++
++
++def downgrade() -> None:
++    op.drop_table("index_sessions")
++    with op.batch_alter_table("files") as batch:
++        batch.add_column(sa.Column("width", sa.Integer(), nullable=True))
++        batch.add_column(sa.Column("height", sa.Integer(), nullable=True))
++        batch.add_column(sa.Column("duration", sa.Integer(), nullable=True))
+diff -ruN a/app/bot/handlers/callbacks.py b/app/bot/handlers/callbacks.py
+--- a/app/bot/handlers/callbacks.py	2026-10-01 06:22:12.856617890 +0000
++++ b/app/bot/handlers/callbacks.py	2026-10-01 06:22:12.861769406 +0000
+@@ -92,29 +92,25 @@
+         await query.message.edit_text("⌛ Expired — search again.")
+         return
+     page, total_pages, start = meta
+-    # If we replaced the list message with a photo, go back with a new msg.
++    # Go back by editing the same message (it may currently be a card).
+     text = (f"🔍 <b>Results for</b> {ui.esc(data['query'])}\n"
+             f"<i>{len(data['groups'])} found</i>")
+-    try:
+-        await query.message.delete()
+-    except Exception:
+-        pass
+-    await client.send_message(
+-        query.message.chat.id, text,
+-        reply_markup=ui.results_kb(token, page, total_pages, chunk,
+-                                   page_start=start))
++    await query.message.edit_text(
++        text, reply_markup=ui.results_kb(token, page, total_pages, chunk,
++                                         page_start=start))
+ 
+ 
+ async def _deliver(client: Client, query):
+     await query.answer("📤 Preparing your file…")
+     uid = query.from_user.id
+     if await is_banned(uid):
+-        await query.message.reply_text("⛔ You are banned.")
++        await query.answer("⛔ You are banned.", show_alert=True)
+         return
+     kb = await forcesub.ensure_joined(client, uid,
+                                       chat_id=query.message.chat.id)
+     if kb:
+-        await query.message.reply_text(
++        # Reuse the card message: swap its content for the join prompt.
++        await query.message.edit_text(
+             "📢 <b>Join our channels to download</b>", reply_markup=kb)
+         return
+     try:
+@@ -126,37 +122,41 @@
+         f = (await session.execute(
+             select(File).where(File.id == file_db_id))).scalar_one_or_none()
+     if not f:
+-        await query.message.reply_text("❌ File not found (removed?).")
++        await query.answer("❌ File not found (removed?).", show_alert=True)
+         return
+ 
+-    status = await query.message.reply_text("📤 <i>Uploading…</i>")
++    await query.message.edit_text("📤 <i>Uploading…</i>")
+     try:
+-        sent = await client.send_document(
++        # send_cached_media (not send_document): send_document rejects
++        # non-document file_ids ("Expected DOCUMENT, got VIDEO"), which
++        # broke delivery for every video file.
++        sent = await client.send_cached_media(
+             query.message.chat.id,
+-            document=f.file_id,
++            file_id=f.file_id,
+             caption=ui.file_caption({
+                 "file_name": f.file_name, "quality": f.quality,
+-                "language": f.language, "file_size": f.file_size,
+-                "duration": f.duration}),
++                "language": f.language, "file_size": f.file_size}),
+             parse_mode=ParseMode.HTML,
+             reply_markup=ui.file_kb(
+                 f.id, watch_url(f.id, uid)),
+             protect_content=settings.PROTECT_CONTENT,
+         )
+     except FloodWait as exc:
+-        await status.edit_text(f"⏳ Flood control — retry in {exc.value}s.")
++        await query.message.edit_text(
++            f"⏳ Flood control — retry in {exc.value}s.")
+         return
+     except Exception as exc:
+         log.warning("deliver failed for file %d: %s", f.id, exc)
+-        await status.edit_text("❌ Couldn't send the file. Try again later.")
++        await query.message.edit_text(
++            "❌ Couldn't send the file. Try again later.")
+         return
+     try:
+-        await status.delete()
++        await query.message.delete()
+     except Exception:
+         pass
+     asyncio.create_task(log_event("download", user_id=uid,
+-                                  chat_id=query.message.chat.id))
+-    ad = await effective_autodelete(query.message.chat.id)
++                                  chat_id=sent.chat.id))
++    ad = await effective_autodelete(sent.chat.id)
+     if ad > 0:
+         await autodelete.schedule(sent.chat.id, sent.id, ad)
+ 
+@@ -164,19 +164,21 @@
+ async def _spell(client: Client, query):
+     suggestion = query.data.split(":", 1)[1]
+     await query.answer()
+-    # Re-run search with the suggestion as a fresh message flow.
+-    from app.bot.handlers.search import _do_search, _send_results
++    # Re-run search with the suggestion, reusing the same message.
++    from app.bot.handlers.search import _do_search
+     uid = query.from_user.id
+     token, groups = await _do_search(client, suggestion, uid)
+-    try:
+-        await query.message.delete()
+-    except Exception:
+-        pass
+     if not token:
+-        await client.send_message(query.message.chat.id,
+-                                  "❌ Still nothing found.")
++        await query.message.edit_text("❌ Still nothing found.")
+         return
+-    await _send_results(client, query.message.chat.id, token, suggestion)
++    per = settings.RESULTS_PER_PAGE
++    total_pages = max(1, math.ceil(len(groups) / per))
++    chunk = groups[:per]
++    await query.message.edit_text(
++        f"🔍 <b>Results for</b> {ui.esc(suggestion)}\n"
++        f"<i>{len(groups)} found</i>",
++        reply_markup=ui.results_kb(token, 0, total_pages, chunk,
++                                   page_start=0))
+ 
+ 
+ async def _fsub_retry(client: Client, query):
+diff -ruN a/app/bot/handlers/groups.py b/app/bot/handlers/groups.py
+--- a/app/bot/handlers/groups.py	2026-10-01 06:22:12.856854265 +0000
++++ b/app/bot/handlers/groups.py	2026-10-01 06:22:12.862461736 +0000
+@@ -19,6 +19,7 @@
+ from sqlalchemy import select
+ 
+ from app import state
++from app.bot import ui
+ from app.bot.handlers.common import admin_only, track_user
+ from app.config import settings
+ from app.db import get_session_factory
+@@ -227,9 +228,13 @@
+ async def _ask_reply(client: Client, query, action: str, prompt: str):
+     gid = int(query.data.split(":")[1])
+     uid = query.from_user.id
+-    _pending[uid] = {"action": action, "gid": gid}
+-    await query.message.reply_text(prompt + "\n<i>Reply here in PM. /cancel to abort.</i>",
+-                                   parse_mode=ParseMode.HTML)
++    _pending[uid] = {"action": action, "gid": gid,
++                     "panel_msg_id": query.message.id}
++    # Turn the panel itself into the prompt — no extra message.
++    await query.message.edit_text(
++        prompt + "\n<i>Reply here in PM. /cancel to abort.</i>",
++        parse_mode=ParseMode.HTML,
++        reply_markup=ui.ix_setup_cancel_kb())
+     await query.answer()
+ 
+ 
+@@ -265,10 +270,28 @@
+     pend = _pending.get(uid)
+     if not pend or not message.text:
+         return
++    from pyrogram import StopPropagation
++
++    async def _restore_panel():
++        """Edit the panel back to the updated settings (clean UI)."""
++        g = await _get_group(pend["gid"])
++        if not g:
++            return
++        try:
++            await client.edit_message_text(
++                message.chat.id, pend.get("panel_msg_id"),
++                _panel_text(g), reply_markup=_panel_kb(g),
++                parse_mode=ParseMode.HTML)
++        except Exception:
++            pass
++
+     if message.text.strip() == "/cancel":
+         _pending.pop(uid, None)
+-        await message.reply_text("Cancelled.")
+-        from pyrogram import StopPropagation
++        try:
++            await message.delete()
++        except Exception:
++            pass
++        await _restore_panel()
+         raise StopPropagation
+     text = message.text.strip()
+     gid = pend["gid"]
+@@ -280,20 +303,20 @@
+                      if c.strip()]
+         await _save_group(gid, None,
+                           mutate=lambda s: {**s, "force_sub": chans})
+-        await message.reply_text(
+-            f"📢 Force-sub: {', '.join(chans) if chans else 'off'}")
+     elif pend["action"] == "welcome":
+         if text.lower() == "off":
+             await _save_group(gid, None,
+                               mutate=lambda s: {k: v for k, v in s.items()
+                                                 if k != "welcome"})
+-            await message.reply_text("👋 Welcome cleared.")
+         else:
+             await _save_group(gid, None,
+                               mutate=lambda s: {**s, "welcome": text[:1000]})
+-            await message.reply_text("👋 Welcome text saved.")
+     _pending.pop(uid, None)
+-    from pyrogram import StopPropagation
++    try:
++        await message.delete()  # panel shows the new value — no clutter
++    except Exception:
++        pass
++    await _restore_panel()
+     raise StopPropagation
+ 
+ 
+diff -ruN a/app/bot/handlers/index.py b/app/bot/handlers/index.py
+--- a/app/bot/handlers/index.py	2026-10-01 06:22:12.856740804 +0000
++++ b/app/bot/handlers/index.py	2026-10-01 06:22:12.862010157 +0000
+@@ -188,7 +188,7 @@
+ 
+     # --- /index cancel ---
+     if text.lower() in ("/index cancel", "/cancel"):
+-        state.pending_clear(uid)
++        await state.pending_clear(uid)
+         stopped = 0
+         for job_id, job in list(state._index_jobs.items()):
+             if job.task and not job.task.done():
+@@ -202,7 +202,7 @@
+ 
+     # --- interactive setup when no channel given ---
+     if not args["channel"]:
+-        state.pending_set(uid, {"step": "channel"})
++        await state.pending_set(uid, {"step": "channel"})
+         await message.reply_text(SETUP_PROMPT,
+                                  reply_markup=ui.ix_setup_cancel_kb())
+         return
+@@ -223,7 +223,7 @@
+     except Exception:
+         pass
+     title = getattr(chat, "title", None) or str(chat.id)
+-    state.pending_set(uid, {
++    await state.pending_set(uid, {
+         "step": "bootstrap",
+         "chat_id": chat.id,
+         "title": title,
+@@ -248,7 +248,7 @@
+     uid = message.from_user.id if message.from_user else None
+     if not uid or not settings.is_admin(uid):
+         return
+-    pending = state.pending_get(uid)
++    pending = await state.pending_get(uid)
+     if not pending:
+         return
+     text = (message.text or message.caption or "").strip()
+@@ -303,6 +303,7 @@
+         panel = await message.reply_text(
+             _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
+         pending["panel_msg_id"] = panel.id
++        await state.pending_set(uid, pending)
+         raise StopPropagation
+ 
+     # --- step 1b: waiting for a forwarded message / post link ---
+@@ -320,6 +321,7 @@
+         panel = await message.reply_text(
+             _setup_text(pending), reply_markup=ui.ix_setup_kb(pending))
+         pending["panel_msg_id"] = panel.id
++        await state.pending_set(uid, pending)
+         raise StopPropagation
+ 
+ 
+@@ -328,22 +330,33 @@
+         key = step[4:]
+         digits = re.sub(r"[^\d]", "", text)
+         if not digits and text != "0":
+-            await message.reply_text(
+-                "⚠️ Send a plain number (0 = off).",
+-                reply_markup=ui.ix_setup_cancel_kb())
++            try:
++                await message.delete()
++            except Exception:
++                pass
++            try:
++                await client.edit_message_text(
++                    message.chat.id, pending["panel_msg_id"],
++                    f"⚠️ Send a <b>plain number</b> for "
++                    f"<b>{OPT_LABELS.get(key, key)}</b> (0 = off).",
++                    reply_markup=ui.ix_setup_cancel_kb())
++            except Exception:
++                pass
+             raise StopPropagation
+         pending["opts"][key] = int(digits or 0)
+         pending["step"] = "options"
+         try:
++            await message.delete()  # keep the chat clean: panel shows value
++        except Exception:
++            pass
++        try:
+             await client.edit_message_text(
+                 message.chat.id, pending["panel_msg_id"],
+                 _setup_text(pending),
+                 reply_markup=ui.ix_setup_kb(pending))
+         except Exception:
+             pass
+-        await message.reply_text(
+-            f"✅ {OPT_LABELS.get(key, key)} = "
+-            f"<b>{pending['opts'][key]:,}</b>")
++        await state.pending_set(uid, pending)
+         raise StopPropagation
+ 
+ 
+@@ -354,10 +367,10 @@
+         await query.answer("⛔ Admins only.", show_alert=True)
+         return
+     data = query.data or ""
+-    pending = state.pending_get(uid)
++    pending = await state.pending_get(uid)
+ 
+     if data == "ixs:cancel":
+-        state.pending_clear(uid)
++        await state.pending_clear(uid)
+         await query.message.edit_text("❌ Index setup cancelled.")
+         await query.answer()
+         return
+@@ -375,13 +388,14 @@
+             await query.answer("⚠️ Already indexing this channel.",
+                                show_alert=True)
+             return
+-        state.pending_clear(uid)
++        await state.pending_clear(uid)
+         await query.answer("Starting…")
++        # Reuse the panel message for progress — one message, edited.
++        prog = query.message
+         try:
+-            await query.message.edit_reply_markup(None)
++            await prog.edit_text("📥 <i>Starting…</i>")
+         except Exception:
+-            pass
+-        prog = await query.message.reply_text("📥 <i>Starting…</i>")
++            prog = await query.message.reply_text("📥 <i>Starting…</i>")
+         await _start_job(client, prog, str(chat_id),
+                          skip=opts["skip"], from_id=opts["from_id"],
+                          to_id=opts["to_id"], limit=opts["limit"],
+@@ -394,9 +408,12 @@
+             await query.answer()
+             return
+         pending["step"] = f"opt:{key}"
+-        await query.message.reply_text(
++        await state.pending_set(uid, pending)
++        # Turn the panel itself into the prompt — no extra message.
++        await query.message.edit_text(
+             f"✏️ Send a number for <b>{OPT_LABELS[key]}</b>\n"
+-            "(0 = off):")
++            "(0 = off):",
++            reply_markup=ui.ix_setup_cancel_kb())
+         await query.answer()
+         return
+ 
+diff -ruN a/app/bot/ui.py b/app/bot/ui.py
+--- a/app/bot/ui.py	2026-10-01 06:22:12.856271430 +0000
++++ b/app/bot/ui.py	2026-10-01 06:22:12.865429332 +0000
+@@ -24,14 +24,6 @@
+     return f"{n:.1f} TB"
+ 
+ 
+-def fmt_duration(sec: int | None) -> str:
+-    if not sec:
+-        return ""
+-    m, s = divmod(int(sec), 60)
+-    h, m = divmod(m, 60)
+-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+-
+-
+ def esc(s: str | None) -> str:
+     return html.escape(s or "", quote=False)
+ 
+@@ -61,9 +53,6 @@
+     if q or lang:
+         bits.append(f"🎞 {q or '—'} · 🗣 {lang or '—'}")
+     bits.append(f"💾 {fmt_size(f.get('file_size'))}")
+-    dur = fmt_duration(f.get("duration"))
+-    if dur:
+-        bits.append(f"⏱ {dur}")
+     return "\n".join(bits)
+ 
+ # ---------------------------------------------------------------- keyboards
+diff -ruN a/app/indexer.py b/app/indexer.py
+--- a/app/indexer.py	2026-10-01 06:22:12.855851439 +0000
++++ b/app/indexer.py	2026-10-01 06:22:12.869796400 +0000
+@@ -81,9 +81,6 @@
+         "quality": quality,
+         "language": language,
+         "title_key": title_key(file_name) or None,
+-        "width": getattr(media, "width", None),
+-        "height": getattr(media, "height", None),
+-        "duration": getattr(media, "duration", None),
+         "views": getattr(msg, "views", None),
+         "forwards": getattr(msg, "forwards", None),
+         "posted_at": date,
+diff -ruN a/app/models.py b/app/models.py
+--- a/app/models.py	2026-10-01 06:22:12.855679971 +0000
++++ b/app/models.py	2026-10-01 06:22:12.869328287 +0000
+@@ -48,9 +48,6 @@
+     quality: Mapped[str | None] = mapped_column(String(16), index=True)
+     language: Mapped[str | None] = mapped_column(String(32), index=True)
+     title_key: Mapped[str | None] = mapped_column(Text, index=True)
+-    width: Mapped[int | None] = mapped_column(Integer)
+-    height: Mapped[int | None] = mapped_column(Integer)
+-    duration: Mapped[int | None] = mapped_column(Integer)
+     views: Mapped[int | None] = mapped_column(Integer)
+     forwards: Mapped[int | None] = mapped_column(Integer)
+     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+@@ -169,3 +166,20 @@
+ 
+     key: Mapped[str] = mapped_column(String(64), primary_key=True)
+     value: Mapped[dict | None] = mapped_column(JSON)
++
++
++class IndexSession(Base):
++    """Interactive /index setup state — survives bot restarts.
++
++    The in-memory ``state.pending_*`` dict is only an L1 cache; this
++    table is the source of truth so a number the admin sends after a
++    button tap is never lost (and never leaks to search).
++    """
++
++    __tablename__ = "index_sessions"
++
++    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
++    data: Mapped[dict] = mapped_column(JSONB, default=dict)
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
++    )
+diff -ruN a/app/state.py b/app/state.py
+--- a/app/state.py	2026-10-01 06:22:12.855631699 +0000
++++ b/app/state.py	2026-10-01 06:22:12.869160775 +0000
+@@ -2,10 +2,13 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import logging
+ import time
+ import uuid
+ from dataclasses import dataclass, field
+ 
++log = logging.getLogger(__name__)
++
+ # --- tiny TTL cache (hot search results) ---
+ _hot: dict[str, tuple[float, object]] = {}
+ HOT_TTL = 300
+@@ -57,19 +60,91 @@
+ #  "chat_id": int, "title": str,
+ #  "opts": {"skip": int, "from_id": int, "to_id": int, "limit": int},
+ #  "panel_msg_id": int | None}
++#
++# The in-memory dict is only an L1 cache — the ``index_sessions`` table
++# is the source of truth, so a setup survives bot restarts and works
++# even if two instances are briefly alive at once. Sessions expire
++# after 30 minutes of inactivity.
+ _index_pending: dict[int, dict] = {}
+ 
++PENDING_TTL = 1800
++
++
++async def _pending_db_get(user_id: int):
++    from sqlalchemy import select
+ 
+-def pending_get(user_id: int) -> dict | None:
+-    return _index_pending.get(user_id)
++    from app.config import settings
++    from app.db import get_session_factory
++    from app.models import IndexSession
++
++    factory = get_session_factory(settings.DATABASE_URL)
++    async with factory() as s:
++        return (await s.execute(
++            select(IndexSession).where(IndexSession.user_id == user_id)
++        )).scalar_one_or_none()
++
++
++async def pending_get(user_id: int) -> dict | None:
++    data = _index_pending.get(user_id)
++    if data is not None:
++        return data
++    try:
++        from datetime import datetime, timezone
++
++        row = await _pending_db_get(user_id)
++        if row is None:
++            return None
++        updated = row.updated_at
++        if updated is not None:
++            if updated.tzinfo is None:
++                updated = updated.replace(tzinfo=timezone.utc)
++            age = (datetime.now(timezone.utc) - updated).total_seconds()
++            if age > PENDING_TTL:
++                await pending_clear(user_id)
++                return None
++        data = dict(row.data or {})
++        _index_pending[user_id] = data
++        return data
++    except Exception as exc:
++        log.debug("pending_get failed: %s", exc)
++        return None
+ 
+ 
+-def pending_set(user_id: int, data: dict) -> None:
++async def pending_set(user_id: int, data: dict) -> None:
+     _index_pending[user_id] = data
++    try:
++        from app.config import settings
++        from app.db import get_session_factory
++        from app.models import IndexSession
++
++        factory = get_session_factory(settings.DATABASE_URL)
++        async with factory() as s:
++            row = (await s.get(IndexSession, user_id))
++            payload = dict(data)
++            if row is None:
++                s.add(IndexSession(user_id=user_id, data=payload))
++            else:
++                row.data = payload
++            await s.commit()
++    except Exception as exc:
++        log.debug("pending_set failed: %s", exc)
+ 
+ 
+-def pending_clear(user_id: int) -> None:
++async def pending_clear(user_id: int) -> None:
+     _index_pending.pop(user_id, None)
++    try:
++        from app.config import settings
++        from app.db import get_session_factory
++        from app.models import IndexSession
++
++        factory = get_session_factory(settings.DATABASE_URL)
++        async with factory() as s:
++            row = await s.get(IndexSession, user_id)
++            if row is not None:
++                await s.delete(row)
++                await s.commit()
++    except Exception as exc:
++        log.debug("pending_clear failed: %s", exc)
+ 
+ 
+ # --- /index job registry (shared between engine and handlers) ---
+diff -ruN a/app/web/admin.py b/app/web/admin.py
+--- a/app/web/admin.py	2026-10-01 06:22:12.857239113 +0000
++++ b/app/web/admin.py	2026-10-01 06:22:12.867270206 +0000
+@@ -488,9 +488,7 @@
+         for k, v in [
+             ("ID", f.id), ("Name", f.file_name), ("Size", _fmt_size(f.file_size)),
+             ("MIME", f.mime_type), ("Quality", f.quality),
+-            ("Language", f.language), ("Duration", f.duration),
+-            ("Dimensions",
+-             f"{f.width}×{f.height}" if f.width else None),
++            ("Language", f.language),
+             ("Channel ID", f.channel_id), ("Message ID", f.message_id),
+             ("Views", f.views), ("Forwards", f.forwards),
+             ("Posted at", f.posted_at), ("Indexed at", f.created_at),
