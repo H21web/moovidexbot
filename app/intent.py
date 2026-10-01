@@ -23,6 +23,14 @@ _GREET_RE = re.compile(r"^(hi+|hello|hey|hai|thanks|thank you|nanni|bye)\b",
                        re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\b(request|add cheyy\w*|upload|please.*(add|upload))\b",
                          re.IGNORECASE)
+# v9.2: a bare "title?" is a search, not a question. Question words that
+# keep the "?" -> question routing. "undo" is deliberately excluded:
+# "<movie> undo?" asks whether the file exists -> movie_search.
+_QUESTION_WORD_RE = re.compile(
+    r"\b(what|when|where|who|whom|whose|which|why|how|is|are|was|were|"
+    r"do|does|did|can|could|will|would|should|may|etha|entha|enth|evide|"
+    r"eppol|epo|aara|aar|ethra|engane|engine|aano|alle|aakumo)\b",
+    re.IGNORECASE)
 
 
 def _keyword_intent(text: str) -> str:
@@ -41,7 +49,15 @@ def _keyword_intent(text: str) -> str:
             return "question"
         return "movie_search"
     if "?" in t:
-        return "question"
+        # v9.2: "kgf?" (no question word) is a movie search; a real
+        # question ("best movie etha?", "bot work cheyyunno?") keeps
+        # question routing.
+        if _QUESTION_WORD_RE.search(t):
+            return "question"
+        # Manglish verb question suffix: "cheyyunno?", "varumo?"
+        if re.search(r"(unno|umo)\?\s*$", t, re.IGNORECASE):
+            return "question"
+        return "movie_search"
     if _QUESTION_START.match(t):
         return "question"
     if _ML_QUESTION_START.match(t):

@@ -180,18 +180,20 @@ async def render_v8_results(client: Client, message: Message,
         await message.edit_text(text, reply_markup=kb,
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True)
+        data["page"] = page  # v9.3: background enrich re-renders this page
     except Exception:
         log.debug("v8 render edit failed", exc_info=True)
 
 
 async def _v9_search_flow(client: Client, message: Message,
                          uid: int, q: str) -> bool:
-    """v9.1 PM search: smart search, AI only on failure + verdict.
+    """v9.3 PM search: fast + accurate, zero AI on the hot path.
 
     Always handles the message (True) except on unexpected failure.
-    Hot path is AI-free: keyword intent, local parse, DB sweeps, enrich,
-    verdict. AI is used only for the no-results spell-correction chain
-    and the one-line verdict (with a local fallback so it always shows).
+    Flow: keyword intent -> local parse -> parallel DB sweeps -> instant
+    local verdict -> results render IMMEDIATELY -> enrich (poster/info)
+    fills in via a background edit. AI is used only for the no-results
+    spell-correction chain.
     """
     wait = await message.reply_text("\U0001F50D <i>Searching…</i>")
     try:
@@ -229,15 +231,13 @@ async def _v9_search_flow(client: Client, message: Message,
             return True
 
     asyncio.create_task(ai.remember(uid, "user", q))
-    from app import enrich as enrich_mod
-    meta = await enrich_mod.enrich_title(res["title"] or q,
-                                         res["parsed"].get("year"), uid)
-    ai_note = await ai_assist.ai_verdict(uid, res["best"],
-                                         res["title"] or q)
+    # v9.3: verdict is local (no AI). Results render instantly; enrich
+    # (poster/info) fills in via a background edit when ready.
+    ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
     token = state.v8_put({
         "files": res["files"],
         "best": res["best"],
-        "meta": meta,
+        "meta": None,  # filled by _fill_meta below
         "query": q,
         "user_id": uid,
         "filters": {},
@@ -245,7 +245,37 @@ async def _v9_search_flow(client: Client, message: Message,
         "ai_note": ai_note,
     })
     await render_v8_results(client, wait, token, uid, page=0)
+    asyncio.create_task(_fill_meta(client, wait, token, uid,
+                                   res["title"] or q,
+                                   res["parsed"].get("year")))
     return True
+
+
+async def _fill_meta(client: Client, message: Message, token: str,
+                     uid: int, title: str, year: int | None) -> None:
+    """Background enrich: add poster/info to an already-rendered result.
+
+    Never raises; silently skips when enrich finds nothing, the results
+    expired, or the user moved on. Re-renders the page the user is
+    currently on so pagination/filtering is never clobbered.
+    """
+    try:
+        from app import enrich as enrich_mod
+        meta = await enrich_mod.enrich_title(title, year, uid)
+    except Exception:  # noqa: BLE001
+        log.debug("v9 background enrich failed", exc_info=True)
+        return
+    if not meta:
+        return
+    data = state.v8_get(token)
+    if not data or data.get("user_id") != uid or data.get("meta"):
+        return
+    data["meta"] = meta
+    try:
+        await render_v8_results(client, message, token, uid,
+                                page=data.get("page", 0))
+    except Exception:  # noqa: BLE001
+        log.debug("v9 background enrich render failed", exc_info=True)
 
 
 async def _on_text(client: Client, message: Message):

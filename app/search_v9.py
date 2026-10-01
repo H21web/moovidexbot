@@ -22,13 +22,14 @@ uncertain candidates, suggest corrections) — search never depends on it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
 from sqlalchemy import func, select
 
 from app import personalize
-from app.ai_search import _query_season_episode, ai_parse_query
+from app.ai_search import _query_season_episode
 from app.bot.v8_ui import sort_best_first
 from app.config import settings
 from app.db import get_session_factory
@@ -132,24 +133,30 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     parsed = await _ai_parse_if_needed(user_id, raw, parsed)
     title = (parsed.get("title") or raw).strip()
 
-    # --- multi-sweep: every variant, best score per file id --------------
+    # --- multi-sweep (parallel): every variant, best score per file id --
+    variants = _sweep_queries(raw, parsed)
     merged: dict[int, dict] = {}
-    first = True
-    for variant in _sweep_queries(raw, parsed):
+
+    async def _one(variant: str, log_q: bool) -> tuple[str, list]:
         try:
             items, _ = await search_files(variant, user_id=user_id,
-                                          log_query=first)
+                                          log_query=log_q)
+            return variant, items
         except Exception as exc:  # noqa: BLE001
             log.warning("v9 sweep %r failed: %s", variant, exc)
-            continue
-        first = False
-        for it in items:
-            fid = it.get("id")
-            if fid is None:
-                continue
-            prev = merged.get(fid)
-            if prev is None or (it.get("score") or 0) > (prev.get("score") or 0):
-                merged[fid] = it
+            return variant, []
+
+    if variants:
+        for variant, items in await asyncio.gather(
+                *(_one(v, i == 0) for i, v in enumerate(variants))):
+            for it in items:
+                fid = it.get("id")
+                if fid is None:
+                    continue
+                prev = merged.get(fid)
+                if prev is None or (it.get("score") or 0) > (
+                        prev.get("score") or 0):
+                    merged[fid] = it
 
     # --- fuzzy retry when hits are thin ----------------------------------
     if len(merged) < MIN_HITS:

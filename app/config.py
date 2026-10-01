@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     AI_FALLBACK_MODELS: str = ""
     WEBSEARCH_API_URL: str = "https://moovidex.alwaysdata.net"  # web search API for ai_web_answer
     # Max AI actions per user per day (one AI search/chat ≈ 2 Groq calls).
-    AI_DAILY_QUOTA: int = 20
+    AI_DAILY_QUOTA: int = 50
 
     # --- Behaviour ---
     RESULTS_PER_PAGE: int = 8

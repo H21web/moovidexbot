@@ -171,11 +171,6 @@ def best_pick_line(best: dict) -> str:
 # AI only *enhances* (verdict line, no-result suggestion); the flow works
 # fully with AI off.
 
-VERDICT_SYSTEM = (
-    "You write a ONE-LINE recommendation note (under 18 words, friendly). "
-    "Say why this file is the best pick. Plain text, no markdown, no quotes."
-)
-
 SUGGEST_SYSTEM = (
     "You correct movie/series search queries. Reply with ONLY the most "
     "likely intended movie or series title, nothing else. No year, no quotes."
@@ -201,26 +196,6 @@ def _query_season_episode(parsed: dict, files: list[dict]) -> list[dict]:
             continue
         kept.append(f)
     return kept or files
-
-
-async def _ai_verdict(user_id: int, best: dict, title: str) -> str | None:
-    """One-line AI note on why this file is the best pick (optional)."""
-    if not ai.is_configured():
-        return None
-    try:
-        if await ai.quota_remaining(user_id) <= 0:
-            return None
-        desc = (f"{title}: {(best.get('file_name') or '')[:80]}, "
-                f"{best.get('quality') or '?'}, {best.get('language') or '?'}")
-        note = await ai.groq_complete(VERDICT_SYSTEM,
-                                      f"Best pick -> {desc}",
-                                      max_tokens=60)
-        if note:
-            await ai.quota_use(user_id)
-            return " ".join(note.strip().split())[:160] or None
-    except Exception as exc:  # noqa: BLE001
-        log.debug("ai verdict failed: %s", exc)
-    return None
 
 
 async def ai_suggest_title(user_id: int, q: str) -> str | None:
@@ -301,7 +276,8 @@ async def v8_search(user_id: int, q: str) -> dict:
 
     meta = await enrich_mod.enrich_title(title or q, parsed.get("year"),
                                          user_id)
-    ai_note = await _ai_verdict(user_id, best, title or q)
+    from app.ai_assist import verdict_line  # v9.3: local verdict, no AI
+    ai_note = verdict_line(best, title or q)
 
     return {"status": "ok", "intent": "search", "title": title,
             "files": files, "best": best, "meta": meta,

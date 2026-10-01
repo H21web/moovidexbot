@@ -5,10 +5,9 @@ Two AI touchpoints, nothing on the hot path:
 1. **No results** — :func:`assist_no_results` runs the recovery chain:
    AI title correction -> DB retry -> spell suggestions -> give up
    honestly. This is the ONLY search-time AI besides the verdict.
-2. **Verdict** — :func:`ai_verdict` writes the one-line best-pick note.
-   AI first; a deterministic local line as fallback so the 💡 verdict
-   ALWAYS shows (it was starving when v9's router/parse/judge burned
-   the quota).
+2. **Verdict** — :func:`verdict_line` writes the one-line best-pick note
+   with the old deterministic technique (downloads / quality /
+   language). Zero AI, zero quota — it always shows.
 
 The old "uncertain" AI judge was removed in v9.1 (speed + quota).
 """
@@ -53,27 +52,17 @@ async def assist_no_results(user_id: int | None, q: str) -> dict:
     return {"action": "none"}
 
 
-def _local_verdict(best: dict, title: str) -> str:
-    """Deterministic verdict so the 💡 line ALWAYS renders."""
-    dl = best.get("downloads") or 0
+def verdict_line(best: dict, title: str) -> str:
+    """v9.3: one-line best-pick note. Local only — no AI, no quota.
+
+    Always returns a non-empty line, so the 💡 verdict renders on
+    every result.
+    """
+    dl = (best or {}).get("downloads") or 0
     if dl:
         return f"Most downloaded pick — {dl} downloads"
-    bits = [x for x in (best.get("quality"), best.get("language")) if x]
+    bits = [x for x in ((best or {}).get("quality"),
+                        (best or {}).get("language")) if x]
     if bits:
         return f"Best {' '.join(bits)} match for \u201c{title}\u201d"
     return f"Top match for \u201c{title}\u201d"
-
-
-async def ai_verdict(user_id: int | None, best: dict,
-                     title: str) -> str:
-    """One-line best-pick note. AI first, local fallback — never empty."""
-    try:
-        from app.ai_search import _ai_verdict
-        note = await _ai_verdict(user_id or 0, best, title)
-        if note:
-            return note
-    except Exception as exc:  # noqa: BLE001
-        log.debug("v9 verdict failed: %s", exc)
-    note = _local_verdict(best, title or "")
-    log.info("v9 verdict: local fallback %r", note[:60])
-    return note
