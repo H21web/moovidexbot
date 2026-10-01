@@ -471,6 +471,55 @@ async def ai_chat(user_id: int, text: str) -> tuple[str | None, str]:
     return reply, "ok"
 
 
+# ------------------------------------------------------------------ web RAG
+
+WEBSEARCH_URL = settings.WEBSEARCH_API_URL.rstrip("/")
+
+WEBQA_SYSTEM = (
+    "You answer using ONLY the web search results below. "
+    "Cite sources like [1], [2]. If the results don't contain the answer, "
+    "say so honestly \u2014 never invent. Keep it short (under 100 words). "
+    "Manglish-friendly tone is fine."
+)
+
+
+async def ai_web_answer(user_id: int, query: str) -> tuple[str | None, str]:
+    """Live web Q&A: search API results -> Groq answer.
+
+    Returns ``(answer, status)``; status in "ok" | "no_quota" | "no_results"
+    | "ai_off" | "failed". Uses one quota unit only when an answer is made.
+    """
+    if not is_configured():
+        return None, "ai_off"
+    if await quota_remaining(user_id) <= 0:
+        return None, "no_quota"
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0, connect=5.0)) as c:
+            r = await c.get(f"{WEBSEARCH_URL}/search",
+                            params={"q": query[:300], "num": 5})
+            r.raise_for_status()
+            results = (r.json() or {}).get("results") or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("websearch api failed: %s", exc)
+        return None, "failed"
+    if not results:
+        return None, "no_results"
+    ctx = "\n".join(
+        f"[{i + 1}] {(x.get('title') or '').strip()}"
+        + (f": {(x.get('snippet') or '').strip()}" if x.get("snippet") else "")
+        + f" ({x.get('url') or ''})"
+        for i, x in enumerate(results[:5]))
+    ans = await groq_complete(
+        WEBQA_SYSTEM,
+        f"Question: {query[:300]}\n\nWeb search results:\n{ctx}",
+        max_tokens=300)
+    if not ans:
+        return None, "failed"
+    await quota_use(user_id)
+    return ans, "ok"
+
+
 async def close_client() -> None:
     global _client
     if _client is not None:

@@ -105,9 +105,19 @@ async def _no_results_pm(client: Client, message: Message, q: str):
 
 
 async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
-    """Route a question-like PM message to the Groq chat."""
+    """Route a question-like PM message to Groq: live web answer first,
+    entertainment chat as fallback."""
     wait = await message.reply_text("🤖 <i>thinking…</i>")
     try:
+        reply, status = await ai.ai_web_answer(uid, q)
+        if status == "ok":
+            await wait.edit_text(reply)
+            return
+        if status == "no_quota":
+            await wait.edit_text(
+                "🤖 Daily AI limit reached — try again tomorrow 🌙")
+            return
+        # no_results / failed / ai_off -> fall through to normal chat
         reply, status = await ai.ai_chat(uid, q)
         if status in ("ok", "cached"):
             await wait.edit_text(reply)
