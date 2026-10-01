@@ -14,7 +14,7 @@ from sqlalchemy import select
 from app import ai, personalize, state
 from app import autodelete
 from app.analytics import log_event
-from app.bot import forcesub, ui
+from app.bot import forcesub, ui, v8_ui
 from app.bot.handlers.common import is_banned
 from app.bot.handlers.groups import effective_autodelete
 from app.config import settings
@@ -127,8 +127,7 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
             "file_name": f.file_name, "quality": f.quality,
             "language": f.language, "file_size": f.file_size}),
         parse_mode=ParseMode.HTML,
-        reply_markup=ui.file_kb(
-            f.id, watch_url(f.id, uid)),
+        reply_markup=v8_ui.v8_file_kb(f.id, uid),
         protect_content=settings.PROTECT_CONTENT,
     )
     asyncio.create_task(log_event("download", user_id=uid,
@@ -374,3 +373,76 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
     bot.on_callback_query(filters.regex(r"^aiq:"))(_aiq)
     bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
+    bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)
+    bot.on_callback_query(filters.regex(r"^rf:"))(_rfilter)
+
+
+async def _v8page(client: Client, query) -> None:
+    """v8 results pagination: ``v8:{token}:{page}``."""
+    try:
+        _, token, page = query.data.split(":")
+        page = int(page)
+    except (ValueError, IndexError):
+        return
+    data = state.v8_get(token)
+    if not data or data.get("user_id") != query.from_user.id:
+        await query.answer("⌛ Results expired — search again.", show_alert=True)
+        return
+    await query.answer()
+    from app.bot.handlers.search import render_v8_results
+    await render_v8_results(client, query.message, token,
+                            query.from_user.id, page)
+
+
+async def _rfilter(client: Client, query) -> None:
+    """v8 filter selectors.
+
+    ``rf:{token}:{kind}`` -> show options (edits keyboard only)
+    ``rf:{token}:{kind}:{idx}`` -> apply option
+    ``rf:{token}:{kind}:x`` -> clear filter
+    ``rf:{token}:back`` -> back to the results view
+    """
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        return
+    token = parts[1]
+    kind = parts[2]
+    uid = query.from_user.id
+    data = state.v8_get(token)
+    if not data or data.get("user_id") != uid:
+        await query.answer("⌛ Results expired — search again.", show_alert=True)
+        return
+    await query.answer()
+    from app.bot.handlers.search import render_v8_results
+
+    if kind == "back" or len(parts) == 3:
+        if kind == "back":
+            await render_v8_results(client, query.message, token, uid, 0)
+            return
+        # show options for this filter kind
+        options = (data.get("filter_opts") or {}).get(kind) or []
+        if not options:
+            await query.answer("No options for this filter.", show_alert=True)
+            return
+        kb, label = v8_ui.v8_filter_options_kb(
+            token, kind, options, data.get("filters") or {})
+        try:
+            await query.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            log.debug("filter options edit failed", exc_info=True)
+        return
+
+    # apply / clear
+    choice = parts[3]
+    filters = dict(data.get("filters") or {})
+    if choice == "x":
+        filters.pop(kind, None)
+    else:
+        options = (data.get("filter_opts") or {}).get(kind) or []
+        try:
+            value = options[int(choice)]
+        except (ValueError, IndexError):
+            return
+        filters[kind] = value
+    data["filters"] = filters
+    await render_v8_results(client, query.message, token, uid, 0)

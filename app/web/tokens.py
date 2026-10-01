@@ -32,3 +32,11 @@ def watch_url(file_db_id: int, user_id: int) -> str | None:
     if not base:
         return None
     return f"{base}/watch/{make_watch_token(file_db_id, user_id)}"
+
+
+def dl_url(file_db_id: int, user_id: int) -> str | None:
+    """Direct download link for a file (Tech VJ style: stream + download URLs)."""
+    base = (settings.WEB_URL or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/dl/{make_watch_token(file_db_id, user_id)}"

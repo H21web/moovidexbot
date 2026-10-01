@@ -34,10 +34,12 @@ EPISODE_WORD_RE = re.compile(r"\b[Ee]p(?:isode)?\s*0*(\d{1,3})(?!\d)")
 # Intent / noise words users add to queries ("premam full movie download").
 # Stripped query-side only; the DB rows are untouched. If stripping leaves
 # nothing, the original words are kept (e.g. the query "1080p" alone).
+# Includes Manglish question markers ("kgf movie undo" -> "kgf").
 QUERY_NOISE_RE = re.compile(
     r"\b(movies?|films?|full|download(?:s|ing)?|watch(?:ing)?|online|"
     r"dubbed|version|latest|hd|hq|please|pls|bluray|brrip|bdrip|"
-    r"webrip|web-?dl|hdrip|dvdrip|hdtc|hdts|camrip)\b",
+    r"webrip|web-?dl|hdrip|dvdrip|hdtc|hdts|camrip|"
+    r"undo|aano|alle|aakumo|aakum|entha|enth|evide|eppol|aar?a)\b",
     re.IGNORECASE,
 )
 

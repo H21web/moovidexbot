@@ -161,3 +161,138 @@ def best_pick_line(best: dict) -> str:
     if meta:
         bits.append(meta)
     return "\n".join(bits)
+
+
+# ---------------------------------------------------------------- v8 rework
+# Keyword-first search + enrichment. The local parser is the priority:
+# language / year / season / episode / quality come out of the query
+# itself ("s01 e02", "S1E3", "ep3", "season 2") and the DB search runs
+# on keywords. Enrichment: search API -> IMDB id -> TMDB -> Groq fallback.
+# AI only *enhances* (verdict line, no-result suggestion); the flow works
+# fully with AI off.
+
+VERDICT_SYSTEM = (
+    "You write a ONE-LINE recommendation note (under 18 words, friendly). "
+    "Say why this file is the best pick. Plain text, no markdown, no quotes."
+)
+
+SUGGEST_SYSTEM = (
+    "You correct movie/series search queries. Reply with ONLY the most "
+    "likely intended movie or series title, nothing else. No year, no quotes."
+)
+
+
+def _query_season_episode(parsed: dict, files: list[dict]) -> list[dict]:
+    """Narrow files to the query's season/episode; no-op when absent.
+
+    If the filter would empty the set, the full set is kept (boost
+    instead of filter) so a slightly-off tag never yields zero results.
+    """
+    season, episode = parsed.get("season"), parsed.get("episode")
+    if not season and not episode:
+        return files
+    from app.bot.v8_ui import file_season_episode
+    kept = []
+    for f in files:
+        s, e = file_season_episode(f.get("file_name"))
+        if season and s != season:
+            continue
+        if episode and e != episode:
+            continue
+        kept.append(f)
+    return kept or files
+
+
+async def _ai_verdict(user_id: int, best: dict, title: str) -> str | None:
+    """One-line AI note on why this file is the best pick (optional)."""
+    if not ai.is_configured():
+        return None
+    try:
+        if await ai.quota_remaining(user_id) <= 0:
+            return None
+        desc = (f"{title}: {(best.get('file_name') or '')[:80]}, "
+                f"{best.get('quality') or '?'}, {best.get('language') or '?'}")
+        note = await ai.groq_complete(VERDICT_SYSTEM,
+                                      f"Best pick -> {desc}",
+                                      max_tokens=60)
+        if note:
+            await ai.quota_use(user_id)
+            return " ".join(note.strip().split())[:160] or None
+    except Exception as exc:  # noqa: BLE001
+        log.debug("ai verdict failed: %s", exc)
+    return None
+
+
+async def ai_suggest_title(user_id: int, q: str) -> str | None:
+    """AI guess at the intended title when a search found nothing."""
+    if not ai.is_configured():
+        return None
+    try:
+        if await ai.quota_remaining(user_id) <= 0:
+            return None
+        raw = await ai.groq_complete(SUGGEST_SYSTEM,
+                                     f"Query: {q[:150]}",
+                                     max_tokens=40)
+        if raw:
+            await ai.quota_use(user_id)
+            return raw.strip().strip("\"'")[:120] or None
+    except Exception as exc:  # noqa: BLE001
+        log.debug("ai suggest failed: %s", exc)
+    return None
+
+
+async def v8_search(user_id: int, q: str) -> dict:
+    """v8 search pipeline.
+
+    Returns ``{"status", "files", "best", "title", "meta", "parsed",
+    "ai_note"}``; status is ``"ok"`` or ``"no_results"``. Works with
+    zero AI configured.
+    """
+    from app import enrich as enrich_mod
+
+    parsed = _local_parse(q)
+    title = (parsed.get("title") or q).strip()
+    # v8: no special "play query" card — "play kgf" is just a search for
+    # kgf; the Play button rides on the file itself (Tech VJ style).
+    if title.lower().startswith("play ") and len(title) > 5:
+        title = title[5:].strip()
+        parsed["title"] = title
+
+    items_raw, _lp = await search_files(q, user_id=user_id, log_query=False)
+
+    items_extra: list[dict] = []
+    if title and title.lower() != q.strip().lower() and len(title) >= 2:
+        items_extra, _ = await search_files(title, user_id=user_id,
+                                            log_query=False)
+
+    merged: dict[int, dict] = {}
+    for it in list(items_raw) + list(items_extra):
+        fid = it.get("id")
+        if fid is None:
+            continue
+        prev = merged.get(fid)
+        if prev is None or (it.get("score") or 0) > (prev.get("score") or 0):
+            merged[fid] = it
+    items = list(merged.values())
+
+    if items:
+        try:
+            items = await personalize.rerank(items, user_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("personalize rerank failed: %s", exc)
+
+    if not items:
+        return {"status": "no_results", "intent": "search", "title": title,
+                "files": [], "best": None, "meta": None,
+                "parsed": parsed, "ai_note": None}
+
+    files = _query_season_episode(parsed, items)
+    best = files[0]
+
+    meta = await enrich_mod.enrich_title(title or q, parsed.get("year"),
+                                         user_id)
+    ai_note = await _ai_verdict(user_id, best, title or q)
+
+    return {"status": "ok", "intent": "search", "title": title,
+            "files": files, "best": best, "meta": meta,
+            "parsed": parsed, "ai_note": ai_note}

@@ -103,6 +103,69 @@ async def get_movie(title: str, year: int | None = None) -> dict | None:
     return payload
 
 
+async def find_by_imdb(imdb_id: str) -> dict | None:
+    """Look up a title on TMDB by its IMDB id (``tt1234567``).
+
+    Returns the same dict shape as ``get_movie``. ``None`` when the key
+    is missing, TMDB errors, or no match exists.
+    """
+    if not settings.TMDB_API_KEY or not imdb_id:
+        return None
+    key = f"imdb:{imdb_id.strip()}"
+    try:
+        async with get_session_factory()() as session:
+            row = await session.get(TmdbCache, key)
+            if row and datetime.now(timezone.utc) - row.cached_at < CACHE_TTL:
+                return dict(row.payload or {})
+    except Exception:
+        log.debug("tmdb imdb cache read failed", exc_info=True)
+    try:
+        resp = await _get_client().get(
+            f"/find/{imdb_id.strip()}",
+            params={
+                "api_key": settings.TMDB_API_KEY,
+                "external_source": "imdb_id",
+                "language": "en-US",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        movies = data.get("movie_results") or []
+        tvs = data.get("tv_results") or []
+        if movies:
+            m, kind, date_key, title_key_ = movies[0], "movie", "release_date", "title"
+        elif tvs:
+            m, kind, date_key, title_key_ = tvs[0], "tv", "first_air_date", "name"
+        else:
+            return None
+        poster_path = m.get("poster_path")
+        payload = {
+            "title": m.get(title_key_) or imdb_id,
+            "year": extract_year(m.get(date_key) or ""),
+            "rating": round(float(m.get("vote_average") or 0), 1),
+            "plot": (m.get("overview") or "").strip(),
+            "poster_url": f"{POSTER_BASE}{poster_path}" if poster_path else None,
+            "genres": [GENRE_MAP.get(g, str(g)) for g in (m.get("genre_ids") or [])][:3],
+            "imdb_id": imdb_id,
+            "kind": kind,
+        }
+    except Exception:
+        log.warning("tmdb find_by_imdb failed for %s", imdb_id, exc_info=True)
+        return None
+    try:
+        async with get_session_factory()() as session:
+            row = await session.get(TmdbCache, key)
+            if row:
+                row.payload = payload
+                row.cached_at = datetime.now(timezone.utc)
+            else:
+                session.add(TmdbCache(key=key, payload=payload))
+            await session.commit()
+    except Exception:
+        log.debug("tmdb imdb cache write failed", exc_info=True)
+    return payload
+
+
 async def _fetch_from_tmdb(title: str, year: int | None) -> dict | None:
     params = {
         "api_key": settings.TMDB_API_KEY,

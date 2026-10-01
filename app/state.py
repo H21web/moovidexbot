@@ -55,6 +55,32 @@ def results_get(token: str) -> dict | None:
     return None
 
 
+# --- v8 search sessions: best pick + filterable file list ---
+# token -> {"files": [...], "rest": [...], "best": {...}, "meta": {...}|None,
+#           "query": str, "user_id": int, "filters": {...},
+#           "filter_opts": {...}, "ai_note": str|None, "created": ts}
+_v8: dict[str, dict] = {}
+
+
+def v8_put(data: dict) -> str:
+    token = uuid.uuid4().hex
+    data["created"] = time.time()
+    _v8[token] = data
+    if len(_v8) > 500:
+        oldest = sorted(_v8, key=lambda k: _v8[k]["created"])[:100]
+        for k in oldest:
+            _v8.pop(k, None)
+    return token
+
+
+def v8_get(token: str) -> dict | None:
+    item = _v8.get(token)
+    if item and time.time() - item["created"] < RESULTS_TTL:
+        return item
+    _v8.pop(token, None)
+    return None
+
+
 # --- interactive /index setup sessions: admin user id -> dict ---
 # {"step": "channel" | "options" | "opt:<key>",
 #  "chat_id": int, "title": str,

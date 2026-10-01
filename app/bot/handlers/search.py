@@ -1,4 +1,4 @@
-"""Text search (private + groups) — v6: personalized + AI-assisted."""
+"""Text search (private + groups) — v8: keyword-first + enriched + AI touches."""
 from __future__ import annotations
 
 import asyncio
@@ -6,12 +6,13 @@ import logging
 import math
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 
 from app import ai, ai_search, personalize, state
 from app import autodelete
 from app.analytics import log_event
-from app.bot import forcesub, ui
+from app.bot import forcesub, ui, v8_ui
 from app.bot.handlers.common import track_user
 from app.bot.handlers.groups import effective_autodelete
 from app.config import settings
@@ -134,68 +135,85 @@ async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
             pass
 
 
-async def _ai_search_flow(client: Client, message: Message,
-                        uid: int, q: str) -> bool:
-    """v7 AI search: understand -> find -> recommend. True = handled.
-
-    - play intent + best file  -> "Playing" card with Play/Download
-    - search intent + files    -> AI best-pick card, then classic results
-    - chat intent              -> AI chat
-    - no results / failure     -> False (classic flow takes over)
-    """
-    wait = await message.reply_text("🤖 <i>understanding…</i>")
+async def render_v8_results(client: Client, message: Message,
+                        token: str, uid: int, page: int = 0) -> None:
+    """Render (or re-render) a v8 results message: best pick + list."""
+    data = state.v8_get(token)
+    if not data or data.get("user_id") != uid:
+        try:
+            await message.edit_text("⌛ Results expired — search again.")
+        except Exception:
+            pass
+        return
+    files = v8_ui.apply_v8_filters(data["files"], data.get("filters") or {})
+    best = data["best"]
+    rest = [f for f in files if f.get("id") != best.get("id")]
+    pages = max(1, math.ceil(len(rest) / v8_ui.V8_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = rest[page * v8_ui.V8_PAGE_SIZE:(page + 1) * v8_ui.V8_PAGE_SIZE]
+    text = v8_ui.v8_results_text(
+        data.get("meta"), best, chunk, page, pages, len(rest),
+        data.get("filters") or {}, uid, data.get("ai_note"))
+    kb = v8_ui.v8_results_kb(token, best["id"], uid, page, pages,
+                             data.get("filters") or {})
     try:
-        res = await ai_search.ai_search(uid, q)
+        await message.edit_text(text, reply_markup=kb,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True)
+    except Exception:
+        log.debug("v8 render edit failed", exc_info=True)
+
+
+async def _v8_search_flow(client: Client, message: Message,
+                         uid: int, q: str) -> bool:
+    """v8 PM search: keyword-first, enriched, AI-enhanced. True = handled.
+
+    Runs with or without AI configured — AI only adds the verdict line
+    and the no-result title suggestion. Falls back to the classic
+    no-results card when nothing is found.
+    """
+    wait = await message.reply_text("🔍 <i>Searching…</i>")
+    try:
+        res = await ai_search.v8_search(uid, q)
     except Exception:  # noqa: BLE001
-        log.exception("ai search failed")
+        log.exception("v8 search failed")
         try:
             await wait.delete()
         except Exception:
             pass
         return False
 
-    status, intent = res["status"], res["intent"]
-    if status == "no_quota":
-        await wait.edit_text("🤖 Daily AI limit reached — try again tomorrow 🌙")
-        return True
-    if intent == "chat":
-        await wait.delete()
-        await _ai_chat_reply(client, message, uid, q)
-        return True
-    if status != "ok" or not res.get("best"):
-        await wait.delete()
-        return False  # classic flow: _no_results_pm
+    if res["status"] != "ok" or not res.get("best"):
+        # No results: one AI retry with a suggested title, then classic.
+        retry_q = None
+        try:
+            retry_q = await ai_search.ai_suggest_title(uid, q)
+        except Exception:  # noqa: BLE001
+            log.debug("ai suggest title failed", exc_info=True)
+        if retry_q and retry_q.lower() != q.lower():
+            try:
+                res2 = await ai_search.v8_search(uid, retry_q)
+            except Exception:  # noqa: BLE001
+                res2 = {"status": "no_results"}
+            if res2["status"] == "ok" and res2.get("best"):
+                res = res2
+                q = retry_q
+        if res["status"] != "ok" or not res.get("best"):
+            await wait.delete()
+            return False  # classic flow: _no_results_pm
 
-    best = res["best"]
-    title = res["title"]
     asyncio.create_task(ai.remember(uid, "user", q))
-    url = watch_url(best["id"], uid)
-    kb = ui.play_kb(best["id"], url)
-    meta = " · ".join(x for x in (
-        best.get("quality"), best.get("language"),
-        ai_search.fmt_size(best.get("file_size"))) if x)
-    fname = ui.esc((best.get("file_name") or title)[:70])
-
-    if intent == "play":
-        text = f"▶ <b>Playing:</b> {fname}"
-        if meta:
-            text += f"\n<i>{ui.esc(meta)}</i>"
-        await wait.edit_text(text, reply_markup=kb)
-        return True
-
-    # search intent: best-pick card, then the full classic results below.
-    n = len(res["files"])
-    text = (f"🤖 <b>AI found {n} result{'s' if n != 1 else ''} for</b> "
-            f"{ui.esc(title[:60])}\n⭐ <b>Best pick:</b> {fname}")
-    if meta:
-        text += f"\n<i>{ui.esc(meta)}</i>"
-    await wait.edit_text(text, reply_markup=kb)
-    try:
-        token, groups = await _do_search(client, q, uid, personal=True)
-        if token:
-            await _send_results(client, message.chat.id, token, q, 0)
-    except Exception:  # noqa: BLE001
-        log.exception("classic results after ai card failed")
+    token = state.v8_put({
+        "files": res["files"],
+        "best": res["best"],
+        "meta": res.get("meta"),
+        "query": q,
+        "user_id": uid,
+        "filters": {},
+        "filter_opts": v8_ui.v8_filter_options(res["files"]),
+        "ai_note": res.get("ai_note"),
+    })
+    await render_v8_results(client, wait, token, uid, page=0)
     return True
 
 
@@ -218,10 +236,11 @@ async def _on_text(client: Client, message: Message):
     pm = _is_pm(message.chat.id)
     asyncio.create_task(log_event("search", user_id=uid,
                                   chat_id=message.chat.id))
-    # v7: AI search in PM — understand intent, find files, recommend best.
-    # (Chat-intent messages keep the classic _ai_chat_reply path.)
-    if pm and ai.is_configured() and ai.detect_intent(q) != "chat":
-        if await _ai_search_flow(client, message, uid, q):
+    # v8: PM search always goes through the v8 flow (keyword-first,
+    # enriched, AI-enhanced when available). Chat-intent messages keep
+    # the AI chat path.
+    if pm and ai.detect_intent(q) != "chat":
+        if await _v8_search_flow(client, message, uid, q):
             return
     # v6: question-like messages in PM go to the AI chat (ai_chat keeps
     # the memory itself — no separate remember here).
