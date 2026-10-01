@@ -25,7 +25,7 @@ from app.models import AiCache, AiQuota, ChatMemory
 
 log = logging.getLogger(__name__)
 
-GROQ_URL = "https://api.openai.com/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TIMEOUT = 15.0
 CACHE_TTL = timedelta(days=30)
 MEMORY_KEEP = 20
@@ -43,7 +43,7 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         _client = httpx.AsyncClient(
-            base_url="https://api.openai.com",
+            base_url="https://api.groq.com/openai",
             timeout=httpx.Timeout(TIMEOUT, connect=5.0),
             headers={
                 "Authorization": f"Bearer {settings.GROQ_API_KEY}",
@@ -58,6 +58,14 @@ def _get_client() -> httpx.AsyncClient:
 _QUESTION_START = re.compile(
     r"^(who|what|when|where|why|how|which|whose|whom)\b", re.IGNORECASE)
 
+# Manglish/Malayalam question markers: "Nivin paulyude puthiya cinema undo",
+# "entha nalla padam", "evide kittum" etc. must route to chat, not raw search.
+_ML_QUESTION_START = re.compile(
+    r"^(entha|enth|aaru|aar|evide|engane|eppol|ethra|enthina|enthin|aano|undo|alle)\b",
+    re.IGNORECASE)
+_ML_QUESTION_END = re.compile(
+    r"\b(undo|aano|ano|alle|llo)\??\s*$", re.IGNORECASE)
+
 
 def detect_intent(text: str) -> str:
     """'chat' for question-like messages, else 'search'. No AI call."""
@@ -67,6 +75,8 @@ def detect_intent(text: str) -> str:
     if "?" in t:
         return "chat"
     if _QUESTION_START.match(t):
+        return "chat"
+    if _ML_QUESTION_START.match(t) or _ML_QUESTION_END.search(t):
         return "chat"
     return "search"
 
@@ -173,12 +183,13 @@ async def quota_use(user_id: int) -> None:
 
 async def groq_complete(system: str, user: str,
                         max_tokens: int = 512,
-                        json_mode: bool = False) -> str | None:
+                        json_mode: bool = False,
+                        model: str | None = None) -> str | None:
     """One Groq chat call. Returns the text or None on any failure."""
     if not is_configured():
         return None
     payload: dict = {
-        "model": settings.AI_MODEL,
+        "model": model or settings.AI_MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},

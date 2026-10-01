@@ -8,7 +8,7 @@ import math
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from app import ai, personalize, state
+from app import ai, ai_search, personalize, state
 from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui
@@ -18,7 +18,8 @@ from app.config import settings
 from app.db import get_session_factory
 from app.search import group_by_title, search_files
 from app.spell import suggest
-from app.tmdb import search_title
+from app.tmdb import resolve_title
+from app.web.tokens import watch_url
 
 log = logging.getLogger(__name__)
 
@@ -69,11 +70,9 @@ async def _no_results_pm(client: Client, message: Message, q: str):
     AI button. Everything in the single clean template."""
     kb = None
     text = "❌ <b>No results found.</b>"
-    try:
-        tm = await search_title(q)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("tmdb correction failed: %s", exc)
-        tm = None
+    # Never send raw user text to TMDB: resolve a clean title first
+    # (local extraction -> TMDB -> web-search fallback).
+    tm = await resolve_title(q)
     if tm and tm.get("title"):
         year = f" ({tm['year']})" if tm.get("year") else ""
         text = (
@@ -135,6 +134,71 @@ async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
             pass
 
 
+async def _ai_search_flow(client: Client, message: Message,
+                        uid: int, q: str) -> bool:
+    """v7 AI search: understand -> find -> recommend. True = handled.
+
+    - play intent + best file  -> "Playing" card with Play/Download
+    - search intent + files    -> AI best-pick card, then classic results
+    - chat intent              -> AI chat
+    - no results / failure     -> False (classic flow takes over)
+    """
+    wait = await message.reply_text("🤖 <i>understanding…</i>")
+    try:
+        res = await ai_search.ai_search(uid, q)
+    except Exception:  # noqa: BLE001
+        log.exception("ai search failed")
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        return False
+
+    status, intent = res["status"], res["intent"]
+    if status == "no_quota":
+        await wait.edit_text("🤖 Daily AI limit reached — try again tomorrow 🌙")
+        return True
+    if intent == "chat":
+        await wait.delete()
+        await _ai_chat_reply(client, message, uid, q)
+        return True
+    if status != "ok" or not res.get("best"):
+        await wait.delete()
+        return False  # classic flow: _no_results_pm
+
+    best = res["best"]
+    title = res["title"]
+    asyncio.create_task(ai.remember(uid, "user", q))
+    url = watch_url(best["id"], uid)
+    kb = ui.play_kb(best["id"], url)
+    meta = " · ".join(x for x in (
+        best.get("quality"), best.get("language"),
+        ai_search.fmt_size(best.get("file_size"))) if x)
+    fname = ui.esc((best.get("file_name") or title)[:70])
+
+    if intent == "play":
+        text = f"▶ <b>Playing:</b> {fname}"
+        if meta:
+            text += f"\n<i>{ui.esc(meta)}</i>"
+        await wait.edit_text(text, reply_markup=kb)
+        return True
+
+    # search intent: best-pick card, then the full classic results below.
+    n = len(res["files"])
+    text = (f"🤖 <b>AI found {n} result{'s' if n != 1 else ''} for</b> "
+            f"{ui.esc(title[:60])}\n⭐ <b>Best pick:</b> {fname}")
+    if meta:
+        text += f"\n<i>{ui.esc(meta)}</i>"
+    await wait.edit_text(text, reply_markup=kb)
+    try:
+        token, groups = await _do_search(client, q, uid, personal=True)
+        if token:
+            await _send_results(client, message.chat.id, token, q, 0)
+    except Exception:  # noqa: BLE001
+        log.exception("classic results after ai card failed")
+    return True
+
+
 async def _on_text(client: Client, message: Message):
     if not message.text or message.text.startswith("/"):
         return
@@ -154,6 +218,11 @@ async def _on_text(client: Client, message: Message):
     pm = _is_pm(message.chat.id)
     asyncio.create_task(log_event("search", user_id=uid,
                                   chat_id=message.chat.id))
+    # v7: AI search in PM — understand intent, find files, recommend best.
+    # (Chat-intent messages keep the classic _ai_chat_reply path.)
+    if pm and ai.is_configured() and ai.detect_intent(q) != "chat":
+        if await _ai_search_flow(client, message, uid, q):
+            return
     # v6: question-like messages in PM go to the AI chat (ai_chat keeps
     # the memory itself — no separate remember here).
     if pm and ai.is_configured() and ai.detect_intent(q) == "chat":

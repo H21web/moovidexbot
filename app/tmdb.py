@@ -7,6 +7,7 @@ the bot falls back to filename-derived info.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -175,6 +176,7 @@ async def search_title(raw: str) -> dict | None:
                     "title": m.get("title") or m.get("name") or clean,
                     "year": extract_year(rd),
                     "kind": kind,
+                    "tmdb_id": m.get("id"),
                 }
                 break
     except Exception as exc:  # noqa: BLE001
@@ -235,3 +237,104 @@ async def discover(genre: str | None = None, year: int | None = None,
         except Exception as exc:  # noqa: BLE001
             log.debug("tmdb discover cache write failed: %s", exc)
     return items
+
+
+# ---------------------------------------------------------------------------
+# Clean title resolution: never send raw user questions to TMDB.
+# ---------------------------------------------------------------------------
+
+_TITLE_Q_HEAD = {
+    "entha", "enth", "evide", "eppol", "eppo", "aara", "aar", "ethra",
+    "engine", "enthina", "enthelum", "what", "whats", "which", "who",
+    "when", "where", "is", "are",
+}
+_TITLE_Q_TAIL = {
+    "undo", "aano", "alle", "aakumo", "aakum", "lloo", "aayi",
+    "aayirunno", "aayirunnu",
+}
+_TITLE_NOISE = {
+    "movie", "movies", "cinema", "cinemayude", "padam", "padathinte",
+    "film", "films", "filminte", "series", "serial", "show", "shows",
+    "trailer", "teaser", "song", "songs", "review", "reviews", "story",
+    "download", "watch", "online", "puthiya", "pazhaya", "latest",
+    "new", "illa", "vannittundo", "release", "rilis", "kazhinjo",
+}
+
+
+def _strip_punct(w: str) -> str:
+    return w.strip("?.!,;:'\"\"()[]")
+
+
+def extract_title_candidate(query: str) -> str:
+    """Pull a probable movie/series title out of a question-like query.
+
+    "Kgf movie undo" -> "Kgf"; "kgf 2 trailer undo?" -> "kgf 2".
+    Returns "" when nothing title-like remains.
+    """
+    words = (query or "").strip().rstrip("?").strip().split()
+    while words and _strip_punct(words[0]).lower() in _TITLE_Q_HEAD:
+        words.pop(0)
+    while words and _strip_punct(words[-1]).lower() in _TITLE_Q_TAIL:
+        words.pop()
+    words = [w for w in words if _strip_punct(w).lower() not in _TITLE_NOISE]
+    return " ".join(words).strip()
+
+
+def _clean_web_title(title: str) -> str:
+    """'K.G.F: Chapter 2 (2022) - IMDb' -> 'K.G.F: Chapter 2'."""
+    t = (title or "").strip()
+    t = re.sub(
+        r"\s*[-–—|]\s*"
+        r"(imdb|wikipedia|prime video|netflix|youtube|rotten tomatoes"
+        r"|hotstar|jiocinema|sonyliv|zee5).*$",
+        "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*\(\d{4}\)\s*$", "", t)
+    t = re.sub(r"\s*[⭐️]+.*$", "", t)
+    return t.strip(" -–—|")
+
+
+async def _web_title_hint(query: str) -> str | None:
+    """Ask the web search API; return a cleaned top-result title for TMDB."""
+    base = (settings.WEBSEARCH_API_URL or "").rstrip("/")
+    if not base:
+        return None
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=5.0)) as c:
+            r = await c.get(f"{base}/search",
+                            params={"q": query[:200], "num": 3})
+            r.raise_for_status()
+            results = (r.json() or {}).get("results") or []
+    except Exception as exc:  # noqa: BLE001
+        log.debug("web title hint failed: %s", exc)
+        return None
+    for item in results:
+        title = _clean_web_title(str(item.get("title") or ""))
+        if title and len(title) >= 2:
+            return title
+    return None
+
+
+async def resolve_title(query: str) -> dict | None:
+    """Resolve user text to a TMDB title entry.
+
+    1. Extract a clean title candidate locally (never the raw question).
+    2. TMDB search with the candidate.
+    3. Fallback: web search API -> cleaned top title -> TMDB.
+
+    Returns {"title", "year", "kind", "tmdb_id"} or None. Never raises.
+    """
+    try:
+        candidate = extract_title_candidate(query)
+        if candidate and len(candidate) >= 2:
+            hit = await search_title(candidate)
+            if hit:
+                return hit
+        web_title = await _web_title_hint(query)
+        if web_title and web_title.lower() != candidate.lower():
+            hit = await search_title(web_title)
+            if hit:
+                return hit
+    except Exception as exc:  # noqa: BLE001
+        log.debug("resolve_title failed for %r: %s", query, exc)
+    return None

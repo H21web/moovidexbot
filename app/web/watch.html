@@ -1,162 +1,328 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__ — Moovidex</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>__TITLE__</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css">
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0b0e14; color: #e8ecf1; font-family: system-ui, sans-serif;
-         min-height: 100vh; display: flex; flex-direction: column; }
-  header { padding: 14px 16px; border-bottom: 1px solid #1c2330; }
-  header h1 { font-size: 16px; font-weight: 600; white-space: nowrap;
-              overflow: hidden; text-overflow: ellipsis; }
-  header p { font-size: 12px; color: #8b95a7; margin-top: 4px; }
-  main { flex: 1; display: flex; flex-direction: column; padding: 16px;
-         gap: 14px; max-width: 860px; width: 100%; margin: 0 auto; }
-  .player-wrap { background: #000; border-radius: 12px; overflow: hidden;
-                 aspect-ratio: 16/9; display: flex; align-items: center;
-                 justify-content: center; }
-  video { width: 100%; height: 100%; background: #000; }
-  .notice { background: #1a2230; border: 1px solid #2a3a55; border-radius: 12px;
-            padding: 14px; font-size: 14px; line-height: 1.5; }
-  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
-  .btn { flex: 1 1 140px; text-align: center; padding: 12px; border-radius: 10px;
-         font-size: 15px; font-weight: 600; text-decoration: none; border: none;
-         cursor: pointer; }
-  .btn-primary { background: #2aabee; color: #fff; }
-  .btn-ghost { background: #1a2230; color: #e8ecf1; border: 1px solid #2a3a55; }
-  .progress { height: 8px; background: #1a2230; border-radius: 4px;
-              overflow: hidden; display: none; }
-  .progress > div { height: 100%; width: 0%; background: #2aabee; }
-  .pct { font-size: 13px; color: #8b95a7; display: none; }
-  footer { text-align: center; padding: 12px; font-size: 12px; color: #5b6577; }
+  :root{
+    --bg:#0b0e14; --bg2:#11151f; --card:#161b28; --line:#232a3d;
+    --txt:#f2f5fa; --mut:#9aa4b8; --acc:#e50914; --acc2:#ff6b6b;
+    --ok:#22c55e; --warn:#f59e0b;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  body{
+    margin:0; background:var(--bg); color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial,sans-serif;
+    min-height:100vh; padding-bottom:calc(28px + env(safe-area-inset-bottom));
+  }
+  .backdrop{
+    position:fixed; inset:0; z-index:-1;
+    background:__BACKDROP_CSS__;
+    filter:blur(60px) brightness(.5); transform:scale(1.2);
+  }
+  header{
+    position:sticky; top:0; z-index:10;
+    display:flex; align-items:center; gap:12px;
+    padding:calc(10px + env(safe-area-inset-top)) 14px 10px;
+    background:rgba(11,14,20,.82); backdrop-filter:blur(14px);
+    border-bottom:1px solid var(--line);
+  }
+  header .back{
+    width:36px; height:36px; border-radius:12px; border:1px solid var(--line);
+    background:var(--card); color:var(--txt); font-size:18px; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; flex:none;
+  }
+  header h1{
+    font-size:15px; font-weight:700; margin:0; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  header .sub{font-size:11px; color:var(--mut); font-weight:500;}
+  .wrap{max-width:640px; margin:0 auto; padding:14px 14px 0;}
+  .hero{
+    display:flex; gap:14px; background:var(--card);
+    border:1px solid var(--line); border-radius:18px; padding:14px;
+    box-shadow:0 12px 40px rgba(0,0,0,.45);
+  }
+  .poster{
+    width:96px; height:144px; border-radius:12px; flex:none;
+    object-fit:cover; background:#1c2233;
+    border:1px solid var(--line);
+  }
+  .poster-fallback{
+    display:flex; align-items:center; justify-content:center;
+    font-size:38px; color:var(--mut);
+  }
+  .meta{flex:1; min-width:0;}
+  .meta h2{font-size:16px; margin:2px 0 8px; line-height:1.3;}
+  .chips{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;}
+  .chip{
+    font-size:11px; font-weight:700; padding:4px 9px; border-radius:999px;
+    background:#1e2536; border:1px solid var(--line); color:var(--mut);
+    letter-spacing:.3px;
+  }
+  .chip.hot{background:rgba(229,9,20,.15); border-color:rgba(229,9,20,.5); color:#ff8a8a;}
+  .chip.ok{background:rgba(34,197,94,.12); border-color:rgba(34,197,94,.4); color:#7ee2a8;}
+  .plot{font-size:12.5px; color:var(--mut); line-height:1.55; margin:0;
+    display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;}
+  .player-card{
+    margin-top:14px; background:var(--card); border:1px solid var(--line);
+    border-radius:18px; overflow:hidden; box-shadow:0 12px 40px rgba(0,0,0,.45);
+  }
+  .plyr{--plyr-color-main:var(--acc); border-radius:18px; overflow:hidden;}
+  .plyr video{max-height:52vh;}
+  .codec-note{padding:26px 20px; text-align:center;}
+  .codec-note .big{font-size:44px; margin-bottom:10px;}
+  .codec-note h3{margin:0 0 6px; font-size:16px;}
+  .codec-note p{color:var(--mut); font-size:13px; line-height:1.6; margin:0 0 4px;}
+  .codec-note code{background:#1e2536; padding:2px 8px; border-radius:6px; font-size:12px;}
+  .actions{display:flex; gap:10px; padding:14px;}
+  .btn{
+    flex:1; border:none; border-radius:14px; padding:14px 10px;
+    font-size:14px; font-weight:800; cursor:pointer; color:#fff;
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    transition:transform .08s ease;
+  }
+  .btn:active{transform:scale(.97);}
+  .btn-dl{background:linear-gradient(135deg,var(--acc),#b00610); box-shadow:0 8px 24px rgba(229,9,20,.35);}
+  .btn:disabled{opacity:.55;}
+  .prog{height:6px; background:#1e2536; border-radius:99px; margin:0 14px; overflow:hidden; display:none;}
+  .prog i{display:block; height:100%; width:0%; background:linear-gradient(90deg,var(--acc),var(--acc2)); border-radius:99px; transition:width .2s;}
+  .prog-label{font-size:11px; color:var(--mut); text-align:center; padding:6px 0 0; display:none;}
+  .section{margin-top:16px;}
+  .section h3{font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--mut); margin:0 0 10px 2px;}
+  .ext-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:10px;}
+  .ext{
+    background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:14px 6px; text-align:center; cursor:pointer; color:var(--txt);
+    transition:transform .08s ease;
+  }
+  .ext:active{transform:scale(.95);}
+  .ext .ic{
+    width:44px; height:44px; border-radius:13px; margin:0 auto 8px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:22px; font-weight:900; color:#fff;
+  }
+  .ext .nm{font-size:11.5px; font-weight:700;}
+  .ext .tp{font-size:10px; color:var(--mut); margin-top:2px;}
+  .details{background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px 16px;}
+  .drow{display:flex; justify-content:space-between; gap:12px; padding:7px 0; font-size:13px; border-bottom:1px solid #1b2132;}
+  .drow:last-child{border-bottom:none;}
+  .drow .k{color:var(--mut); flex:none;}
+  .drow .v{text-align:right; word-break:break-all;}
+  .foot{text-align:center; color:var(--mut); font-size:11px; margin:22px 0 8px; opacity:.7;}
+  #toast{
+    position:fixed; left:50%; bottom:32px; transform:translateX(-50%) translateY(20px);
+    background:#1e2536; border:1px solid var(--line); color:var(--txt);
+    padding:11px 18px; border-radius:12px; font-size:13px; font-weight:600;
+    opacity:0; pointer-events:none; transition:all .25s; z-index:50; max-width:90vw;
+  }
+  #toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
 </style>
 </head>
 <body>
+<div class="backdrop"></div>
+
 <header>
-  <h1 id="title">__TITLE__</h1>
-  <p id="meta"></p>
+  <button class="back" id="backBtn" aria-label="Back">‹</button>
+  <div style="min-width:0">
+    <h1>__TITLE__</h1>
+    <div class="sub">Moovidex Player</div>
+  </div>
 </header>
-<main>
-  <div class="player-wrap" id="playerWrap">
-    <video id="player" controls playsinline preload="metadata" style="display:none">
-      <source id="src" src="__DL_URL__" type="video/mp4">
-    </video>
-    <div class="notice" id="cantPlay" style="display:none">
-      ⚠️ Your browser can't play this format directly.<br>
-      Use an external player or download it below.
+
+<div class="wrap">
+  <div class="hero">
+    __POSTER_HTML__
+    <div class="meta">
+      <h2>__TITLE__</h2>
+      <div class="chips">__CHIPS_HTML__</div>
+      <p class="plot">__PLOT__</p>
     </div>
   </div>
-  <div class="btn-row">
-    <button class="btn btn-primary" id="dlBtn">⬇️ Download</button>
-    <button class="btn btn-ghost" id="copyBtn">🔗 Copy link</button>
+
+  <div class="player-card">
+    <div id="playerSlot"></div>
+    <div class="prog" id="prog"><i id="progBar"></i></div>
+    <div class="prog-label" id="progLabel"></div>
+    <div class="actions">
+      <button class="btn btn-dl" id="dlBtn">⬇ Download</button>
+    </div>
   </div>
-  <div class="progress" id="prog"><div id="bar"></div></div>
-  <div class="pct" id="pct"></div>
-  <div class="btn-row" id="extRow" style="display:none">
-    <a class="btn btn-ghost" id="mxBtn" href="#">▶️ MX Player</a>
-    <a class="btn btn-ghost" id="vlcBtn" href="#">▶️ VLC</a>
+
+  <div class="section">
+    <h3>Open in external player</h3>
+    <div class="ext-grid" id="extGrid"></div>
   </div>
-</main>
-<footer>Moovidex • streamed via MTProto</footer>
+
+  <div class="section">
+    <h3>File details</h3>
+    <div class="details">__DETAILS_HTML__</div>
+  </div>
+
+  <div class="foot">Streamed securely from Moovidex · seek &amp; resume supported</div>
+</div>
+
+<div id="toast"></div>
+
+<script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
 <script>
-(function () {
-  var tg = window.Telegram && window.Telegram.WebApp;
-  if (tg) { try { tg.expand(); tg.ready(); } catch (e) {} }
-  var PLAYABLE = "__PLAYABLE__" === "true";
+(function(){
+  "use strict";
+  var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+  if (tg) {
+    tg.ready(); tg.expand();
+    try { tg.setHeaderColor("#0b0e14"); tg.setBackgroundColor("#0b0e14"); } catch(e){}
+    tg.BackButton.show();
+    tg.BackButton.onClick(function(){ tg.close(); });
+    try { tg.HapticFeedback.impactOccurred("light"); } catch(e){}
+  }
+  document.getElementById("backBtn").onclick = function(){
+    if (tg) tg.close(); else history.back();
+  };
+
   var DL_URL = "__DL_URL__";
-  var SIZE = parseInt("__SIZE__", 10) || 0;
-  var title = document.getElementById('title').textContent;
+  var FILE_NAME = "__FILENAME__";
+  var FILE_SIZE = __SIZE__ || 0;
+  var MIME = "__MIME__";
+  var PLAYABLE = "__PLAYABLE__" === "true";
+  var EXT = "__EXT__".toLowerCase();
+  var POSTER = "__POSTER__";
 
-  function fmtSize(n) {
-    if (!n) return '';
-    var u = ['B','KB','MB','GB','TB'], i = 0;
-    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-    return n.toFixed(1) + ' ' + u[i];
+  function toast(msg){
+    var el = document.getElementById("toast");
+    el.textContent = msg; el.classList.add("show");
+    clearTimeout(el._t); el._t = setTimeout(function(){ el.classList.remove("show"); }, 2600);
   }
-  document.getElementById('meta').textContent = fmtSize(SIZE);
-
-  var player = document.getElementById('player');
-  if (PLAYABLE) {
-    player.style.display = 'block';
-  } else {
-    document.getElementById('cantPlay').style.display = 'block';
-  }
-
-  // External players (Android intents)
-  var isAndroid = /android/i.test(navigator.userAgent);
-  if (isAndroid) {
-    document.getElementById('extRow').style.display = 'flex';
-    var enc = encodeURIComponent(DL_URL);
-    var encTitle = encodeURIComponent(title);
-    document.getElementById('mxBtn').href =
-      'intent:' + DL_URL + '#Intent;package=com.mxtech.videoplayer.ad;type=video/*;S.title=' + encTitle + ';end';
-    document.getElementById('vlcBtn').href =
-      'intent:' + DL_URL + '#Intent;package=org.videolan.vlc;type=video/*;S.title=' + encTitle + ';end';
-  }
-
-  document.getElementById('copyBtn').onclick = function () {
-    (navigator.clipboard ? navigator.clipboard.writeText(DL_URL)
-                        : Promise.reject()).then(
-      function () { flash('🔗 Link copied'); },
-      function () { prompt('Copy link:', DL_URL); });
-  };
-
-  // Download: stream straight to disk (no RAM blowup for big files).
-  // Primary: File System Access API -> pipe the fetch body into a file
-  // handle. Fallback: plain navigation, the browser streams to disk itself.
-  document.getElementById('dlBtn').onclick = async function () {
-    var prog = document.getElementById('prog'),
-        bar = document.getElementById('bar'),
-        pct = document.getElementById('pct');
-    prog.style.display = 'block'; pct.style.display = 'block';
-
-    function showProgress(received) {
-      if (SIZE) {
-        var p = Math.min(100, received / SIZE * 100);
-        bar.style.width = p + '%';
-        pct.textContent = p.toFixed(1) + '% • ' + fmtSize(received) + ' / ' + fmtSize(SIZE);
-      } else { pct.textContent = fmtSize(received); }
-    }
-
-    // Plain-browser fallback: let it download natively (streams to disk).
-    function nativeDownload() {
-      var a = document.createElement('a');
-      a.href = DL_URL;
-      a.download = title;
-      document.body.appendChild(a); a.click();
-      setTimeout(function () { a.remove(); }, 4000);
-      pct.textContent = '⬇️ Download started in browser…';
-    }
-
+  function haptic(kind){
+    if (!tg) return;
     try {
-      if (!window.showSaveFilePicker) { nativeDownload(); return; }
-      var handle = await window.showSaveFilePicker({ suggestedName: title });
-      var writable = await handle.createWritable();
+      if (kind === "ok") tg.HapticFeedback.notificationOccurred("success");
+      else tg.HapticFeedback.impactOccurred("medium");
+    } catch(e){}
+  }
+
+  /* ---------------- player ---------------- */
+  var slot = document.getElementById("playerSlot");
+  if (PLAYABLE) {
+    var isAudio = MIME.indexOf("audio/") === 0 || /\.(mp3|ogg|wav|m4a|flac)$/i.test(FILE_NAME);
+    var media = document.createElement(isAudio ? "audio" : "video");
+    media.setAttribute("playsinline", "");
+    media.setAttribute("controls", "");
+    media.setAttribute("preload", "metadata");
+    if (!isAudio && POSTER) media.setAttribute("poster", POSTER);
+    var src = document.createElement("source");
+    src.src = DL_URL;
+    src.type = MIME || (isAudio ? "audio/mpeg" : "video/mp4");
+    media.appendChild(src);
+    slot.appendChild(media);
+    try {
+      new Plyr(media, {
+        controls: ["play-large","play","progress","current-time","duration","mute","volume","captions","settings","pip","airplay","fullscreen"],
+        seekTime: 10,
+        keyboard: { focused: true, global: true },
+        tooltips: { controls: true, seek: true }
+      });
+    } catch(e){ /* native controls remain */ }
+  } else {
+    slot.innerHTML =
+      '<div class="codec-note"><div class="big">🎞️</div>' +
+      "<h3>Browser can't play ." + (EXT || "this") + " files</h3>" +
+      "<p>Your browser doesn't support the <code>" + (EXT || "?") + "</code> codec. " +
+      "No quality is lost — open it in an external player below, or download it.</p></div>";
+  }
+
+  /* ---------------- external players ---------------- */
+  var PLAYERS = [
+    { name:"MX Player",    sub:"Free · all codecs", pkg:"com.mxtech.videoplayer.ad",
+      bg:"linear-gradient(135deg,#ff7a00,#ff3d00)", glyph:"▶" },
+    { name:"MX Player Pro",sub:"Pro · no ads",      pkg:"com.mxtech.videoplayer.pro",
+      bg:"linear-gradient(135deg,#ffb300,#ff7a00)", glyph:"▶" },
+    { name:"VLC",          sub:"Open source",       pkg:"org.videolan.vlc",
+      bg:"linear-gradient(135deg,#f5a623,#e08300)", glyph:"◉" },
+    { name:"PlayIt",       sub:"Floating player",   pkg:"com.playit.videoplayer",
+      bg:"linear-gradient(135deg,#7c4dff,#4a1fd6)", glyph:"✦" },
+    { name:"KMPlayer",     sub:"Classic player",    pkg:"com.kmplayer",
+      bg:"linear-gradient(135deg,#00bcd4,#00838f)", glyph:"K" },
+    { name:"XPlayer",      sub:"Light & fast",      pkg:"video.player.videoplayer",
+      bg:"linear-gradient(135deg,#26c6da,#0097a7)", glyph:"X" }
+  ];
+  var grid = document.getElementById("extGrid");
+  PLAYERS.forEach(function(p){
+    var b = document.createElement("button");
+    b.className = "ext";
+    b.innerHTML = '<div class="ic" style="background:' + p.bg + '">' + p.glyph + "</div>" +
+                  '<div class="nm">' + p.name + '</div><div class="tp">' + p.sub + "</div>";
+    b.onclick = function(){
+      haptic();
+      var intent = "intent:" + DL_URL +
+        "#Intent;package=" + p.pkg + ";type=video/*;" +
+        "S.browser_fallback_url=" + encodeURIComponent(DL_URL) + ";end";
+      window.location.href = intent;
+      setTimeout(function(){ toast("Opening in " + p.name + "…"); }, 600);
+    };
+    grid.appendChild(b);
+  });
+
+  /* ---------------- download with progress ---------------- */
+  function fmt(n){
+    if (!n) return "";
+    var u = ["B","KB","MB","GB"], i = 0;
+    while (n >= 1024 && i < 3) { n /= 1024; i++; }
+    return n.toFixed(n >= 100 || i === 0 ? 0 : 1) + u[i];
+  }
+  function setProg(done, total){
+    var bar = document.getElementById("prog"), lbl = document.getElementById("progLabel");
+    bar.style.display = "block"; lbl.style.display = "block";
+    var pct = total > 0 ? Math.min(100, done / total * 100) : 0;
+    document.getElementById("progBar").style.width = pct.toFixed(1) + "%";
+    lbl.textContent = fmt(done) + (total ? " / " + fmt(total) + " · " + pct.toFixed(0) + "%" : "");
+  }
+  document.getElementById("dlBtn").onclick = async function(){
+    var btn = this;
+    btn.disabled = true; haptic();
+    toast("Starting download…");
+    try {
       var res = await fetch(DL_URL);
-      if (!res.ok || !res.body) throw new Error('download failed');
-      var reader = res.body.getReader(), received = 0;
-      for (;;) {
-        var r = await reader.read();
-        if (r.done) break;
-        await writable.write(r.value);
-        received += r.value.length;
-        showProgress(received);
+      if (!res.ok || !res.body) throw new Error("fetch failed");
+      var total = parseInt(res.headers.get("content-length") || "0", 10) || FILE_SIZE;
+      if (window.showSaveFilePicker) {
+        // Stream straight to disk (Chrome/Edge/Android) — no RAM blowup
+        var handle = await window.showSaveFilePicker({ suggestedName: FILE_NAME });
+        var w = await handle.createWritable();
+        var reader = res.body.getReader(), done = 0;
+        for (;;) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+          await w.write(chunk.value);
+          done += chunk.value.length; setProg(done, total);
+        }
+        await w.close();
+        toast("Saved ✓"); haptic("ok");
+      } else {
+        // Blob fallback with progress
+        var reader2 = res.body.getReader(), done2 = 0, parts = [];
+        for (;;) {
+          var c2 = await reader2.read();
+          if (c2.done) break;
+          parts.push(c2.value); done2 += c2.value.length; setProg(done2, total);
+        }
+        var blob = new Blob(parts, { type: MIME || "application/octet-stream" });
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob); a.download = FILE_NAME;
+        document.body.appendChild(a); a.click();
+        setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+        toast("Downloaded ✓"); haptic("ok");
       }
-      await writable.close();
-      flash('✅ Download complete');
-    } catch (e) {
-      // User cancelled the picker, or streaming failed -> native fallback.
-      try { nativeDownload(); } catch (e2) { window.location.href = DL_URL; }
+    } catch(e) {
+      window.open(DL_URL, "_blank");
+      toast("Opened download link");
+    } finally {
+      btn.disabled = false;
     }
   };
-
-  function flash(msg) {
-    if (tg && tg.showPopup) { try { tg.showPopup({ message: msg }); return; } catch (e) {} }
-    pct.style.display = 'block'; pct.textContent = msg;
-  }
 })();
 </script>
 </body>

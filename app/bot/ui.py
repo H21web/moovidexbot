@@ -138,6 +138,17 @@ def file_kb(file_db_id: int, watch_url: str | None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def play_kb(file_db_id: int, watch_url: str | None) -> InlineKeyboardMarkup:
+    """v7 AI card: big Play (web app) + Download buttons."""
+    rows = []
+    if watch_url:
+        rows.append([InlineKeyboardButton(
+            "▶ Play", web_app=WebAppInfo(url=watch_url))])
+    rows.append([InlineKeyboardButton(
+        "⬇️ Download", callback_data=f"dl:{file_db_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def spell_kb(suggestions: list[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(f"🔍 {s[:50]}", callback_data=f"sp:{s[:50]}")]
             for s in suggestions[:3]]
