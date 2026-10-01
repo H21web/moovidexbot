@@ -251,6 +251,13 @@ async def _index_interactive(client: Client, message: Message):
         return
     pending = await state.pending_get(uid)
     if not pending:
+        # Diagnostic: the classic symptom of a lost session is a number
+        # falling through to search — log it loudly.
+        if text and re.fullmatch(r"\d+", text):
+            log.warning(
+                "index: number %r from admin %s but NO pending session "
+                "(is migration 0004 applied? is only ONE bot instance "
+                "running?)", text, uid)
         return
     text = (message.text or message.caption or "").strip()
     if text.startswith("/"):
@@ -347,6 +354,8 @@ async def _index_interactive(client: Client, message: Message):
             raise StopPropagation
         pending["opts"][key] = int(digits or 0)
         pending["step"] = "options"
+        log.info("index setup: admin %s set %s=%s", uid, key,
+                 pending["opts"][key])
         try:
             await message.delete()  # keep the chat clean: panel shows value
         except Exception:
@@ -411,6 +420,7 @@ async def _ixs(client: Client, query: CallbackQuery):
             return
         pending["step"] = f"opt:{key}"
         await state.pending_set(uid, pending)
+        log.info("index setup: admin %s chose option %s", uid, key)
         # Turn the panel itself into the prompt — no extra message.
         await query.message.edit_text(
             f"✏️ Send a number for <b>{OPT_LABELS[key]}</b>\n"

@@ -240,6 +240,38 @@ async def _req_action(client: Client, query):
 
 
 @admin_only
+async def _dbcheck(client: Client, message: Message):
+    """Report migration state without needing Render shell access."""
+    from sqlalchemy import text as sa_text
+
+    lines = []
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            ver = (await s.execute(
+                sa_text("SELECT version_num FROM alembic_version")
+            )).scalar()
+            lines.append(f"🔖 alembic version: <code>{ver}</code>")
+    except Exception as exc:
+        lines.append(f"🔖 alembic version: ❌ {exc}")
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            exists = (await s.execute(
+                sa_text("SELECT to_regclass('public.index_sessions')")
+            )).scalar()
+            if exists:
+                lines.append("🗂 index_sessions table: ✅ exists")
+            else:
+                lines.append("🗂 index_sessions table: ❌ MISSING — "
+                             "the /index number bug will persist until "
+                             "<code>alembic upgrade head</code> runs")
+    except Exception as exc:
+        lines.append(f"🗂 index_sessions table: ❌ {exc}")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
 async def _settings(client: Client, message: Message):
     base = (settings.WEB_URL or "").rstrip("/")
     dash = f"{base}/admin" if base else "/admin"
@@ -261,4 +293,5 @@ def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.command("broadcast"))(_broadcast)
     bot.on_message(filters.private & filters.command("requests"))(_requests)
     bot.on_message(filters.private & filters.command("settings"))(_settings)
+    bot.on_message(filters.private & filters.command("dbcheck"))(_dbcheck)
     bot.on_callback_query(filters.regex(r"^req(done|rej):"))(_req_action)
