@@ -29,6 +29,38 @@ _client: httpx.AsyncClient | None = None
 # in-flight dedupe: cache_key -> asyncio task result not needed; small guard
 _inflight: dict[str, float] = {}
 
+
+class _RedactApiKey(logging.Filter):
+    """httpx logs full request URLs at INFO — including ``?api_key=…``.
+
+    Scrub the key so Render logs never leak it again.
+    """
+    _RE = re.compile(r"api_key=[^&\s'\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = self._RE.sub("api_key=***", record.msg)
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {
+                        k: self._RE.sub("api_key=***", v)
+                        if isinstance(v, str) else v
+                        for k, v in record.args.items()
+                    }
+                else:
+                    record.args = tuple(
+                        self._RE.sub("api_key=***", a)
+                        if isinstance(a, str) else a
+                        for a in record.args
+                    )
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactApiKey())
+
 GENRE_MAP = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
     80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",

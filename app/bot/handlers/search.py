@@ -29,6 +29,22 @@ def _is_pm(chat_id: int) -> bool:
     return not str(chat_id).startswith("-")
 
 
+_bot_username: str | None = None
+
+
+async def _get_bot_username(client: Client) -> str | None:
+    """Cache the bot's username for file deep links (tap name -> deliver)."""
+    global _bot_username
+    if _bot_username:
+        return _bot_username
+    try:
+        me = await client.get_me()
+        _bot_username = me.username or None
+    except Exception:
+        log.debug("get_me failed", exc_info=True)
+    return _bot_username
+
+
 async def _do_search(client: Client, query_text: str, user_id: int,
                      personal: bool = True
                      ) -> tuple[str, object] | tuple[None, None]:
@@ -151,9 +167,10 @@ async def render_v8_results(client: Client, message: Message,
     pages = max(1, math.ceil(len(rest) / v8_ui.V8_PAGE_SIZE))
     page = max(0, min(page, pages - 1))
     chunk = rest[page * v8_ui.V8_PAGE_SIZE:(page + 1) * v8_ui.V8_PAGE_SIZE]
+    username = await _get_bot_username(client)
     text = v8_ui.v8_results_text(
         data.get("meta"), best, chunk, page, pages, len(rest),
-        data.get("filters") or {}, uid, data.get("ai_note"))
+        data.get("filters") or {}, uid, data.get("ai_note"), username)
     kb = v8_ui.v8_results_kb(token, best["id"], uid, page, pages,
                              data.get("filters") or {})
     try:

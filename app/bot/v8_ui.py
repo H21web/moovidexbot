@@ -27,7 +27,6 @@ V8_FILTERS: tuple[tuple[str, str], ...] = (
 
 
 def file_season_episode(file_name: str | None) -> tuple[int | None, int | None]:
-    """Season/episode parsed from a filename (best effort)."""
     from app.textutil import (
         EPISODE_WORD_RE,
         SEASON_BARE_RE,
@@ -51,6 +50,44 @@ def file_season_episode(file_name: str | None) -> tuple[int | None, int | None]:
     if m:
         episode = int(m.group(1))
     return season, episode
+
+
+def kind_icon(meta: dict | None = None,
+              file_name: str | None = None) -> str:
+    """🎬 for movies, 📺 for series (TMDB kind, else filename S/E tags)."""
+    kind = (meta or {}).get("kind")
+    if kind == "tv":
+        return "📺"
+    if kind == "movie":
+        return "🎬"
+    s, e = file_season_episode(file_name)
+    return "📺" if (s or e) else "🎬"
+
+
+def file_deep_link(bot_username: str | None, file_db_id: int) -> str | None:
+    """t.me deep link that makes the bot deliver this exact file."""
+    if not bot_username:
+        return None
+    return f"https://t.me/{bot_username}?start=dl_{file_db_id}"
+
+
+# Canonical quality order for "best logic" sorting.
+_QUALITY_RANK = {"480p": 1, "720p": 2, "1080p": 3, "2160p": 4, "4320p": 5}
+
+
+def sort_best_first(files: list[dict]) -> list[dict]:
+    """Order files with the same logic that picks the best pick.
+
+    Score first (search relevance + personal taste), then quality,
+    then size — so the list runs best → worst and ``files[0]`` is
+    always the best pick.
+    """
+    def key(f: dict):
+        q = (f.get("quality") or "").lower()
+        return (-(f.get("score") or 0.0),
+                -_QUALITY_RANK.get(q, 0),
+                -(f.get("file_size") or 0))
+    return sorted(files, key=key)
 
 
 def v8_file_kb(file_db_id: int, user_id: int):
@@ -78,32 +115,43 @@ def _v8_dl_link(file_db_id: int, user_id: int) -> str | None:
     return dl_url(file_db_id, user_id)
 
 
-def _v8_file_line(idx: int, f: dict, user_id: int) -> str:
+def _v8_file_line(idx: int, f: dict, user_id: int,
+                  bot_username: str | None = None) -> str:
     name = (f.get("file_name") or "file").strip()
-    short = esc(name if len(name) <= 48 else name[:45] + "…")
+    short = name if len(name) <= 48 else name[:45] + "…"
+    # Tapping the file name delivers the file (deep link -> dl_ handler).
+    deep = file_deep_link(bot_username, f["id"])
+    if deep:
+        disp = f'<b><a href="{deep}">{esc(short)}</a></b>'
+    else:
+        disp = f"<b>{esc(short)}</b>"
+    icon = kind_icon(file_name=name)
     meta = " · ".join(x for x in (
         f.get("quality"), f.get("language"), fmt_size(f.get("file_size"))) if x)
     s, e = file_season_episode(name)
     if s or e:
-        se = "".join(x for x in (
-            f" S{s:02d}" if s else "", f" E{e:02d}" if e else ""))
-        meta = (se.strip() + (" · " + meta if meta else "")).strip(" ·")
-    line = f"{idx}. <b>{short}</b>"
+        se = f"S{s:02d}" if s else ""
+        if e:
+            se += f"E{e:02d}"
+        meta = se + (" · " + meta if meta else "")
+    line = f"{idx}. {icon} {disp}"
     if meta:
-        line += f"\n   <i>{esc(meta)}</i>"
+        line += f"\n   {esc(meta)}"
     link = _v8_dl_link(f["id"], user_id)
     if link:
-        line += f' — <a href="{link}">⬇ download</a>'
+        line += f'\n   <a href="{link}">⬇ Download</a>'
     return line
 
 
 def v8_results_text(meta: dict | None, best: dict, files: list[dict],
                     page: int, pages: int, total: int,
                     filters: dict, user_id: int,
-                    ai_note: str | None = None) -> str:
+                    ai_note: str | None = None,
+                    bot_username: str | None = None) -> str:
     parts: list[str] = []
     if meta:
-        head = f"🎬 <b>{esc(meta.get('title'))}</b>"
+        icon = kind_icon(meta)
+        head = f"{icon} <b>{esc(meta.get('title'))}</b>"
         if meta.get("year"):
             head += f" ({meta['year']})"
         if meta.get("rating"):
@@ -115,13 +163,20 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
             plot = meta["plot"]
             parts.append(f"<i>{esc(plot[:170] + '…' if len(plot) > 170 else plot)}</i>")
         parts.append("")
-    bname = esc((best.get("file_name") or "")[:70])
+    bname = (best.get("file_name") or "").strip()
+    bshort = bname if len(bname) <= 60 else bname[:57] + "…"
+    bdeep = file_deep_link(bot_username, best["id"])
+    bicon = kind_icon(meta, bname)
+    if bdeep:
+        parts.append(f"⭐ <b>Best pick</b> {bicon}\n"
+                     f'📁 <a href="{bdeep}">{esc(bshort)}</a>')
+    else:
+        parts.append(f"⭐ <b>Best pick</b> {bicon}\n📁 {esc(bshort)}")
     bmeta = " · ".join(x for x in (
         best.get("quality"), best.get("language"),
         fmt_size(best.get("file_size"))) if x)
-    parts.append(f"⭐ <b>Best pick</b>\n📁 {bname}")
     if bmeta:
-        parts.append(f"<i>{esc(bmeta)}</i>")
+        parts.append(esc(bmeta))
     if ai_note:
         parts.append(f"💡 <i>{esc(ai_note)}</i>")
     parts.append("")
@@ -133,7 +188,7 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     parts.append(head)
     start = page * V8_PAGE_SIZE
     for i, f in enumerate(files, start=start + 1):
-        parts.append(_v8_file_line(i, f, user_id))
+        parts.append(_v8_file_line(i, f, user_id, bot_username))
     text = "\n".join(parts)
     # Telegram hard limit: 4096 chars.
     if len(text) > 4000:

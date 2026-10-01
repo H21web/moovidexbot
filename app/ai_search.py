@@ -286,6 +286,11 @@ async def v8_search(user_id: int, q: str) -> dict:
                 "files": [], "best": None, "meta": None,
                 "parsed": parsed, "ai_note": None}
 
+    # "Best logic" ordering: score (relevance + taste) -> quality -> size.
+    # files[0] is always the best pick; the list runs best -> worst.
+    from app.bot.v8_ui import sort_best_first
+    items = sort_best_first(items)
+
     files = _query_season_episode(parsed, items)
     best = files[0]
 

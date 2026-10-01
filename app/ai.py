@@ -204,6 +204,29 @@ async def groq_complete(system: str, user: str,
         resp.raise_for_status()
         data = resp.json()
         return (data["choices"][0]["message"]["content"] or "").strip() or None
+    except httpx.HTTPStatusError as exc:
+        # Log Groq's own error body — it names the real cause
+        # (model_not_found, invalid key, rate limit...).
+        body = ""
+        try:
+            body = (exc.response.text or "")[:300]
+        except Exception:
+            pass
+        log.warning("groq call failed: %s | groq says: %s", exc, body)
+        # 404 from Groq's OpenAI-compatible route almost always means the
+        # model id is unknown there — retry once with the fast fallback.
+        if (exc.response.status_code == 404
+                and (model or settings.AI_MODEL) != settings.AI_PARSE_MODEL):
+            try:
+                payload["model"] = settings.AI_PARSE_MODEL
+                resp = await _get_client().post("/v1/chat/completions",
+                                               json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                return (data["choices"][0]["message"]["content"] or "").strip() or None
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("groq fallback model also failed: %s", exc2)
+        return None
     except Exception as exc:  # noqa: BLE001 - AI must never break the bot
         log.warning("groq call failed: %s", exc)
         return None
