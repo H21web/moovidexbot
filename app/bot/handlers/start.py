@@ -41,6 +41,35 @@ HELP_TEXT = (
 )
 
 
+async def _deliver_deeplink(client: Client, message: Message,
+                          file_db_id: int):
+    """Deliver one file in PM for a /start dl_<id> deep link."""
+    from app.bot.handlers.callbacks import _get_file, _send_file
+
+    f = await _get_file(file_db_id)
+    if not f:
+        await message.reply_text("❌ File not found (removed?).")
+        return
+    try:
+        await _send_file(client, message.chat.id, f,
+                         message.from_user.id)
+    except Exception as exc:
+        log.warning("deep-link deliver failed for file %d: %s",
+                    file_db_id, exc)
+        await message.reply_text(
+            "❌ Couldn't send the file. Try again later.")
+
+
+def _parse_dl_arg(text: str | None) -> int | None:
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("dl_"):
+        try:
+            return int(parts[1][3:])
+        except ValueError:
+            return None
+    return None
+
+
 async def _start(client: Client, message: Message):
     user = await track_user(message)
     if user and user.is_banned:
@@ -48,12 +77,21 @@ async def _start(client: Client, message: Message):
         return
     asyncio.create_task(log_event("start", user_id=message.from_user.id,
                                   chat_id=message.chat.id))
-    kb = await forcesub.ensure_joined(client, message.from_user.id,
+    uid = message.from_user.id
+    dl_id = _parse_dl_arg(message.text)
+    kb = await forcesub.ensure_joined(client, uid,
                                       chat_id=message.chat.id)
     if kb:
+        # Remember the file so "try again" can deliver it after joining.
+        if dl_id:
+            state.pending_dl[uid] = dl_id
         await message.reply_text(
             "📢 <b>Please join our channels first</b>, then tap Try Again.",
             reply_markup=kb)
+        return
+    if dl_id:
+        state.pending_dl.pop(uid, None)
+        await _deliver_deeplink(client, message, dl_id)
         return
     text = await rt.aget_setting("WELCOME_PM") or START_TEXT
     await message.reply_text(text, reply_markup=ui.start_kb())

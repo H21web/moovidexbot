@@ -127,7 +127,10 @@ async def pending_set(user_id: int, data: dict) -> None:
                 row.data = payload
             await s.commit()
     except Exception as exc:
-        log.debug("pending_set failed: %s", exc)
+        # Visible warning (not debug): if this fails the session only
+        # lives in memory and is lost on restart — usually means the
+        # index_sessions table is missing (run: alembic upgrade head).
+        log.warning("pending_set DB persist failed: %s", exc)
 
 
 async def pending_clear(user_id: int) -> None:
@@ -145,6 +148,12 @@ async def pending_clear(user_id: int) -> None:
                 await s.commit()
     except Exception as exc:
         log.debug("pending_clear failed: %s", exc)
+
+
+# --- pending deep-link deliveries: user id -> file db id ---
+# Set when /start dl_<id> hits the force-sub wall; consumed by
+# fsub_retry after the user joins. Short-lived; memory-only is fine.
+pending_dl: dict[int, int] = {}
 
 
 # --- /index job registry (shared between engine and handlers) ---

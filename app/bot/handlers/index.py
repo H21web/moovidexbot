@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timezone
 
 from pyrogram import Client, StopPropagation, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -339,7 +340,8 @@ async def _index_interactive(client: Client, message: Message):
                     message.chat.id, pending["panel_msg_id"],
                     f"⚠️ Send a <b>plain number</b> for "
                     f"<b>{OPT_LABELS.get(key, key)}</b> (0 = off).",
-                    reply_markup=ui.ix_setup_cancel_kb())
+                    reply_markup=ui.ix_setup_cancel_kb(),
+                    parse_mode=ParseMode.HTML)
             except Exception:
                 pass
             raise StopPropagation
@@ -413,7 +415,8 @@ async def _ixs(client: Client, query: CallbackQuery):
         await query.message.edit_text(
             f"✏️ Send a number for <b>{OPT_LABELS[key]}</b>\n"
             "(0 = off):",
-            reply_markup=ui.ix_setup_cancel_kb())
+            reply_markup=ui.ix_setup_cancel_kb(),
+            parse_mode=ParseMode.HTML)
         await query.answer()
         return
 

@@ -6,8 +6,9 @@ import logging
 import math
 
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
+from pyrogram.enums import ChatType, ParseMode
+from pyrogram.errors import FloodWait, PeerIdInvalid
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
 from app import state
@@ -100,47 +101,88 @@ async def _back(client: Client, query):
                                          page_start=start))
 
 
+async def _send_file(client: Client, target_id: int, f, uid: int):
+    """Send a File row to ``target_id`` via cached media.
+
+    Shared by in-PM delivery, group→PM delivery, and the ``dl_``
+    deep-link handler. Returns the sent message.
+    """
+    # send_cached_media (not send_document): send_document rejects
+    # non-document file_ids ("Expected DOCUMENT, got VIDEO"), which
+    # broke delivery for every video file.
+    sent = await client.send_cached_media(
+        target_id,
+        file_id=f.file_id,
+        caption=ui.file_caption({
+            "file_name": f.file_name, "quality": f.quality,
+            "language": f.language, "file_size": f.file_size}),
+        parse_mode=ParseMode.HTML,
+        reply_markup=ui.file_kb(
+            f.id, watch_url(f.id, uid)),
+        protect_content=settings.PROTECT_CONTENT,
+    )
+    asyncio.create_task(log_event("download", user_id=uid,
+                                  chat_id=sent.chat.id))
+    # PM deliveries fall back to the global auto-delete default
+    # (no per-group row exists for a user id).
+    ad = await effective_autodelete(target_id)
+    if ad > 0:
+        await autodelete.schedule(sent.chat.id, sent.id, ad)
+    return sent
+
+
+async def _get_file(file_db_id: int):
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as session:
+        return (await session.execute(
+            select(File).where(File.id == file_db_id))).scalar_one_or_none()
+
+
 async def _deliver(client: Client, query):
     await query.answer("📤 Preparing your file…")
     uid = query.from_user.id
     if await is_banned(uid):
         await query.answer("⛔ You are banned.", show_alert=True)
         return
-    kb = await forcesub.ensure_joined(client, uid,
-                                      chat_id=query.message.chat.id)
+    src = query.message.chat
+    in_group = src.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    kb = await forcesub.ensure_joined(client, uid, chat_id=src.id)
     if kb:
         # Reuse the card message: swap its content for the join prompt.
         await query.message.edit_text(
-            "📢 <b>Join our channels to download</b>", reply_markup=kb)
+            "📢 <b>Join our channels to download</b>", reply_markup=kb,
+            parse_mode=ParseMode.HTML)
         return
     try:
         file_db_id = int(query.data.split(":")[1])
     except (ValueError, IndexError):
         return
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as session:
-        f = (await session.execute(
-            select(File).where(File.id == file_db_id))).scalar_one_or_none()
+    f = await _get_file(file_db_id)
     if not f:
         await query.answer("❌ File not found (removed?).", show_alert=True)
         return
 
-    await query.message.edit_text("📤 <i>Uploading…</i>")
+    # Group searches deliver to the user's PM only — never in the group.
+    target = uid if in_group else src.id
+    if not in_group:
+        await query.message.edit_text("📤 <i>Uploading…</i>",
+                                      parse_mode=ParseMode.HTML)
     try:
-        # send_cached_media (not send_document): send_document rejects
-        # non-document file_ids ("Expected DOCUMENT, got VIDEO"), which
-        # broke delivery for every video file.
-        sent = await client.send_cached_media(
-            query.message.chat.id,
-            file_id=f.file_id,
-            caption=ui.file_caption({
-                "file_name": f.file_name, "quality": f.quality,
-                "language": f.language, "file_size": f.file_size}),
-            parse_mode=ParseMode.HTML,
-            reply_markup=ui.file_kb(
-                f.id, watch_url(f.id, uid)),
-            protect_content=settings.PROTECT_CONTENT,
-        )
+        await _send_file(client, target, f, uid)
+    except PeerIdInvalid:
+        # User never started the bot in PM — one-tap deep link that
+        # delivers this exact file once they tap START.
+        me = await client.get_me()
+        deep = f"https://t.me/{me.username}?start=dl_{f.id}"
+        await query.message.edit_text(
+            "👋 <b>Almost there!</b>\n\n"
+            "Tap below to open my private chat — "
+            "your file will be sent there:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Open bot & get file",
+                                     url=deep)]]),
+            parse_mode=ParseMode.HTML)
+        return
     except FloodWait as exc:
         await query.message.edit_text(
             f"⏳ Flood control — retry in {exc.value}s.")
@@ -150,15 +192,13 @@ async def _deliver(client: Client, query):
         await query.message.edit_text(
             "❌ Couldn't send the file. Try again later.")
         return
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    asyncio.create_task(log_event("download", user_id=uid,
-                                  chat_id=sent.chat.id))
-    ad = await effective_autodelete(sent.chat.id)
-    if ad > 0:
-        await autodelete.schedule(sent.chat.id, sent.id, ad)
+    if in_group:
+        await query.answer("📥 File sent to your private chat ✅")
+    else:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
 
 
 async def _spell(client: Client, query):
@@ -182,18 +222,35 @@ async def _spell(client: Client, query):
 
 
 async def _fsub_retry(client: Client, query):
-    kb = await forcesub.ensure_joined(client, query.from_user.id,
+    uid = query.from_user.id
+    kb = await forcesub.ensure_joined(client, uid,
                                       chat_id=query.message.chat.id)
     if kb:
         await query.answer("❌ You haven't joined all channels yet.",
                            show_alert=True)
     else:
-        await query.answer("✅ All joined! Send your movie name.",
-                           show_alert=True)
+        await query.answer("✅ All joined!", show_alert=True)
         try:
             await query.message.delete()
         except Exception:
             pass
+        # Deep-link flow: user came from a group file button via
+        # /start dl_<id> — deliver the waiting file now.
+        dl_id = state.pending_dl.pop(uid, None)
+        if dl_id:
+            f = await _get_file(dl_id)
+            if f:
+                try:
+                    await _send_file(client, uid, f, uid)
+                except Exception as exc:
+                    log.warning("retry deliver failed for file %d: %s",
+                                dl_id, exc)
+                    try:
+                        await client.send_message(
+                            uid, "❌ Couldn't send the file. "
+                                 "Try again later.")
+                    except Exception:
+                        pass
 
 
 async def _ixstop(client: Client, query):
