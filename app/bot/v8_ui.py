@@ -115,9 +115,16 @@ def _v8_dl_link(file_db_id: int, user_id: int) -> str | None:
     return dl_url(file_db_id, user_id)
 
 
+def _clean_disp_name(name: str) -> str:
+    """Display-clean file name: dots/underscores -> spaces, squeeze gaps."""
+    import re as _re
+    s = _re.sub(r"[._]+", " ", name or "").strip()
+    return _re.sub(r"\s+", " ", s)
+
+
 def _v8_file_line(idx: int, f: dict, user_id: int,
                   bot_username: str | None = None) -> str:
-    name = (f.get("file_name") or "file").strip()
+    name = _clean_disp_name(f.get("file_name") or "file")
     short = name if len(name) <= 48 else name[:45] + "…"
     # Tapping the file name delivers the file (deep link -> dl_ handler).
     deep = file_deep_link(bot_username, f["id"])
@@ -163,7 +170,7 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
             plot = meta["plot"]
             parts.append(f"<i>{esc(plot[:170] + '…' if len(plot) > 170 else plot)}</i>")
         parts.append("")
-    bname = (best.get("file_name") or "").strip()
+    bname = _clean_disp_name(best.get("file_name") or "")
     bshort = bname if len(bname) <= 60 else bname[:57] + "…"
     bdeep = file_deep_link(bot_username, best["id"])
     bicon = kind_icon(meta, bname)
@@ -178,7 +185,7 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     if bmeta:
         parts.append(esc(bmeta))
     if ai_note:
-        parts.append(f"💡 <i>{esc(ai_note)}</i>")
+        parts.append(f"💡 <i>“{esc(ai_note)}”</i>")
     parts.append("")
     # v8.1: no other files besides the best pick -> skip the list section.
     if files:
@@ -188,6 +195,7 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
         if flt:
             head += f"\n🔎 <i>{esc(flt)}</i>"
         parts.append(head)
+        parts.append("")  # breathing room between heading and the list
         start = page * V8_PAGE_SIZE
         for i, f in enumerate(files, start=start + 1):
             parts.append(_v8_file_line(i, f, user_id, bot_username))
