@@ -174,18 +174,20 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     bshort = bname if len(bname) <= 60 else bname[:57] + "…"
     bdeep = file_deep_link(bot_username, best["id"])
     bicon = kind_icon(meta, bname)
+    bq: list[str] = []
     if bdeep:
-        parts.append(f"⭐ <b>Best pick</b> {bicon}\n"
-                     f'📁 <a href="{bdeep}">{esc(bshort)}</a>')
+        bq.append(f"⭐ <b>Best pick</b> {bicon}\n"
+                  f'📁 <a href="{bdeep}">{esc(bshort)}</a>')
     else:
-        parts.append(f"⭐ <b>Best pick</b> {bicon}\n📁 {esc(bshort)}")
+        bq.append(f"⭐ <b>Best pick</b> {bicon}\n📁 {esc(bshort)}")
     bmeta = " · ".join(x for x in (
         best.get("quality"), best.get("language"),
         fmt_size(best.get("file_size"))) if x)
     if bmeta:
-        parts.append(esc(bmeta))
+        bq.append(esc(bmeta))
     if ai_note:
-        parts.append(f"💡 <i>“{esc(ai_note)}”</i>")
+        bq.append(f"💡 <i>“{esc(ai_note)}”</i>")
+    parts.append("<blockquote>" + "\n".join(bq) + "</blockquote>")
     parts.append("")
     # v8.1: no other files besides the best pick -> skip the list section.
     if files:

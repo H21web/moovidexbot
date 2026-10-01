@@ -83,8 +83,12 @@ async def _send_results(client: Client, chat_id: int, token: str,
 
 
 async def _no_results_pm(client: Client, message: Message, q: str):
-    """No-results flow for PM: TMDB correction -> spell suggestions ->
-    AI button. Everything in the single clean template."""
+    """No-results flow for PM: TMDB correction -> spell suggestions.
+
+    v8.6: no AI-search button — the AI search already ran automatically
+    (ai_suggest_title retry inside _v8_search_flow). If we're here,
+    everything fell back -> show no results.
+    """
     kb = None
     text = "❌ <b>No results found.</b>"
     # Never send raw user text to TMDB: resolve a clean title first
@@ -108,15 +112,6 @@ async def _no_results_pm(client: Client, message: Message, q: str):
         if suggestions:
             text += "\nDid you mean:"
             kb = ui.spell_kb(suggestions)
-    # On-demand AI search button (only when Groq is configured; the query
-    # lives server-side because callback data is limited to 64 bytes).
-    if ai.is_configured():
-        ai_token = ai.store_query(q)
-        ai_kb = ui.ai_search_kb(ai_token)
-        if kb is not None:
-            kb.inline_keyboard.extend(ai_kb.inline_keyboard)
-        else:
-            kb = ai_kb
     await message.reply_text(text, reply_markup=kb)
 
 
