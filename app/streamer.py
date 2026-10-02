@@ -30,8 +30,18 @@ from pyrogram.session import Auth, Session
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1024 * 1024  # 1 MiB per GetFile call
-MAX_CHUNK = 1024 * 1024
+# Telegram's upload.GetFile granularity rules (violating them raises
+# [400 LIMIT_INVALID]):
+#   * with precise=True: offset and limit must be multiples of 1 KiB,
+#     limit <= 1 MiB;
+#   * without precise: multiples of 4 KiB and (1 MiB % limit == 0).
+# 512 KiB satisfies BOTH regimes, so every request we build is valid by
+# construction. We always request the FULL chunk and let Telegram
+# short-read at EOF — trimming the final limit to the exact remainder
+# is what used to break the granularity rule.
+CHUNK_SIZE = 512 * 1024
+MAX_CHUNK = 512 * 1024
+_GRANULARITY = 1024  # precise=True -> 1 KiB alignment
 
 
 class StreamError(RuntimeError):
@@ -126,22 +136,21 @@ async def _stream_cdn(client, main_session: Session,
 
     pos = max(0, offset)
     remaining = length
+    # v10.3.1: align to the 1 KiB granularity (a multiple of 16, so the
+    # AES-CTR IV math below stays correct) and always request the FULL
+    # chunk — GetCdnFile has the same LIMIT_INVALID rules as GetFile.
+    req_pos = pos - (pos % _GRANULARITY)
+    skip = pos - req_pos
 
     while True:
-        want = chunk_size if remaining is None else min(chunk_size, remaining)
-        if want <= 0:
+        if remaining is not None and remaining <= 0:
             break
-        # AES-CTR works on 16-byte blocks: align the request down, decrypt,
-        # then slice off the leading misalignment.
-        req_pos = pos - (pos % 16)
-        skip = pos - req_pos
-        limit = want + skip + 16
 
         r2 = await cdn_session.invoke(
             raw.functions.upload.GetCdnFile(
                 file_token=redirect.file_token,
                 offset=req_pos,
-                limit=limit,
+                limit=chunk_size,
             ),
             sleep_threshold=30,
         )
@@ -180,16 +189,18 @@ async def _stream_cdn(client, main_session: Session,
             if len(part) == h.limit and sha256(part).digest() != h.hash:
                 raise StreamError("CDN chunk hash mismatch")
 
-        data = dec[skip: skip + want]
+        # Slice off the leading misalignment (first chunk only), then
+        # trim to the requested range. The server short-reads at EOF.
+        data = dec[skip:] if skip else dec
+        skip = 0
+        if remaining is not None:
+            data = data[:remaining]
+            remaining -= len(data)
         if not data:
             break
         yield data
-        pos += len(data)
-        if remaining is not None:
-            remaining -= len(data)
-            if remaining <= 0:
-                break
-        if len(enc) < limit:
+        req_pos += chunk_size
+        if len(enc) < chunk_size:
             break  # short read = EOF
 
 
@@ -210,19 +221,27 @@ async def stream_file(
     location = _location_for(fid)
     session = await _media_session(client, fid.dc_id)
 
-    chunk_size = max(4096, min(chunk_size, MAX_CHUNK))
+    # v10.3.1: round the chunk to the granularity — every limit we send
+    # is then a valid power-of-2 multiple (512 KiB) by construction.
+    chunk_size = max(_GRANULARITY, min(chunk_size, MAX_CHUNK))
+    chunk_size -= chunk_size % _GRANULARITY
     pos = max(0, offset)
     remaining = length
+    # Align the first request down to the granularity; drop the leading
+    # bytes locally. HTTP Range offsets are arbitrary — sending them raw
+    # is what raised [400 LIMIT_INVALID].
+    req_pos = pos - (pos % _GRANULARITY)
+    skip = pos - req_pos
 
     while True:
-        take = chunk_size if remaining is None else min(chunk_size, remaining)
-        if take <= 0:
+        if remaining is not None and remaining <= 0:
             break
+        # Always the FULL chunk — never trim the limit to the remainder.
         result = await session.invoke(
             raw.functions.upload.GetFile(
                 location=location,
-                offset=pos,
-                limit=take,
+                offset=req_pos,
+                limit=chunk_size,
                 precise=True,
                 cdn_supported=True,
             ),
@@ -231,14 +250,19 @@ async def stream_file(
         if isinstance(result, raw.types.upload.File):
             data = result.bytes
             if not data:
+                break  # EOF
+            if skip:
+                data = data[skip:]
+                skip = 0
+            if remaining is not None:
+                data = data[:remaining]
+                remaining -= len(data)
+            if not data:
                 break
             yield data
             pos += len(data)
-            if remaining is not None:
-                remaining -= len(data)
-                if remaining <= 0:
-                    break
-            if len(data) < take:  # EOF
+            req_pos += chunk_size
+            if len(result.bytes) < chunk_size:  # short read = EOF
                 break
         elif isinstance(result, raw.types.upload.FileCdnRedirect):
             log.info("CDN redirect for file (dc %d), following",

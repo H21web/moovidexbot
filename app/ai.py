@@ -224,6 +224,25 @@ async def groq_complete(system: str, user: str,
                 pass
             log.warning("groq call failed (model %s): %s | groq says: %s",
                         m, exc, body)
+            # v10.3.1: strict JSON mode can make the model emit nothing
+            # ("json_validate_failed" with an empty generation). One retry
+            # without the straitjacket — callers parse defensively via
+            # _parse_json anyway, so a non-JSON answer degrades the same
+            # way None would.
+            if json_mode and "json_validate_failed" in body:
+                log.info("groq: retrying without json_object (model %s)", m)
+                payload.pop("response_format", None)
+                try:
+                    resp = await _get_client().post("/v1/chat/completions",
+                                                    json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    return ((data["choices"][0]["message"]["content"] or "")
+                            .strip() or None)
+                except Exception as exc2:  # noqa: BLE001
+                    log.warning("groq json retry failed (model %s): %s",
+                                m, exc2)
+                    return None
             if not _is_model_not_found(exc):
                 return None
             tried.append(m)
