@@ -52,7 +52,7 @@ async def _save_cb(client: Client, query) -> None:
                     constraint="uq_saved_user_file"))
             await s.commit()
     except Exception:  # noqa: BLE001
-        log.debug("save failed", exc_info=True)
+        log.warning("watchlist save failed for user %d", uid, exc_info=True)
         try:
             await query.answer("⚠️ Couldn't save — try again.")
         except Exception:  # noqa: BLE001
@@ -64,16 +64,28 @@ async def _save_cb(client: Client, query) -> None:
 async def _unsave_cb(client: Client, query) -> None:
     """unsave:{file_db_id} — remove from watchlist, re-render the list."""
     uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
     try:
         fid = int(query.data.split(":")[1])
     except (ValueError, IndexError):
         return
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        await s.execute(
-            delete(SavedFile).where(SavedFile.user_id == uid,
-                                    SavedFile.file_id == fid))
-        await s.commit()
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            await s.execute(
+                delete(SavedFile).where(SavedFile.user_id == uid,
+                                        SavedFile.file_id == fid))
+            await s.commit()
+    except Exception:  # noqa: BLE001
+        log.warning("watchlist unsave failed for user %d", uid,
+                    exc_info=True)
+        try:
+            await query.answer("⚠️ Couldn't remove — try again.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
     await query.answer("🗑 Removed")
     # Re-render the list in place.
     await _render_saved(query.message, uid, page=0, edit=True)
@@ -93,7 +105,20 @@ async def _saved_rows(uid: int):
 
 async def _render_saved(message, uid: int, page: int = 0,
                         edit: bool = False) -> None:
-    rows = await _saved_rows(uid)
+    try:
+        rows = await _saved_rows(uid)
+    except Exception:  # noqa: BLE001
+        # v10.1: never die silently — a DB hiccup (or a missing saved_files
+        # table) used to make /saved do nothing at all.
+        log.warning("watchlist load failed for user %d", uid, exc_info=True)
+        try:
+            await message.reply_text(
+                "⚠️ <b>Couldn't load your watchlist.</b>\n"
+                "Please try again in a bit.",
+                parse_mode=ParseMode.HTML)
+        except Exception:  # noqa: BLE001
+            pass
+        return
     if not rows:
         text = ("⭐ <b>Your watchlist is empty.</b>\n"
                 "Tap ⭐ Save on any file to keep it here.")

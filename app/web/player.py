@@ -67,16 +67,22 @@ def _content_type(f: File) -> str:
     return guess or "application/octet-stream"
 
 
-def _content_disposition(filename: str) -> str:
+def _content_disposition(filename: str, attachment: bool = False) -> str:
     """RFC 6266/5987 Content-Disposition.
 
     Sanitised ASCII ``filename`` (quotes/CR/LF stripped — no header
     injection) plus the UTF-8 ``filename*`` for non-ASCII names.
+
+    Explicit downloads (``?dl=1``) are served as ``attachment`` so the
+    browser downloads the file instead of trying to play a multi-GB
+    stream inline — that inline attempt is what made the ⬇ Download
+    button look dead.
     """
     safe = (filename or "file").rsplit("/", 1)[-1]
     safe = safe.replace('"', "").replace("\r", "").replace("\n", "")
     ascii_name = safe.encode("ascii", "ignore").decode("ascii") or "file"
-    return (f'inline; filename="{ascii_name}"; '
+    disp = "attachment" if attachment else "inline"
+    return (f'{disp}; filename="{ascii_name}"; '
             f"filename*=UTF-8''{quote(safe)}")
 
 
@@ -245,9 +251,10 @@ async def download(token: str, request: Request):
     # v8.1: explicit ⬇ Download hits (list link has ?dl=1) count toward the
     # per-file download counter. Web-player streams carry no marker, so
     # plays are never counted as downloads. HEAD/range-resumes don't count.
-    if (request.method == "GET"
-            and request.query_params.get("dl") == "1"
-            and not request.headers.get("range")):
+    is_explicit_dl = (request.method == "GET"
+                      and request.query_params.get("dl") == "1"
+                      and not request.headers.get("range"))
+    if is_explicit_dl:
         asyncio.create_task(bump_file_downloads(f.id))
     size = f.file_size or 0
     if size <= 0:
@@ -271,7 +278,8 @@ async def download(token: str, request: Request):
         "Accept-Ranges": "bytes",
         "Content-Type": ctype,
         "Content-Length": str(length),
-        "Content-Disposition": _content_disposition(filename),
+        "Content-Disposition": _content_disposition(
+            filename, attachment=is_explicit_dl),
     }
     partial = offset != 0 or length != size
     if partial:

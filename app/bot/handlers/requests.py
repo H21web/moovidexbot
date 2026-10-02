@@ -1,12 +1,14 @@
 """/request — users ask for missing movies."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 
+from app.analytics import log_event
 from app.bot import forcesub
 from app.bot.handlers.common import track_user
 from app.config import settings
@@ -39,6 +41,10 @@ async def _request(client: Client, message: Message):
         s.add(req)
         await s.commit()
         rid = req.id
+    # v10.1: feed /mystats — requests were never logged, so the counter
+    # was stuck at 0 forever.
+    asyncio.create_task(log_event("request", user_id=message.from_user.id,
+                                  chat_id=message.chat.id))
     await message.reply_text(
         f"✅ <b>Request #{rid} noted!</b>\nWe'll add it soon. 🎬")
     # notify request channel / admins

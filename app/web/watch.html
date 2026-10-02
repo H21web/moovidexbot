@@ -184,6 +184,10 @@
   };
 
   var DL_URL = "__DL_URL__";
+  /* v10.1: the explicit ⬇ Download button uses ?dl=1 — it counts toward
+     the file's download counter and the server answers `attachment`,
+     so the browser downloads instead of trying to play it inline. */
+  var DL_DL_URL = DL_URL + "?dl=1";
   var FILE_NAME = "__FILENAME__";
   var FILE_SIZE = __SIZE__ || 0;
   var MIME = "__MIME__";
@@ -285,7 +289,7 @@
     btn.disabled = true; haptic();
     toast("Starting download…");
     try {
-      var res = await fetch(DL_URL);
+      var res = await fetch(DL_DL_URL);
       if (!res.ok || !res.body) throw new Error("fetch failed");
       var total = parseInt(res.headers.get("content-length") || "0", 10) || FILE_SIZE;
       if (window.showSaveFilePicker) {
@@ -317,7 +321,7 @@
         toast("Downloaded ✓"); haptic("ok");
       }
     } catch(e) {
-      window.open(DL_URL, "_blank");
+      window.open(DL_DL_URL, "_blank");
       toast("Opened download link");
     } finally {
       btn.disabled = false;
