@@ -71,6 +71,25 @@ Index("ix_files_title_key_trgm", File.title_key,
       postgresql_using="gin", postgresql_ops={"title_key": "gin_trgm_ops"})
 
 
+class SavedFile(Base):
+    """v10: per-user watchlist. One row per (user, file)."""
+
+    __tablename__ = "saved_files"
+    __table_args__ = (
+        UniqueConstraint("user_id", "file_id", name="uq_saved_user_file"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True,
+                                        nullable=False)
+    file_id: Mapped[int] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), nullable=False,
+        index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class User(Base):
     __tablename__ = "users"
 

@@ -15,7 +15,7 @@ import time
 
 log = logging.getLogger(__name__)
 
-_queue: list[tuple[float, int, int]] = []  # (delete_at, chat_id, msg_id)
+_queue: list[tuple[float, int, int, int]] = []  # (delete_at, seq, chat_id, msg_id)
 _waker: asyncio.Event | None = None
 _task: asyncio.Task | None = None
 _seq = 0
@@ -73,7 +73,3 @@ def start() -> asyncio.Task:
     if _task is None or _task.done():
         _task = asyncio.create_task(worker())
     return _task
-
-
-def pending_count() -> int:
-    return len(_queue)

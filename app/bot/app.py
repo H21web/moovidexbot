@@ -4,9 +4,10 @@ The bot account does everything over MTProto (no Bot API library):
 
 * search, buttons, inline mode, file delivery
 * real-time auto-index of new channel posts (bot is admin)
-* historical ``/index`` backfill — bots CAN read channel history via
-  ``messages.getHistory`` when they are admin of the channel
-  (this is exactly how Tech VJ-style bots index; no user session needed)
+* historical ``/index`` backfill — the bot walks channel message IDs
+  with ``channels.GetMessages`` in batches (``messages.GetHistory``
+  returns [400 BOT_METHOD_INVALID] for bots, even as admin; this ID-walk
+  is exactly how Tech VJ-style bots index — no user session needed)
 * web-player streaming — ``/dl`` reads file bytes with raw
   ``upload.GetFile`` (any file size, HTTP Range seeking works)
 

@@ -1,6 +1,7 @@
 """Analytics helpers: log events, build daily series for the dashboard."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -51,12 +52,16 @@ async def _daily(table, date_col, days: int = 30,
 
 async def overview(days: int = 30) -> dict:
     """Everything the dashboard homepage needs."""
-    searches = await _daily(SearchLog, SearchLog.created_at, days)
-    downloads = await _daily(EventLog, EventLog.created_at, days, kind="download")
-    starts = await _daily(EventLog, EventLog.created_at, days, kind="start")
-    new_users = await _daily(User, User.joined_at, days)
-    new_files = await _daily(File, File.created_at, days)
-    new_requests = await _daily(MovieRequest, MovieRequest.created_at, days)
+    # 6 independent daily series -> run concurrently, not sequentially.
+    searches, downloads, starts, new_users, new_files, new_requests = \
+        await asyncio.gather(
+            _daily(SearchLog, SearchLog.created_at, days),
+            _daily(EventLog, EventLog.created_at, days, kind="download"),
+            _daily(EventLog, EventLog.created_at, days, kind="start"),
+            _daily(User, User.joined_at, days),
+            _daily(File, File.created_at, days),
+            _daily(MovieRequest, MovieRequest.created_at, days),
+        )
 
     def total(d: dict[str, int], n: int) -> int:
         keys = sorted(d)[-n:]

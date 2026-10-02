@@ -7,11 +7,13 @@ movies play fine.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
 import re
 from html import escape
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -65,6 +67,19 @@ def _content_type(f: File) -> str:
     return guess or "application/octet-stream"
 
 
+def _content_disposition(filename: str) -> str:
+    """RFC 6266/5987 Content-Disposition.
+
+    Sanitised ASCII ``filename`` (quotes/CR/LF stripped — no header
+    injection) plus the UTF-8 ``filename*`` for non-ASCII names.
+    """
+    safe = (filename or "file").rsplit("/", 1)[-1]
+    safe = safe.replace('"', "").replace("\r", "").replace("\n", "")
+    ascii_name = safe.encode("ascii", "ignore").decode("ascii") or "file"
+    return (f'inline; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(safe)}")
+
+
 def _parse_range(range_header: str | None, size: int) -> tuple[int, int | None]:
     """Return (offset, length). length None = to end."""
     if not range_header:
@@ -73,17 +88,23 @@ def _parse_range(range_header: str | None, size: int) -> tuple[int, int | None]:
     if not m:
         return 0, None
     start_s, end_s = m.groups()
-    if start_s == "" and end_s:
-        # suffix range: last N bytes
-        n = int(end_s)
-        return max(0, size - n), n
-    start = int(start_s or 0)
-    if end_s:
-        end = min(int(end_s), size - 1)
-        if start > end:
-            raise HTTPException(416, "range not satisfiable")
-        return start, end - start + 1
-    return start, None
+    try:
+        if start_s == "" and end_s:
+            # suffix range: last N bytes
+            n = int(end_s)
+            return max(0, size - n), n
+        start = int(start_s or 0)
+        if end_s:
+            end = min(int(end_s), size - 1)
+            if start > end:
+                raise HTTPException(416, "range not satisfiable")
+            return start, end - start + 1
+        return start, None
+    except (ValueError, OverflowError):
+        # Absurdly long digit runs trip the int() digit limit (or other
+        # garbage): ignore the Range header instead of 500ing.
+        log.debug("ignoring malformed Range header %r", range_header[:60])
+        return 0, None
 
 
 async def _refresh_file_id(f: File) -> str:
@@ -132,7 +153,10 @@ async def watch(token: str, request: Request):
     if poster:
         poster_html = (f'<img class="poster" src="{escape(poster)}" '
                        f'alt="poster" loading="lazy">')
-        backdrop = f"url('{escape(poster)}') center/cover no-repeat"
+        # CSS context: HTML entities are NOT decoded inside <style>, so
+        # URL-quote instead of HTML-escaping (escape() would corrupt &).
+        css_url = quote(poster, safe=":/?#[]@!$&()*+,;=%")
+        backdrop = f"url('{css_url}') center/cover no-repeat"
     else:
         poster_html = '<div class="poster poster-fallback">🎬</div>'
         backdrop = "linear-gradient(135deg,#1a2233,#0b0e14)"
@@ -166,8 +190,10 @@ async def watch(token: str, request: Request):
                              f" ({meta.get('year') or '—'})")
 
     html_page = _template().replace("__TITLE__", escape(name))
-    # JS-string-safe filename (no double quotes / backslashes).
-    js_name = name.replace("\\", "\\\\").replace('"', "")
+    # JS-string-safe filename: a full JSON string literal is valid JS;
+    # </script> is neutralised and CR/LF stripped so the player survives.
+    js_name = json.dumps(name.replace("\r", "").replace("\n", ""))
+    js_name = js_name.replace("<", "\\u003c")
     html_page = (html_page
                  .replace("__DL_URL__", dl_url)
                  .replace("__PLAYABLE__", "true" if playable else "false")
@@ -180,7 +206,7 @@ async def watch(token: str, request: Request):
                  .replace("__PLOT__", escape(plot[:300]))
                  .replace("__BACKDROP_CSS__", backdrop)
                  .replace("__DETAILS_HTML__", details)
-                 .replace("__FILENAME__", js_name))
+                 .replace('"__FILENAME__"', js_name))
     return HTMLResponse(html_page)
 
 
@@ -245,7 +271,7 @@ async def download(token: str, request: Request):
         "Accept-Ranges": "bytes",
         "Content-Type": ctype,
         "Content-Length": str(length),
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": _content_disposition(filename),
     }
     partial = offset != 0 or length != size
     if partial:
@@ -255,19 +281,34 @@ async def download(token: str, request: Request):
         return Response(status_code=206 if partial else 200, headers=headers)
 
     file_id = f.file_id
+    stream = None
+    first: bytes | None = None
     for attempt in (0, 1):
         try:
-            async def gen():
-                async with _stream_sem:
-                    async for chunk in streamer.stream_file(
-                            client, file_id, offset=offset, length=length):
-                        yield chunk
+            # Pre-flight the first GetFile INSIDE the try: the async
+            # generator body only runs once iterated, so without this
+            # the FileReferenceExpired handler below would be dead code.
+            async with _stream_sem:
+                stream = streamer.stream_file(
+                    client, file_id, offset=offset, length=length)
+                try:
+                    first = await stream.__anext__()
+                except StopAsyncIteration:
+                    first = None
             break
         except FileReferenceExpired:
             if attempt == 1:
                 raise HTTPException(410, "file reference expired")
             log.info("file_reference expired for %d, refreshing", f.id)
             file_id = await _refresh_file_id(f)
+
+    async def gen():
+        if first is not None:
+            yield first
+        if stream is not None:
+            async with _stream_sem:
+                async for chunk in stream:
+                    yield chunk
 
     return StreamingResponse(gen(),
                              status_code=206 if partial else 200,

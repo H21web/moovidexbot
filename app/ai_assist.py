@@ -1,15 +1,16 @@
-"""v9.1 AI assistant — AI only where search truly fails.
+"""v9.3 AI assistant — AI only where search truly fails.
 
-Two AI touchpoints, nothing on the hot path:
+One AI touchpoint, nothing on the hot path:
 
 1. **No results** — :func:`assist_no_results` runs the recovery chain:
    AI title correction -> DB retry -> spell suggestions -> give up
-   honestly. This is the ONLY search-time AI besides the verdict.
+   honestly. This is the ONLY search-time AI.
 2. **Verdict** — :func:`verdict_line` writes the one-line best-pick note
    with the old deterministic technique (downloads / quality /
    language). Zero AI, zero quota — it always shows.
 
-The old "uncertain" AI judge was removed in v9.1 (speed + quota).
+The old "uncertain" AI judge was removed in v9.1 (speed + quota);
+the AI verdict was removed in v9.3 (verdict is local now).
 """
 from __future__ import annotations
 

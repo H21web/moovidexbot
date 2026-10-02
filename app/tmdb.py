@@ -100,14 +100,19 @@ async def get_movie(title: str, year: int | None = None) -> dict | None:
     key = cache_key_for(clean, year)
     factory = get_session_factory(settings.DATABASE_URL)
 
-    async with factory() as session:
-        row = await session.get(TmdbCache, key)
-        if row and row.cached_at:
-            cached_at = row.cached_at
-            if cached_at.tzinfo is None:
-                cached_at = cached_at.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - cached_at < CACHE_TTL:
-                return dict(row.payload)
+    # P2#28: cache reads must never break the bot (DB down -> skip cache)
+    try:
+        async with factory() as session:
+            row = await session.get(TmdbCache, key)
+            if row and row.cached_at:
+                cached_at = row.cached_at
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - cached_at < CACHE_TTL:
+                    # P2#27: payload is nullable -> guard the dict() call
+                    return dict(row.payload or {})
+    except Exception:
+        log.debug("tmdb cache read failed", exc_info=True)
 
     # simple in-flight guard so concurrent taps don't stampede TMDB
     now = time.time()
@@ -124,14 +129,18 @@ async def get_movie(title: str, year: int | None = None) -> dict | None:
         _inflight.pop(key, None)
 
     if payload:
-        async with factory() as session:
-            row = await session.get(TmdbCache, key)
-            if row:
-                row.payload = payload
-                row.cached_at = datetime.now(timezone.utc)
-            else:
-                session.add(TmdbCache(key=key, payload=payload))
-            await session.commit()
+        # P2#28: cache writes must never break the bot either
+        try:
+            async with factory() as session:
+                row = await session.get(TmdbCache, key)
+                if row:
+                    row.payload = payload
+                    row.cached_at = datetime.now(timezone.utc)
+                else:
+                    session.add(TmdbCache(key=key, payload=payload))
+                await session.commit()
+        except Exception:
+            log.debug("tmdb cache write failed", exc_info=True)
     return payload
 
 
@@ -145,7 +154,10 @@ async def find_by_imdb(imdb_id: str) -> dict | None:
         return None
     key = f"imdb:{imdb_id.strip()}"
     try:
-        async with get_session_factory()() as session:
+        # P1#14: get_session_factory() needs the DATABASE_URL argument —
+        # without it this raised TypeError (swallowed), so the 30-day
+        # cache never worked here.
+        async with get_session_factory(settings.DATABASE_URL)() as session:
             row = await session.get(TmdbCache, key)
             if row and datetime.now(timezone.utc) - row.cached_at < CACHE_TTL:
                 return dict(row.payload or {})
@@ -185,7 +197,8 @@ async def find_by_imdb(imdb_id: str) -> dict | None:
         log.warning("tmdb find_by_imdb failed for %s", imdb_id, exc_info=True)
         return None
     try:
-        async with get_session_factory()() as session:
+        # P1#14: same missing-argument fix as the cache read above.
+        async with get_session_factory(settings.DATABASE_URL)() as session:
             row = await session.get(TmdbCache, key)
             if row:
                 row.payload = payload
@@ -250,8 +263,13 @@ async def search_title(raw: str) -> dict | None:
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as session:
         row = await session.get(TmdbCache, key)
-        if row and row.payload:
-            return dict(row.payload)
+        # P2#29: cached rows need the same 30-day TTL check as elsewhere
+        if row and row.payload and row.cached_at:
+            cached_at = row.cached_at
+            if cached_at.tzinfo is None:
+                cached_at = cached_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - cached_at < CACHE_TTL:
+                return dict(row.payload)
 
     payload: dict | None = None
     try:

@@ -92,6 +92,9 @@ def v8_get(token: str) -> dict | None:
 # even if two instances are briefly alive at once. Sessions expire
 # after 30 minutes of inactivity.
 _index_pending: dict[int, dict] = {}
+# P2#46: the memory path must honor PENDING_TTL too — timestamps live
+# in a parallel dict so the payload dict itself stays clean.
+_index_pending_ts: dict[int, float] = {}
 
 PENDING_TTL = 1800
 
@@ -113,7 +116,11 @@ async def _pending_db_get(user_id: int):
 async def pending_get(user_id: int) -> dict | None:
     data = _index_pending.get(user_id)
     if data is not None:
-        return data
+        # P2#46: enforce the documented 30-min TTL on the memory path too.
+        if time.time() - _index_pending_ts.get(user_id, 0.0) < PENDING_TTL:
+            return data
+        await pending_clear(user_id)
+        return None
     try:
         from datetime import datetime, timezone
 
@@ -130,6 +137,7 @@ async def pending_get(user_id: int) -> dict | None:
                 return None
         data = dict(row.data or {})
         _index_pending[user_id] = data
+        _index_pending_ts[user_id] = time.time()
         return data
     except Exception as exc:
         log.debug("pending_get failed: %s", exc)
@@ -138,6 +146,7 @@ async def pending_get(user_id: int) -> dict | None:
 
 async def pending_set(user_id: int, data: dict) -> None:
     _index_pending[user_id] = data
+    _index_pending_ts[user_id] = time.time()
     try:
         from app.config import settings
         from app.db import get_session_factory
@@ -161,6 +170,7 @@ async def pending_set(user_id: int, data: dict) -> None:
 
 async def pending_clear(user_id: int) -> None:
     _index_pending.pop(user_id, None)
+    _index_pending_ts.pop(user_id, None)
     try:
         from app.config import settings
         from app.db import get_session_factory
@@ -179,7 +189,60 @@ async def pending_clear(user_id: int) -> None:
 # --- pending deep-link deliveries: user id -> file db id ---
 # Set when /start dl_<id> hits the force-sub wall; consumed by
 # fsub_retry after the user joins. Short-lived; memory-only is fine.
-pending_dl: dict[int, int] = {}
+# P3#19: bounded dict subclass — size cap + per-key TTL, plain-dict
+# interface so existing `pending_dl[uid] = …` / `.pop(uid, None)` call
+# sites keep working unchanged.
+class _TTLMap(dict):
+    def __init__(self, max_size: int = 500, ttl: float = 1800.0):
+        super().__init__()
+        self._max_size = max_size
+        self._ttl = ttl
+        self._ts: dict = {}
+
+    def _purge_expired(self) -> None:
+        now = time.time()
+        for k, ts in list(self._ts.items()):
+            if now - ts > self._ttl:
+                super().pop(k, None)
+                self._ts.pop(k, None)
+
+    def _is_expired(self, key) -> bool:
+        ts = self._ts.get(key)
+        return ts is not None and time.time() - ts > self._ttl
+
+    def __setitem__(self, key, value):
+        self._purge_expired()
+        if key not in self and self._ts and len(self) >= self._max_size:
+            oldest = min(self._ts, key=self._ts.get)
+            super().pop(oldest, None)
+            self._ts.pop(oldest, None)
+        self._ts[key] = time.time()
+        super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        if self._is_expired(key):
+            self.pop(key, None)
+            raise KeyError(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if self._is_expired(key):
+            self.pop(key, None)
+            return default
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        if self._is_expired(key):
+            self.pop(key, None)
+            return False
+        return super().__contains__(key)
+
+    def pop(self, key, *args):
+        self._ts.pop(key, None)
+        return super().pop(key, *args)
+
+
+pending_dl: dict[int, int] = _TTLMap(max_size=500, ttl=1800.0)
 
 
 # --- /index job registry (shared between engine and handlers) ---
@@ -206,10 +269,3 @@ def job_get(job_id: int) -> IndexJob | None:
 
 def job_remove(job_id: int) -> None:
     _index_jobs.pop(job_id, None)
-
-
-def job_active_for_channel(channel_id: int) -> IndexJob | None:
-    for job in _index_jobs.values():
-        if getattr(job, "channel_id", None) == channel_id and not job.task.done():
-            return job
-    return None

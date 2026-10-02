@@ -11,6 +11,7 @@ runtime defaults.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters
@@ -28,8 +29,22 @@ from app import runtime as rt
 
 log = logging.getLogger(__name__)
 
-# uid -> {"action": "fsub"|"welcome", "gid": int} while awaiting a reply
+# uid -> {"action": "fsub"|"welcome", "gid": int, "ts": float}
+# while awaiting a reply. Swept on access: 15-min TTL + size cap.
 _pending: dict[int, dict] = {}
+_PENDING_TTL = 15 * 60
+_PENDING_CAP = 200
+
+
+def _pending_sweep() -> None:
+    """Drop expired pending replies and cap the dict size."""
+    now = time.time()
+    for uid in [u for u, p in _pending.items()
+                if now - p.get("ts", 0) > _PENDING_TTL]:
+        _pending.pop(uid, None)
+    while len(_pending) > _PENDING_CAP:
+        oldest = min(_pending, key=lambda u: _pending[u].get("ts", 0))
+        _pending.pop(oldest, None)
 
 AD_CHOICES = [("Off", 0), ("5 min", 300), ("15 min", 900),
               ("30 min", 1800), ("1 hour", 3600)]
@@ -119,7 +134,7 @@ def _panel_text(g: Group) -> str:
 # ---------- /connect (in group) ----------
 
 async def _connect(client: Client, message: Message):
-    if message.chat.type not in ("group", "supergroup"):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("Run /connect inside the group.")
         return
     uid = message.from_user.id if message.from_user else None
@@ -228,8 +243,10 @@ async def _ad_set(client: Client, query):
 async def _ask_reply(client: Client, query, action: str, prompt: str):
     gid = int(query.data.split(":")[1])
     uid = query.from_user.id
+    _pending_sweep()
     _pending[uid] = {"action": action, "gid": gid,
-                     "panel_msg_id": query.message.id}
+                     "panel_msg_id": query.message.id,
+                     "ts": time.time()}
     # Turn the panel itself into the prompt — no extra message.
     await query.message.edit_text(
         prompt + "\n<i>Reply here in PM. /cancel to abort.</i>",
@@ -266,6 +283,7 @@ async def _grp_del_ok(client: Client, query):
 
 async def _pending_reply(client: Client, message: Message):
     """Catch PM replies for group-setting edits."""
+    _pending_sweep()
     uid = message.from_user.id if message.from_user else None
     pend = _pending.get(uid)
     if not pend or not message.text:

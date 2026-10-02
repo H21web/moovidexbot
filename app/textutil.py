@@ -124,6 +124,19 @@ def extract_year(text: str | None) -> int | None:
     return None
 
 
+def _x_ep_plausible(m: re.Match) -> bool:
+    """Reject NxM false positives like "24x7" (not a season/episode).
+
+    ``NxM`` reads as season/episode only when the episode part is
+    zero-padded ("1x02") or the season is a single digit ("2x7"). A
+    two-digit season with a bare one-digit episode ("24x7") is a
+    ratio/quantity, not S/E.
+    """
+    raw = m.group(0)
+    after = raw.split("x", 1)[1] if "x" in raw else raw.split("×", 1)[1]
+    return after.startswith("0") or len(m.group(1)) == 1
+
+
 def _extract_season_episode(text: str) -> tuple[str, int | None, int | None]:
     """Pull season/episode tokens out of a query.
 
@@ -136,6 +149,8 @@ def _extract_season_episode(text: str) -> tuple[str, int | None, int | None]:
     m = SE_EP_RE.search(text)
     if not m:
         m = X_EP_RE.search(text)
+        if m and not _x_ep_plausible(m):
+            m = None
     if m:
         season, episode = int(m.group(1)), int(m.group(2))
         text = text[: m.start()] + " " + text[m.end():]

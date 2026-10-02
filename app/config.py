@@ -18,8 +18,9 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = ""
     TG_API_ID: int = 0
     TG_API_HASH: str = ""
-    # NOTE: no user session needed. The bot reads channel history itself
-    # via MTProto (messages.getHistory) — it must be ADMIN in each
+    # NOTE: no user session needed. The bot walks channel history itself
+    # via MTProto (channels.GetMessages ID-walk — messages.GetHistory is
+    # [400 BOT_METHOD_INVALID] for bots). It must be ADMIN in each
     # indexed channel. This is how Tech VJ-style bots index.
 
     # --- Database ---
@@ -65,6 +66,15 @@ class Settings(BaseSettings):
             v = v.replace("postgres://", "postgresql+asyncpg://", 1)
         elif v and v.startswith("postgresql://"):
             v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
+    @field_validator("TG_API_ID", mode="before")
+    @classmethod
+    def _fix_api_id(cls, v):
+        # P3: empty env string must not blow up import with a raw
+        # pydantic ValidationError — coerce to the 0 default instead.
+        if v == "" or v is None:
+            return 0
         return v
 
     # --- helpers ---

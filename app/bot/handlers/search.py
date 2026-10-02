@@ -4,10 +4,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import secrets
+import time
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import Message
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app import ai, personalize, state
 from app import ai_assist, intent as intent_mod, search_v9
@@ -75,12 +81,39 @@ async def _send_results(client: Client, chat_id: int, token: str,
             f"<i>{len(groups)} found</i>")
     sent = await client.send_message(
         chat_id, text, reply_markup=ui.results_kb(
-            token, page, total_pages, chunk, page_start=page * per))
+            token, page, total_pages, chunk, page_start=page * per),
+        parse_mode=ParseMode.HTML)
     # In groups, auto-delete the results message after the group's timer.
     if str(chat_id).startswith("-"):
         ad = await effective_autodelete(int(chat_id))
         if ad > 0:
             await autodelete.schedule(int(chat_id), sent.id, ad)
+
+
+def _stash_ai_query(q: str) -> str:
+    """Store a query for the 🤖 AI Search button.
+
+    Consumed by ``ai.take_query`` in the ``aiq:`` callback. The 64-byte
+    callback-data limit is why the full text lives server-side keyed by
+    token (ai.py keeps the store + TTL; this is its producer).
+    """
+    token = secrets.token_hex(8)
+    ai._ai_queries[token] = (time.time(), q)
+    return token
+
+
+def _no_results_kb(ai_token: str,
+                   base: InlineKeyboardMarkup | None = None
+                   ) -> InlineKeyboardMarkup:
+    """No-results keyboard: keep ``base`` rows, add AI Search (+ Request)."""
+    rows = [list(r) for r in (base.inline_keyboard if base else [])]
+    ai_row = [InlineKeyboardButton("🤖 AI Search",
+                                   callback_data=f"aiq:{ai_token}")]
+    if settings.REQUEST_CHANNEL:
+        ai_row.append(InlineKeyboardButton("🎞 Request",
+                                           callback_data="request"))
+    rows.append(ai_row)
+    return InlineKeyboardMarkup(rows)
 
 
 async def _no_results_pm(client: Client, message: Message, q: str,
@@ -90,8 +123,9 @@ async def _no_results_pm(client: Client, message: Message, q: str,
     v9: the AI recovery chain (title correction -> retry) already ran
     inside _v9_search_flow. ``suggestions`` lets the caller pass
     pre-computed spell suggestions so they aren't looked up twice.
+    The 🤖 AI Search button (promised in /help) is always attached.
     """
-    kb = None
+    ai_token = _stash_ai_query(q)
     text = "❌ <b>No results found.</b>"
     if suggestions is None:
         # Never send raw user text to TMDB: resolve a clean title first
@@ -105,7 +139,9 @@ async def _no_results_pm(client: Client, message: Message, q: str,
                 + ("\n🎞 Use /request to ask for it!"
                    if settings.REQUEST_CHANNEL else "")
             )
-            await message.reply_text(text, reply_markup=kb)
+            await message.reply_text(
+                text, reply_markup=_no_results_kb(ai_token),
+                parse_mode=ParseMode.HTML)
             return
         try:
             factory = get_session_factory(settings.DATABASE_URL)
@@ -115,18 +151,21 @@ async def _no_results_pm(client: Client, message: Message, q: str,
             suggestions = []
     if suggestions:
         text += "\nDid you mean:"
-        kb = ui.spell_kb(suggestions)
+        kb = _no_results_kb(ai_token, ui.spell_kb(suggestions))
     else:
         text += ("\n🎞 Try /request to ask for it!"
                  if settings.REQUEST_CHANNEL
                  else "\nTry a different spelling.")
-    await message.reply_text(text, reply_markup=kb)
+        kb = _no_results_kb(ai_token)
+    await message.reply_text(text, reply_markup=kb,
+                             parse_mode=ParseMode.HTML)
 
 
 async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
     """Route a question-like PM message to Groq: live web answer first,
     entertainment chat as fallback."""
-    wait = await message.reply_text("🤖 <i>thinking…</i>")
+    wait = await message.reply_text("🤖 <i>thinking…</i>",
+                                    parse_mode=ParseMode.HTML)
     try:
         reply, status = await ai.ai_web_answer(uid, q)
         if status == "ok":
@@ -176,11 +215,16 @@ async def render_v8_results(client: Client, message: Message,
         data.get("filters") or {}, uid, data.get("ai_note"), username)
     kb = v8_ui.v8_results_kb(token, best["id"], uid, page, pages,
                              data.get("filters") or {})
+    prev_page = data.get("page", 0)
     try:
         await message.edit_text(text, reply_markup=kb,
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True)
-        data["page"] = page  # v9.3: background enrich re-renders this page
+        # Only record the page if the user didn't navigate elsewhere
+        # while the edit was in flight — a background enrich re-render
+        # must never clobber a newer pagination.
+        if data.get("page", 0) == prev_page:
+            data["page"] = page  # v9.3: background enrich re-renders this page
     except Exception:
         log.debug("v8 render edit failed", exc_info=True)
 
@@ -195,7 +239,8 @@ async def _v9_search_flow(client: Client, message: Message,
     fills in via a background edit. AI is used only for the no-results
     spell-correction chain.
     """
-    wait = await message.reply_text("\U0001F50D <i>Searching…</i>")
+    wait = await message.reply_text("\U0001F50D <i>Searching…</i>",
+                                    parse_mode=ParseMode.HTML)
     try:
         res = await search_v9.smart_search(uid, q)
     except Exception:  # noqa: BLE001
@@ -206,9 +251,10 @@ async def _v9_search_flow(client: Client, message: Message,
             pass
         return False
 
-    # v9.1: "uncertain" results render as-is — no AI judge (speed + quota).
+    # v9.3: "uncertain" results render as-is — no AI judge, no quota
+    # burn. Recovery runs only when there is truly nothing to show.
     suggestions: list[str] | None = None
-    if res.get("status") != "ok" or not res.get("best"):
+    if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
         # AI recovery chain: correct the title -> retry once.
         fix = await ai_assist.assist_no_results(uid, q)
         if fix.get("action") == "retry":
@@ -271,9 +317,11 @@ async def _fill_meta(client: Client, message: Message, token: str,
     if not data or data.get("user_id") != uid or data.get("meta"):
         return
     data["meta"] = meta
+    # Re-read the page immediately before the final edit: the user may
+    # have paginated while enrich was in flight.
+    page = data.get("page", 0)
     try:
-        await render_v8_results(client, message, token, uid,
-                                page=data.get("page", 0))
+        await render_v8_results(client, message, token, uid, page=page)
     except Exception:  # noqa: BLE001
         log.debug("v9 background enrich render failed", exc_info=True)
 
@@ -324,7 +372,8 @@ async def _on_text(client: Client, message: Message):
             return
     if pm:
         asyncio.create_task(ai.remember(uid, "user", q))
-    wait = await message.reply_text("🔍 <i>Searching…</i>")
+    wait = await message.reply_text("🔍 <i>Searching…</i>",
+                                    parse_mode=ParseMode.HTML)
     try:
         token, groups = await _do_search(client, q, uid, personal=pm)
         await wait.delete()

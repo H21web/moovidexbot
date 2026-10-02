@@ -14,6 +14,7 @@ needs without touching Telegram commands:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from datetime import datetime
 from html import escape as _esc
@@ -145,7 +146,11 @@ async def login_form(request: Request):
 
 @router.post("/login")
 async def login(request: Request, password: str = Form("")):
-    if settings.ADMIN_PASSWORD and password == settings.ADMIN_PASSWORD:
+    # Constant-time comparison (no early-exit timing leak).
+    ok = bool(settings.ADMIN_PASSWORD) and hmac.compare_digest(
+        password.encode("utf-8"),
+        settings.ADMIN_PASSWORD.encode("utf-8"))
+    if ok:
         resp = RedirectResponse("/admin/", status_code=303)
         resp.set_cookie(COOKIE, _signer().dumps("ok"), httponly=True,
                         max_age=86400 * 7, samesite="lax", path="/admin")
@@ -340,6 +345,7 @@ async def _run_broadcast(text: str, target: str) -> None:
                   total=0, target=target)
     client = bot_app.bot
     factory = get_session_factory(settings.DATABASE_URL)
+    from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked
     try:
         async with factory() as s:
             ids: list[int] = []
@@ -353,22 +359,29 @@ async def _run_broadcast(text: str, target: str) -> None:
         if not client:
             _bcast["failed"] = len(ids)
             return
-        from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked
-        for uid in ids:
-            try:
-                await client.send_message(uid, text)
-                _bcast["sent"] += 1
-            except (UserIsBlocked, PeerIdInvalid):
-                _bcast["failed"] += 1
-            except FloodWait as exc:
-                await asyncio.sleep(exc.value + 1)
+        sem = asyncio.Semaphore(6)
+
+        async def _send(uid: int) -> None:
+            async with sem:
                 try:
                     await client.send_message(uid, text)
-                    _bcast["sent"] += 1
+                except (UserIsBlocked, PeerIdInvalid):
+                    _bcast["failed"] += 1
+                    return
+                except FloodWait as exc:
+                    # one retry after the mandated wait, then give up
+                    await asyncio.sleep(exc.value + 1)
+                    try:
+                        await client.send_message(uid, text)
+                    except Exception:
+                        _bcast["failed"] += 1
+                        return
                 except Exception:
                     _bcast["failed"] += 1
-            except Exception:
-                _bcast["failed"] += 1
+                    return
+                _bcast["sent"] += 1
+
+        await asyncio.gather(*(_send(uid) for uid in ids))
     finally:
         _bcast.update(running=False, done=True)
 
@@ -537,10 +550,10 @@ async def requests_page(request: Request, status: str = "open",
             q = q.where(MovieRequest.status == status)
         rows = (await s.execute(q.limit(100))).scalars().all()
         counts = {}
-        for st, in (await s.execute(
+        for st, n in (await s.execute(
                 select(MovieRequest.status, func.count())
                 .group_by(MovieRequest.status))).all():
-            counts[st] = counts.get(st, 0)
+            counts[st] = n
 
     banner = f'<div class="okmsg">{esc(msg)}</div>' if msg else ""
     tabs = " ".join(

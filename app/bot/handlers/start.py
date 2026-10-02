@@ -5,6 +5,7 @@ import asyncio
 import logging
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 from sqlalchemy import func, select
 
@@ -91,19 +92,20 @@ async def _start(client: Client, message: Message):
             state.pending_dl[uid] = dl_id
         await message.reply_text(
             "📢 <b>Please join our channels first</b>, then tap Try Again.",
-            reply_markup=kb)
+            reply_markup=kb, parse_mode=ParseMode.HTML)
         return
     if dl_id:
         state.pending_dl.pop(uid, None)
         await _deliver_deeplink(client, message, dl_id)
         return
     text = await rt.aget_setting("WELCOME_PM") or START_TEXT
-    await message.reply_text(text, reply_markup=ui.start_kb())
+    await message.reply_text(text, reply_markup=ui.start_kb(),
+                             parse_mode=ParseMode.HTML)
 
 
 async def _help(client: Client, message: Message):
     await track_user(message)
-    await message.reply_text(HELP_TEXT)
+    await message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 async def _trending(client: Client, message: Message):
@@ -115,12 +117,13 @@ async def _trending(client: Client, message: Message):
     lines = ["📊 <b>Trending this week</b>\n"]
     for i, (q, n) in enumerate(rows, 1):
         lines.append(f"{i}. {ui.esc(q)} <i>({n})</i>")
-    await message.reply_text("\n".join(lines))
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def _help_cb(client: Client, query):
     await query.answer()
-    await query.message.edit_text(HELP_TEXT, reply_markup=ui.start_kb())
+    await query.message.edit_text(HELP_TEXT, reply_markup=ui.start_kb(),
+                                  parse_mode=ParseMode.HTML)
 
 
 async def _trending_cb(client: Client, query):
@@ -133,7 +136,8 @@ async def _trending_cb(client: Client, query):
     for i, (q, n) in enumerate(rows, 1):
         lines.append(f"{i}. {ui.esc(q)} <i>({n})</i>")
     await query.message.edit_text("\n".join(lines),
-                                  reply_markup=ui.start_kb())
+                                  reply_markup=ui.start_kb(),
+                                  parse_mode=ParseMode.HTML)
 
 
 async def _file_count(client: Client, query):

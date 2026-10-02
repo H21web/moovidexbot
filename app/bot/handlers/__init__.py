@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pyrogram import Client
 
-from app.bot.handlers import admin, callbacks, groups, index, requests, search, start
+from app.bot.handlers import admin, callbacks, groups, index, inline, requests, saved, search, start
 
 
 def register_all(bot: Client) -> None:
@@ -14,3 +14,5 @@ def register_all(bot: Client) -> None:
     admin.register(bot)
     index.register(bot)
     requests.register(bot)
+    saved.register(bot)   # v10: watchlist + /saved + /mystats
+    inline.register(bot)  # v10: inline mode

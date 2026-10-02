@@ -17,7 +17,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from app.config import settings
 from app.db import get_session_factory
@@ -53,34 +53,6 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-# ------------------------------------------------------------------ intent
-
-_QUESTION_START = re.compile(
-    r"^(who|what|when|where|why|how|which|whose|whom)\b", re.IGNORECASE)
-
-# Manglish/Malayalam question markers: "Nivin paulyude puthiya cinema undo",
-# "entha nalla padam", "evide kittum" etc. must route to chat, not raw search.
-_ML_QUESTION_START = re.compile(
-    r"^(entha|enth|aaru|aar|evide|engane|eppol|ethra|enthina|enthin|aano|undo|alle)\b",
-    re.IGNORECASE)
-_ML_QUESTION_END = re.compile(
-    r"\b(undo|aano|ano|alle|llo)\??\s*$", re.IGNORECASE)
-
-
-def detect_intent(text: str) -> str:
-    """'chat' for question-like messages, else 'search'. No AI call."""
-    t = (text or "").strip()
-    if not t:
-        return "search"
-    if "?" in t:
-        return "chat"
-    if _QUESTION_START.match(t):
-        return "chat"
-    if _ML_QUESTION_START.match(t) or _ML_QUESTION_END.search(t):
-        return "chat"
-    return "search"
-
-
 # ------------------------------------------------------------------ cache
 
 # Short-lived server-side store for AI-button queries: callback data is
@@ -89,17 +61,8 @@ _ai_queries: dict[str, tuple[float, str]] = {}
 _AIQ_TTL = 900
 
 
-def store_query(text: str) -> str:
-    import time as _time
-    import uuid as _uuid
-    now = _time.time()
-    stale = [k for k, (ts, _) in _ai_queries.items() if now - ts > _AIQ_TTL]
-    for k in stale:
-        _ai_queries.pop(k, None)
-    token = _uuid.uuid4().hex[:12]
-    _ai_queries[token] = (now, (text or "")[:300])
-    return token
-
+# P3: store_query was dead (no producers); take_query stays — it is used
+# by the AI-search button flow in app/bot/handlers/callbacks.py.
 
 def take_query(token: str) -> str | None:
     import time as _time
@@ -164,19 +127,28 @@ async def quota_remaining(user_id: int) -> int:
         return 0
 
 
-async def quota_use(user_id: int) -> None:
+async def quota_use(user_id: int) -> bool:
+    """Charge one AI quota unit. Atomic single-statement increment.
+
+    Returns True when the charge was recorded, False on DB failure.
+    """
     try:
         factory = get_session_factory(settings.DATABASE_URL)
         async with factory() as session:
             today = date.today()
-            row = await session.get(AiQuota, (user_id, today))
-            if row is None:
+            # P1#11: single UPDATE — no check-then-act TOCTOU race.
+            res = await session.execute(
+                update(AiQuota)
+                .where(AiQuota.user_id == user_id, AiQuota.day == today)
+                .values(count=AiQuota.count + 1)
+            )
+            if res.rowcount == 0:
                 session.add(AiQuota(user_id=user_id, day=today, count=1))
-            else:
-                row.count = (row.count or 0) + 1
             await session.commit()
+            return True
     except Exception as exc:  # noqa: BLE001
         log.debug("quota use failed: %s", exc)
+        return False
 
 
 # ------------------------------------------------------------------ groq
@@ -415,11 +387,12 @@ async def ai_search(user_id: int, raw_query: str
         return None, [], "no_quota"
 
     filt = await parse_filters(raw_query)
+    # P1#10: the parse is itself a Groq call — charge 1 unit for it.
+    await quota_use(user_id)
     groups = await _db_search(raw_query, filt, user_id)
     if not groups:
         return None, [], "no_results"
 
-    await quota_use(user_id)
     prefs = await personalize.get_prefs(user_id)
     quality = (prefs.get("counters") or {}).get("quality") or {}
     top_q = max(quality, key=lambda k: quality[k]) if quality else None
@@ -437,7 +410,10 @@ async def ai_search(user_id: int, raw_query: str
         + f"REAL results JSON: {json.dumps(results_json, ensure_ascii=False)}"
     )
     intro = await groq_complete(FORMAT_SYSTEM, user_line, max_tokens=300)
-    if not intro:
+    if intro:
+        # P2#48: charge for the format call only when it produced a reply.
+        await quota_use(user_id)
+    else:
         intro = "🤖 <b>AI results</b> — ethokke kitti:"
     await cache_put("search", raw_query, intro)
     return intro, groups, "ok"

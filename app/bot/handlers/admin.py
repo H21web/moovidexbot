@@ -59,7 +59,8 @@ async def _users(client: Client, message: Message):
              "<b>Recent:</b>"]
     for u in recent:
         name = (u.first_name or "")[:20]
-        lines.append(f"• {name} (@{u.username or '—'}) <code>{u.id}</code>")
+        lines.append(f"• {ui.esc(name)} (@{ui.esc(u.username) or '—'}) "
+                     f"<code>{u.id}</code>")
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -73,10 +74,12 @@ async def _ban(client: Client, message: Message):
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
         u = (await s.execute(select(User).where(User.id == uid))).scalar_one_or_none()
-        if u:
-            u.is_banned = True
-        else:
-            s.add(User(id=uid, is_banned=True))
+        if not u:
+            # Never seen this user — don't invent a row for them.
+            await message.reply_text(
+                f"⚠️ User <code>{uid}</code> not in database — nothing to ban.")
+            return
+        u.is_banned = True
         await s.commit()
     await message.reply_text(f"🚫 Banned <code>{uid}</code>.")
 
@@ -157,7 +160,11 @@ async def _warn(client: Client, message: Message):
         return
     uid = int(parts[1])
     reason = " ".join(parts[2:]) or "no reason given"
-    limit = int(await rt.aget_setting("WARN_LIMIT") or 3)
+    try:
+        limit = int(await rt.aget_setting("WARN_LIMIT") or 3)
+    except (TypeError, ValueError):
+        log.warning("bad WARN_LIMIT setting — defaulting to 3")
+        limit = 3
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
         u = (await s.execute(select(User).where(User.id == uid))).scalar_one_or_none()
@@ -172,7 +179,8 @@ async def _warn(client: Client, message: Message):
         await s.commit()
     try:
         await client.send_message(
-            uid, f"⚠️ <b>Warning {warns}/{limit}</b>\nReason: {reason}\n"
+            uid, f"⚠️ <b>Warning {warns}/{limit}</b>\n"
+            f"Reason: {ui.esc(reason)}\n"
             + ("🚫 You have been <b>banned</b>." if auto else
                "Further violations may lead to a ban."),
             parse_mode=ParseMode.HTML)
@@ -272,8 +280,9 @@ async def _dbcheck(client: Client, message: Message):
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-@admin_only
 async def _settings(client: Client, message: Message):
+    # No @admin_only here on purpose: the function itself routes —
+    # admins get the dashboard link, regular users get personal settings.
     uid = message.from_user.id if message.from_user else None
     if not settings.is_admin(uid):
         # v6: regular users get their personal AI/taste settings.

@@ -41,7 +41,6 @@ from app.textutil import (
 log = logging.getLogger(__name__)
 
 EDIT_EVERY_SEC = 3.0
-CHECKPOINT_EVERY = 2000
 
 
 def _media_of(msg):
@@ -133,8 +132,15 @@ def format_progress(scanned: int, indexed: int, skipped: int, errors: int,
                     pos: int = 0, total: int = 0) -> str:
     rate = scanned / elapsed if elapsed > 0 else 0.0
     mins, secs = divmod(int(elapsed), 60)
-    pct_bar = "▰" * 10 if done else "▰" * min(10, int(rate / 10))
-    bar = (pct_bar + "▱" * (10 - len(pct_bar))) if not done else "▰" * 10
+    # P3: bar tracks pos/total fraction, not a rate heuristic.
+    if done:
+        bar = "▰" * 10
+    elif total:
+        filled = min(10, int(10 * pos / total))
+        bar = "▰" * filled + "▱" * (10 - filled)
+    else:
+        filled = min(10, int(rate / 10))
+        bar = "▰" * filled + "▱" * (10 - filled)
     head = "✅ Indexing complete" if done else "📥 Indexing"
     where = (f"📍 Message <b>{pos:,}</b> / {total:,}\n"
              if total and not done else "")
@@ -172,7 +178,9 @@ def normalize_channel_ref(text: str) -> str | int:
         num = int(s)
         if num > 0:
             digits = str(num)
-            if digits.startswith("100"):
+            # P2#33: only strip the "100" prefix when the remainder is a
+            # full channel id (>= 10 digits) — "10055" is not -10055.
+            if digits.startswith("100") and len(digits) - 3 >= 10:
                 digits = digits[3:]
             num = -int("100" + digits)
         return num
@@ -308,6 +316,15 @@ async def run_index_job(job: state.IndexJob, client: Client,
             scanned, indexed = row.total_scanned, row.total_indexed
             skipped, errors = row.total_skipped, row.total_errors
 
+        # P1#17: skip is run-local — on resume (offset_id > 0) it was
+        # already consumed on the first pass. Re-applying it would
+        # silently drop `skip` messages forever.
+        if offset_id:
+            if skip:
+                log.info("index job %d: resume at %d, ignoring skip=%d "
+                         "(already consumed)", job_id, offset_id, skip)
+            skip = 0
+
         # End bound: bootstrapped from the forwarded message / post link
         # (bots can't list history, so the admin supplies the latest id).
         end_id = to_id or last_msg_id
@@ -349,18 +366,50 @@ async def run_index_job(job: state.IndexJob, client: Client,
             except FloodWait as exc:
                 log.info("index job %d: floodwait %ss on get_messages",
                          job_id, exc.value)
+                # P3: long sleeps post a progress update first.
+                if on_progress:
+                    try:
+                        await on_progress(
+                            f"⏳ FloodWait — retrying in {exc.value + 1}s…")
+                    except Exception:
+                        pass
                 await asyncio.sleep(exc.value + 1)
                 continue
             except Exception as exc:
-                log.warning("get_messages failed for %d ids: %s",
-                            len(ids), exc)
-                errors += len(ids)
-                scanned += len(ids)
-                cur = ids[-1] + 1
-                offset_id = ids[-1]
-                await _checkpoint(job_id, scanned, indexed, skipped,
-                                  errors, offset_id)
-                continue
+                # P1#18: retry the failed batch before giving up on it —
+                # a transient error must not discard 200 ids silently.
+                log.warning("index job %d: get_messages failed (%d ids), "
+                            "retrying: %s", job_id, len(ids), exc)
+                msgs = None
+                for attempt in range(1, 4):
+                    try:
+                        msgs = await client.get_messages(channel_id, ids)
+                        break
+                    except FloodWait as fw:
+                        log.info("index job %d: floodwait %ss (retry %d/3)",
+                                 job_id, fw.value, attempt)
+                        if on_progress:
+                            try:
+                                await on_progress(
+                                    "⏳ FloodWait — retrying in "
+                                    f"{fw.value + 1}s…")
+                            except Exception:
+                                pass
+                        await asyncio.sleep(fw.value + 1)
+                    except Exception as exc2:
+                        log.warning("index job %d: get_messages retry %d/3 "
+                                    "failed: %s", job_id, attempt, exc2)
+                        await asyncio.sleep(2 ** attempt)
+                if msgs is None:
+                    log.warning("index job %d: skipping batch of %d ids "
+                                "after 3 retries", job_id, len(ids))
+                    errors += len(ids)
+                    scanned += len(ids)
+                    cur = ids[-1] + 1
+                    offset_id = ids[-1]
+                    await _checkpoint(job_id, scanned, indexed, skipped,
+                                      errors, offset_id)
+                    continue
             if not isinstance(msgs, list):
                 msgs = [msgs]
             for msg in msgs:

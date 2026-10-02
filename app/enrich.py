@@ -29,7 +29,24 @@ log = logging.getLogger(__name__)
 
 _IMDB_RE = re.compile(r"imdb\.com/title/(tt\d{7,8})", re.IGNORECASE)
 _TTL = 60 * 60 * 6  # 6h in-process cache
-_cache: dict[str, tuple[float, dict | None]] = {}
+# P1#15: key includes the year — ("kgf", 2018) and ("kgf", 2022) are
+# different lookups.
+_cache: dict[tuple[str, int | None], tuple[float, dict | None]] = {}
+
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """P2#32: one shared client (tmdb._get_client pattern) — no fresh
+    client per websearch call."""
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            limits=httpx.Limits(max_connections=20,
+                                max_keepalive_connections=10),
+        )
+    return _client
 
 # --- AI prompts -----------------------------------------------------------
 GROQ_IDENTIFY_SYSTEM = (
@@ -49,12 +66,10 @@ async def _websearch_raw(query: str, num: int = 6) -> list[dict] | None:
     if not base:
         return None
     try:
-        async with httpx.AsyncClient(
-                timeout=httpx.Timeout(15.0, connect=5.0)) as c:
-            r = await c.get(f"{base}/search",
-                            params={"q": query[:200], "num": num})
-            r.raise_for_status()
-            return (r.json() or {}).get("results") or []
+        r = await _get_client().get(f"{base}/search",
+                                    params={"q": query[:200], "num": num})
+        r.raise_for_status()
+        return (r.json() or {}).get("results") or []
     except Exception as exc:  # noqa: BLE001
         log.warning("enrich websearch failed: %s", exc)
         return None
@@ -138,7 +153,8 @@ async def enrich_title(keywords: str, year: int | None = None,
     keywords = (keywords or "").strip()
     if not keywords:
         return None
-    hit = _cache.get(keywords.lower())
+    cache_key = (keywords.lower(), year)
+    hit = _cache.get(cache_key)
     if hit and time.time() - hit[0] < _TTL:
         return hit[1]
 
@@ -160,11 +176,17 @@ async def enrich_title(keywords: str, year: int | None = None,
             meta["source"] = "tmdb_search"
 
     # 3. v9.2 AI fallback: title/year only, no search-API response.
+    # P1#16: a None from the quota-gated AI path is never cached — a
+    # later user WITH quota must still get a real answer.
+    ai_path = False
     if meta is None and ai_on and user_id is not None:
+        ai_path = True
         meta = await _groq_identify(keywords, year, user_id)
 
-    _cache[keywords.lower()] = (time.time(), meta)
-    # keep the cache small
+    if meta is not None or not ai_path:
+        _cache[cache_key] = (time.time(), meta)
+    # P3#17: evict the oldest ~100 instead of nuking the whole cache.
     if len(_cache) > 500:
-        _cache.clear()
+        for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
+            _cache.pop(k, None)
     return meta

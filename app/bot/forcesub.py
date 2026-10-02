@@ -52,7 +52,10 @@ async def missing_channels(client, user_id: int,
         except UserNotParticipant:
             missing.append(ref)
         except Exception as exc:
-            log.debug("forcesub check failed for %s: %s", ref, exc)
+            # Fail closed: an unexpected error must not be treated as
+            # "joined" — the user re-checks after joining.
+            log.warning("forcesub check failed for %s: %s", ref, exc)
+            missing.append(ref)
     return missing
 
 

@@ -1,24 +1,26 @@
-"""v9 search module — the best search this bot has.
+"""v9 search module — fast, accurate, AI-free on the hot path.
 
 Pipeline:
 
-1. **Parse** — local keyword-first parse (``textutil.parse_query``) is the
-   priority: year/language/quality/season/episode come out of the query
-   itself. Only *messy* queries (Manglish noise, "?", 6+ words, no clear
-   title) spend 1 AI quota unit on a structured Groq parse.
-2. **Multi-sweep** — the DB is swept with several query variants (raw,
-   cleaned title, title-only, title+year) and hits merge by best score
-   per file id. One query variant missing never sinks the search.
+1. **Parse** — local keyword-first parse (``textutil.parse_query``):
+   year/language/quality/season/episode come out of the query itself.
+   No AI parse on the search path (speed + quota).
+2. **Multi-sweep (parallel)** — the DB is swept with several query
+   variants (raw, cleaned title, title-only, title+year, language
+   word stripped) via ``asyncio.gather``; hits merge by best score per
+   file id. One query variant missing never sinks the search.
 3. **Fuzzy retry** — when hits are few, a second pass runs with the
-   trigram threshold lowered (0.25 -> 0.15) and the language filter
-   dropped, so typos and mistagged files still surface.
+   trigram threshold lowered (0.15) and no filters, so typos and
+   mistagged files still surface.
 4. **Rerank** — personal taste, then score -> quality -> size; the
    most-downloaded file wins best pick when any downloads exist.
-5. **Confidence** — the best hit's relevance score decides: ``ok``,
-   ``uncertain`` (weak matches — AI steps in), or ``no_results``.
+5. **Confidence** — the best hit's relevance score decides ``ok`` or
+   ``uncertain`` (both render; ``uncertain`` just means weak matches).
 
-Works fully with AI off. AI only *assists* (parse messy queries, judge
-uncertain candidates, suggest corrections) — search never depends on it.
+AI appears only in the no-results recovery chain
+(:mod:`app.ai_assist`) — never on a successful search. The results
+render instantly; enrichment (poster/info) fills in afterwards via a
+background message edit owned by the search handler.
 """
 from __future__ import annotations
 
@@ -43,26 +45,11 @@ MIN_HITS = 8            # below this, the fuzzy retry kicks in
 FUZZY_THRESHOLD = 0.15  # lowered trigram bar for the retry pass
 UNCERTAIN_SCORE = 1.0   # best hit below this -> "uncertain"
 
-_MESSY_RE = re.compile(
-    r"(undo|aano|alle|aakumo|aakum|entha|enth|evide|eppol|aara|aar\?|"
-    r"please|pls|vendum|venam|tharoo|tharu)",
-    re.IGNORECASE)
-
 _FUZZY_FIELDS = (
     "id", "file_id", "file_name", "file_size", "mime_type", "caption",
     "channel_id", "message_id", "quality", "language", "title_key",
     "downloads",
 )
-
-
-def _is_messy(raw: str, title: str) -> bool:
-    if "?" in raw:
-        return True
-    if len(raw.split()) > 5:
-        return True
-    if _MESSY_RE.search(raw):
-        return True
-    return len(title) < 2
 
 
 async def _ai_parse_if_needed(user_id: int | None, raw: str,

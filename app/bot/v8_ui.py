@@ -107,6 +107,9 @@ def v8_file_kb(file_db_id: int, user_id: int):
         # No WEB_URL configured — fall back to in-Telegram delivery.
         rows.append([InlineKeyboardButton("⬇ Download",
                                          callback_data=f"dl:{file_db_id}")])
+    # v10: watchlist — save for later.
+    rows.append([InlineKeyboardButton("⭐ Save",
+                                     callback_data=f"save:{file_db_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -202,9 +205,12 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
         for i, f in enumerate(files, start=start + 1):
             parts.append(_v8_file_line(i, f, user_id, bot_username))
     text = "\n".join(parts)
-    # Telegram hard limit: 4096 chars.
+    # Telegram hard limit: 4096 chars. Never cut mid-HTML-tag (Telegram
+    # rejects the edit) — cut back to the last complete ">" before the
+    # limit instead.
     if len(text) > 4000:
-        text = text[:3990] + "…"
+        cut = text.rfind(">", 0, 3990)
+        text = (text[:cut + 1] if cut != -1 else text[:3990]) + "…"
     return text
 
 

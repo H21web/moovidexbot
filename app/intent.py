@@ -19,7 +19,10 @@ _ML_QUESTION_START = re.compile(
     re.IGNORECASE)
 _ML_QUESTION_END = re.compile(
     r"(aano|alle|undo\?*|aakumo|aakum)\s*\??$", re.IGNORECASE)
-_GREET_RE = re.compile(r"^(hi+|hello|hey|hai|thanks|thank you|nanni|bye)\b",
+# Whole message must be just the greeting (+ optional punctuation):
+# "hi kgf" is a search, not a greeting.
+_GREET_RE = re.compile(r"^(hi+|hello|hey|hai|thanks|thank you|nanni|bye)"
+                       r"[\s!.,?]*$",
                        re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\b(request|add cheyy\w*|upload|please.*(add|upload))\b",
                          re.IGNORECASE)

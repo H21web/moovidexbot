@@ -50,6 +50,11 @@ from app.models import BackfillJob, File
 
 log = logging.getLogger(__name__)
 
+# P2#35: consecutive live auto-index failures per channel. A DB outage
+# must not silently drop posts — every 10th consecutive failure logs
+# loudly; the counter resets on the next success.
+_auto_index_failures: dict[int, int] = {}
+
 USAGE = (
     "📥 <b>/index usage</b>\n\n"
     "<code>/index</code> — interactive setup (buttons)\n"
@@ -146,10 +151,16 @@ async def _start_job(client: Client, progress_msg: Message,
         await session.commit()
         job_id = db_job.id
 
-    await progress_msg.edit_text(
-        f"📥 <i>Starting index of {channel_ref}…</i>\n"
-        f"<i>Bot must be admin in the channel.</i>",
-        reply_markup=ui.index_stop_kb(job_id))
+    # Guarded: a failed edit must not leave the DB job row "pending"
+    # forever with the job itself never started.
+    try:
+        await progress_msg.edit_text(
+            f"📥 <i>Starting index of {channel_ref}…</i>\n"
+            f"<i>Bot must be admin in the channel.</i>",
+            reply_markup=ui.index_stop_kb(job_id),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        log.debug("index start progress edit failed", exc_info=True)
 
     async def on_progress(text: str):
         try:
@@ -182,6 +193,26 @@ def _already_indexing(channel_ref: str) -> bool:
     return False
 
 
+async def _cancel_jobs(uid: int) -> int:
+    """Stop the user's active index jobs. Returns jobs stopped."""
+    await state.pending_clear(uid)
+    stopped = 0
+    for job_id, job in list(state._index_jobs.items()):
+        if job.task and not job.task.done():
+            job.cancel_event.set()
+            stopped += 1
+    return stopped
+
+
+@admin_only
+async def _cancel(client: Client, message: Message):
+    """Plain /cancel: stop the user's active index job(s)."""
+    stopped = await _cancel_jobs(message.from_user.id)
+    await message.reply_text(
+        f"🛑 Stopped {stopped} job(s)." if stopped else
+        "No running jobs. (Tip: /index cancel stops an index job.)")
+
+
 @admin_only
 async def _index(client: Client, message: Message):
     uid = message.from_user.id
@@ -189,12 +220,7 @@ async def _index(client: Client, message: Message):
 
     # --- /index cancel ---
     if text.lower() in ("/index cancel", "/cancel"):
-        await state.pending_clear(uid)
-        stopped = 0
-        for job_id, job in list(state._index_jobs.items()):
-            if job.task and not job.task.done():
-                job.cancel_event.set()
-                stopped += 1
+        stopped = await _cancel_jobs(uid)
         await message.reply_text(
             f"🛑 Stopped {stopped} job(s)." if stopped else "No running jobs.")
         return
@@ -404,9 +430,11 @@ async def _ixs(client: Client, query: CallbackQuery):
         # Reuse the panel message for progress — one message, edited.
         prog = query.message
         try:
-            await prog.edit_text("📥 <i>Starting…</i>")
+            await prog.edit_text("📥 <i>Starting…</i>",
+                                 parse_mode=ParseMode.HTML)
         except Exception:
-            prog = await query.message.reply_text("📥 <i>Starting…</i>")
+            prog = await query.message.reply_text(
+                "📥 <i>Starting…</i>", parse_mode=ParseMode.HTML)
         await _start_job(client, prog, str(chat_id),
                          skip=opts["skip"], from_id=opts["from_id"],
                          to_id=opts["to_id"], limit=opts["limit"],
@@ -435,8 +463,9 @@ async def _ixs(client: Client, query: CallbackQuery):
 
 async def _auto_index(client: Client, message: Message):
     """Index new channel posts live (bot receives these as admin)."""
+    chat_id = message.chat.id
     try:
-        rec = extract_record(message, message.chat.id)
+        rec = extract_record(message, chat_id)
         if not rec:
             return
         factory = get_session_factory(settings.DATABASE_URL)
@@ -445,12 +474,22 @@ async def _auto_index(client: Client, message: Message):
             await session.execute(stmt)
             await session.commit()
     except Exception as exc:
-        log.debug("auto-index failed: %s", exc)
+        # P2#35: a DB outage must not silently drop live posts — count
+        # consecutive failures per channel and escalate loudly.
+        n = _auto_index_failures.get(chat_id, 0) + 1
+        _auto_index_failures[chat_id] = n
+        log.warning("auto-index failed for channel %s: %s", chat_id, exc)
+        if n % 10 == 0:
+            log.error("auto-index: %d consecutive failures on channel %s "
+                      "— live posts are being dropped!", n, chat_id)
+        return
+    _auto_index_failures.pop(chat_id, None)
 
 
 def register(bot: Client) -> None:
     # interactive setup interceptor runs first; consumes only setup msgs
     bot.on_message(filters.private, group=-1)(_index_interactive)
     bot.on_message(filters.private & filters.command("index"))(_index)
+    bot.on_message(filters.private & filters.command("cancel"))(_cancel)
     bot.on_callback_query(filters.regex(r"^ixs:"))(_ixs)
     bot.on_message(filters.channel)(_auto_index)

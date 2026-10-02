@@ -26,6 +26,34 @@ from app.web.tokens import watch_url
 log = logging.getLogger(__name__)
 
 
+async def _safe_edit(message, text: str, reply_markup=None,
+                     parse_mode: ParseMode | None = ParseMode.HTML) -> bool:
+    """Edit a results/card message whether it is text or a photo.
+
+    Falls back to ``edit_caption`` when the message is a photo card,
+    and to a fresh reply when editing is impossible. Returns True when
+    the original message was updated in place.
+    """
+    try:
+        await message.edit_text(text, reply_markup=reply_markup,
+                                parse_mode=parse_mode)
+        return True
+    except Exception:
+        pass
+    try:
+        await message.edit_caption(caption=text, reply_markup=reply_markup,
+                                   parse_mode=parse_mode)
+        return True
+    except Exception:
+        pass
+    try:
+        await message.reply_text(text, reply_markup=reply_markup,
+                                 parse_mode=parse_mode)
+    except Exception:
+        log.debug("safe_edit failed completely", exc_info=True)
+    return False
+
+
 def _page_data(token: str, page: int):
     data = state.results_get(token)
     if not data:
@@ -39,8 +67,15 @@ def _page_data(token: str, page: int):
 
 
 async def _pg(client: Client, query):
-    token, page = query.data.split(":")[1:]
-    page = int(page)
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    try:
+        token, page_s = query.data.split(":")[1:]
+        page = int(page_s)
+    except (ValueError, IndexError):
+        return
     data, chunk, meta = _page_data(token, page)
     if not data:
         await query.answer("⌛ Expired — search again.", show_alert=True)
@@ -55,8 +90,15 @@ async def _pg(client: Client, query):
 
 
 async def _movie(client: Client, query):
-    _, token, gidx = query.data.split(":")
-    gidx = int(gidx)
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    try:
+        _, token, gidx_s = query.data.split(":")
+        gidx = int(gidx_s)
+    except (ValueError, IndexError):
+        return
     data = state.results_get(token)
     if not data or gidx >= len(data["groups"]):
         await query.answer("⌛ Expired — search again.", show_alert=True)
@@ -85,20 +127,39 @@ async def _movie(client: Client, query):
     kb = ui.movie_kb(token, gidx, group, page, qorder=qorder)
     try:
         if poster:
-            await query.message.edit_text("🎬 <i>Loading…</i>")
-            await query.message.reply_photo(
-                poster, caption=text, reply_markup=kb)
+            await query.message.edit_text("🎬 <i>Loading…</i>",
+                                          parse_mode=ParseMode.HTML)
+            sent = await query.message.reply_photo(
+                poster, caption=text, reply_markup=kb,
+                parse_mode=ParseMode.HTML)
             await query.message.delete()
+            # The old results message had autodelete in groups — the new
+            # photo must not outlive it.
+            ad = await effective_autodelete(query.message.chat.id)
+            if ad > 0:
+                await autodelete.schedule(query.message.chat.id,
+                                          sent.id, ad)
         else:
-            await query.message.edit_text(text, reply_markup=kb)
+            await query.message.edit_text(text, reply_markup=kb,
+                                          parse_mode=ParseMode.HTML)
     except Exception as exc:
         log.debug("movie card edit failed: %s", exc)
+        # Don't leave the message stuck on "Loading…" — show the text card.
+        await _safe_edit(query.message, text, reply_markup=kb)
 
 
 async def _back(client: Client, query):
-    _, token, page = query.data.split(":")
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    try:
+        _, token, page_s = query.data.split(":")
+        page = int(page_s)
+    except (ValueError, IndexError):
+        return
     await query.answer()
-    data, chunk, meta = _page_data(token, int(page))
+    data, chunk, meta = _page_data(token, page)
     if not data:
         await query.message.edit_text("⌛ Expired — search again.")
         return
@@ -106,9 +167,10 @@ async def _back(client: Client, query):
     # Go back by editing the same message (it may currently be a card).
     text = (f"🔍 <b>Results for</b> {ui.esc(data['query'])}\n"
             f"<i>{len(data['groups'])} found</i>")
-    await query.message.edit_text(
-        text, reply_markup=ui.results_kb(token, page, total_pages, chunk,
-                                         page_start=start))
+    await _safe_edit(
+        query.message, text,
+        reply_markup=ui.results_kb(token, page, total_pages, chunk,
+                                   page_start=start))
 
 
 async def _send_file(client: Client, target_id: int, f, uid: int):
@@ -164,9 +226,10 @@ async def _deliver(client: Client, query):
     kb = await forcesub.ensure_joined(client, uid, chat_id=src.id)
     if kb:
         # Reuse the card message: swap its content for the join prompt.
-        await query.message.edit_text(
-            "📢 <b>Join our channels to download</b>", reply_markup=kb,
-            parse_mode=ParseMode.HTML)
+        await _safe_edit(
+            query.message,
+            "📢 <b>Join our channels to download</b>",
+            reply_markup=kb)
         return
     try:
         file_db_id = int(query.data.split(":")[1])
@@ -180,32 +243,44 @@ async def _deliver(client: Client, query):
     # Group searches deliver to the user's PM only — never in the group.
     target = uid if in_group else src.id
     if not in_group:
-        await query.message.edit_text("📤 <i>Uploading…</i>",
-                                      parse_mode=ParseMode.HTML)
+        await _safe_edit(query.message, "📤 <i>Uploading…</i>")
     try:
         await _send_file(client, target, f, uid)
     except PeerIdInvalid:
         # User never started the bot in PM — one-tap deep link that
         # delivers this exact file once they tap START.
         me = await client.get_me()
-        deep = f"https://t.me/{me.username}?start=dl_{f.id}"
-        await query.message.edit_text(
-            "👋 <b>Almost there!</b>\n\n"
-            "Tap below to open my private chat — "
-            "your file will be sent there:",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("▶️ Open bot & get file",
-                                     url=deep)]]),
-            parse_mode=ParseMode.HTML)
+        username = me.username
+        if username:
+            deep = f"https://t.me/{username}?start=dl_{f.id}"
+            await _safe_edit(
+                query.message,
+                "👋 <b>Almost there!</b>\n\n"
+                "Tap below to open my private chat — "
+                "your file will be sent there:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("▶️ Open bot & get file",
+                                         url=deep)]]))
+        else:
+            # No username: a t.me link would point nowhere — tell the
+            # user to open the PM manually instead.
+            await _safe_edit(
+                query.message,
+                "👋 <b>Almost there!</b>\n\n"
+                "Please open my PM manually and tap START — "
+                "then search again and I'll send your file there.")
         return
     except FloodWait as exc:
-        await query.message.edit_text(
-            f"⏳ Flood control — retry in {exc.value}s.")
+        await _safe_edit(
+            query.message,
+            f"⏳ Flood control — retry in {exc.value}s.",
+            parse_mode=None)
         return
     except Exception as exc:
         log.warning("deliver failed for file %d: %s", f.id, exc)
-        await query.message.edit_text(
-            "❌ Couldn't send the file. Try again later.")
+        await _safe_edit(query.message,
+                         "❌ Couldn't send the file. Try again later.",
+                         parse_mode=None)
         return
     if in_group:
         await query.answer("📥 File sent to your private chat ✅")
@@ -217,6 +292,10 @@ async def _deliver(client: Client, query):
 
 
 async def _spell(client: Client, query):
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
     suggestion = query.data.split(":", 1)[1]
     await query.answer()
     # Re-run search with the suggestion, reusing the same message.
@@ -266,6 +345,14 @@ async def _fsub_retry(client: Client, query):
                                  "Try again later.")
                     except Exception:
                         pass
+        else:
+            # The join prompt is gone and this callback carries no
+            # results token — point the user back to search.
+            try:
+                await client.send_message(
+                    uid, "✅ All joined! Search again to get your results 🔍")
+            except Exception:
+                pass
 
 
 async def _ixstop(client: Client, query):
@@ -327,7 +414,9 @@ async def _aiq(client: Client, query):
     if prefs["enabled"] and prefs["downloads"] >= personalize.MIN_DOWNLOADS:
         qorder = personalize.quality_order(prefs)
     card = ui.movie_card(g, meta=meta, personalized=bool(qorder))
-    text = ((intro or "🤖 <b>AI results</b>") + "\n\n" + card)[:3800]
+    # intro is raw AI text — escape it before mixing into HTML.
+    text = ((ui.esc(intro) if intro else "🤖 <b>AI results</b>")
+            + "\n\n" + card)[:3800]
     kb = ui.movie_kb(new_token, 0, g, 0, qorder=qorder,
                      more=len(groups) > 1)
     poster = (meta or {}).get("poster_url")
@@ -365,35 +454,24 @@ async def _pset(client: Client, query):
         parse_mode=ParseMode.HTML)
 
 
-def register(bot: Client) -> None:
-    bot.on_callback_query(filters.regex(r"^pg:"))(_pg)
-    bot.on_callback_query(filters.regex(r"^mv:"))(_movie)
-    bot.on_callback_query(filters.regex(r"^bk:"))(_back)
-    bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
-    bot.on_callback_query(filters.regex(r"^sp:"))(_spell)
-    bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
-    bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
-    bot.on_callback_query(filters.regex(r"^aiq:"))(_aiq)
-    bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
-    bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)
-    bot.on_callback_query(filters.regex(r"^rf:"))(_rfilter)
-
-
 async def _v8page(client: Client, query) -> None:
     """v8 results pagination: ``v8:{token}:{page}``."""
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
     try:
         _, token, page = query.data.split(":")
         page = int(page)
     except (ValueError, IndexError):
         return
     data = state.v8_get(token)
-    if not data or data.get("user_id") != query.from_user.id:
+    if not data or data.get("user_id") != uid:
         await query.answer("⌛ Results expired — search again.", show_alert=True)
         return
     await query.answer()
     from app.bot.handlers.search import render_v8_results
-    await render_v8_results(client, query.message, token,
-                            query.from_user.id, page)
+    await render_v8_results(client, query.message, token, uid, page)
 
 
 async def _rfilter(client: Client, query) -> None:
@@ -404,12 +482,15 @@ async def _rfilter(client: Client, query) -> None:
     ``rf:{token}:{kind}:x`` -> clear filter
     ``rf:{token}:back`` -> back to the results view
     """
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
     parts = (query.data or "").split(":")
     if len(parts) < 3:
         return
     token = parts[1]
     kind = parts[2]
-    uid = query.from_user.id
     data = state.v8_get(token)
     if not data or data.get("user_id") != uid:
         await query.answer("⌛ Results expired — search again.", show_alert=True)
@@ -436,15 +517,28 @@ async def _rfilter(client: Client, query) -> None:
 
     # apply / clear
     choice = parts[3]
-    filters = dict(data.get("filters") or {})
+    new_filters = dict(data.get("filters") or {})
     if choice == "x":
-        filters.pop(kind, None)
+        new_filters.pop(kind, None)
     else:
         options = (data.get("filter_opts") or {}).get(kind) or []
         try:
             value = options[int(choice)]
         except (ValueError, IndexError):
             return
-        filters[kind] = value
-    data["filters"] = filters
+        new_filters[kind] = value
+    data["filters"] = new_filters
     await render_v8_results(client, query.message, token, uid, 0)
+
+def register(bot: Client) -> None:
+    bot.on_callback_query(filters.regex(r"^pg:"))(_pg)
+    bot.on_callback_query(filters.regex(r"^mv:"))(_movie)
+    bot.on_callback_query(filters.regex(r"^bk:"))(_back)
+    bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
+    bot.on_callback_query(filters.regex(r"^sp:"))(_spell)
+    bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
+    bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
+    bot.on_callback_query(filters.regex(r"^aiq:"))(_aiq)
+    bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
+    bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)
+    bot.on_callback_query(filters.regex(r"^rf:"))(_rfilter)

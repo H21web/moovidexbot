@@ -10,10 +10,11 @@ log = logging.getLogger(__name__)
 
 _engine = None
 _factory = None
+_engine_url: str | None = None
 
 
 def get_engine(database_url: str):
-    global _engine
+    global _engine, _engine_url
     if _engine is None:
         _engine = create_async_engine(
             database_url,
@@ -22,6 +23,12 @@ def get_engine(database_url: str):
             pool_pre_ping=True,
             pool_recycle=300,
         )
+        _engine_url = database_url
+    elif database_url != _engine_url:
+        # Cached by design (single DB per process) — but a different URL
+        # here is almost certainly a config bug; say so loudly.
+        log.warning("get_engine called with a different DATABASE_URL; "
+                    "reusing the cached engine")
     return _engine
 
 

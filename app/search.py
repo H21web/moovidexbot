@@ -209,6 +209,7 @@ def _rank_items(query: str, items: list[dict], parsed: dict) -> list[dict]:
             it.get("file_name"), parsed.get("season"), parsed.get("episode")
         ):
             score += 0.7
+        it["score"] = score  # P0: persist so smart_search confidence works
         return (score, year, it.get("file_size") or 0)
 
     items.sort(key=key, reverse=True)
@@ -283,10 +284,12 @@ async def search_files(
                             seen.add(f.id)
                 items = [_item_to_dict(f, s) for f, s in hits]
                 items = _rank_items(q, items, parsed)[:RESULT_LIMIT]
+            # P1#8: cache only on success — a transient DB failure must not
+            # poison the hot cache with an empty result for 5 minutes.
+            hot_set(cache_key, items)
         except Exception as exc:  # noqa: BLE001 - search must degrade, not crash
             log.warning("search failed for %r: %s", raw_query, exc)
             items = []
-        hot_set(cache_key, items)
 
     if log_query:
         try:

@@ -37,8 +37,18 @@ async def amain() -> None:
     )
     if not settings.BOT_TOKEN or not settings.TG_API_ID or not settings.TG_API_HASH:
         raise SystemExit("BOT_TOKEN / TG_API_ID / TG_API_HASH are required")
+    if not settings.WEB_SECRET or settings.WEB_SECRET == "change-me":
+        raise SystemExit(
+            "WEB_SECRET must be set to a long random value — "
+            "unset/default forges /watch, /dl and admin cookies")
     if not settings.DATABASE_URL:
         raise SystemExit("DATABASE_URL is required")
+    if not settings.WEB_URL:
+        # P3: warn loudly, don't crash — player/download links degrade
+        # to in-Telegram delivery, but the bot itself still works.
+        log.warning(
+            "WEB_URL is unset — /watch and /dl links will be broken; "
+            "set it to the public base URL (e.g. https://moovidex.run.place)")
 
     await check_db()
 
@@ -57,7 +67,28 @@ async def amain() -> None:
     try:
         await server.serve()
     finally:
+        # P3: await the cancel — a bare cancel() leaves the task
+        # dangling and can swallow shutdown errors.
         ad_task.cancel()
+        try:
+            await ad_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("autodelete shutdown: %s", exc)
+        # Close shared httpx clients and the DB pool.
+        try:
+            from app import ai as ai_mod
+            from app import tmdb as tmdb_mod
+            await ai_mod.close_client()
+            await tmdb_mod.close_client()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("httpx client close failed: %s", exc)
+        try:
+            from app.db import get_engine
+            await get_engine(settings.DATABASE_URL).dispose()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("engine dispose failed: %s", exc)
         await bot_app.stop_all()
 
 

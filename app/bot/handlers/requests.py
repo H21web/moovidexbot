@@ -60,6 +60,12 @@ async def _request_cb(client: Client, query):
         "🎞 Send <code>/request Movie Name 2024</code> to ask for a movie.")
 
 
+async def _request_group(client: Client, message: Message):
+    """/request in a group: requests live in the bot's PM."""
+    await message.reply_text("🎞 Please use /request in my PM 📩")
+
+
 def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.command("request"))(_request)
+    bot.on_message(filters.group & filters.command("request"))(_request_group)
     bot.on_callback_query(filters.regex(r"^request$"))(_request_cb)

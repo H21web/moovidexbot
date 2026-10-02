@@ -179,12 +179,15 @@ async def rerank(items: list[dict], user_id: int | None) -> list[dict]:
     counters = prefs["counters"]
     if not counters:
         return items
-    for it in items:
+    # P1#9: copy before mutating — items may come from a shared cache,
+    # and compounding boost on cache hits would skew scores permanently.
+    out = [dict(it) for it in items]
+    for it in out:
         base = it.get("score") or 0.0
         it["score"] = base * (1.0 + _boost_for(it, counters))
         it["personalized"] = True
-    items.sort(key=lambda i: i.get("score", 0), reverse=True)
-    return items
+    out.sort(key=lambda i: i.get("score", 0), reverse=True)
+    return out
 
 
 def quality_order(prefs: dict) -> list[str]:

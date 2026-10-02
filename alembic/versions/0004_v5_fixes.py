@@ -20,10 +20,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("files") as batch:
-        batch.drop_column("width")
-        batch.drop_column("height")
-        batch.drop_column("duration")
+    # P2#30: plain drop_column — batch_alter_table on PG recreates the
+    # files table, risking trigram index loss.
+    op.drop_column("files", "width")
+    op.drop_column("files", "height")
+    op.drop_column("files", "duration")
     op.create_table(
         "index_sessions",
         sa.Column("user_id", sa.BigInteger(), primary_key=True),
@@ -36,7 +37,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("index_sessions")
-    with op.batch_alter_table("files") as batch:
-        batch.add_column(sa.Column("width", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("height", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("duration", sa.Integer(), nullable=True))
+    op.add_column("files", sa.Column("width", sa.Integer(), nullable=True))
+    op.add_column("files", sa.Column("height", sa.Integer(), nullable=True))
+    op.add_column("files", sa.Column("duration", sa.Integer(), nullable=True))
