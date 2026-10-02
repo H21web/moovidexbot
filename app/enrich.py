@@ -16,6 +16,7 @@ source}`` or ``None``. ``source`` is one of ``"tmdb_imdb"``,
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -146,6 +147,9 @@ async def _groq_identify(keywords: str, year: int | None,
 
 
 # --- main pipeline ----------------------------------------------------------
+# v10.2: the two slow lookups (web-search -> imdb id, TMDB title search)
+# now run CONCURRENTLY instead of sequentially — roughly halves the
+# time-to-poster on a cold cache.
 async def enrich_title(keywords: str, year: int | None = None,
                        user_id: int | None = None) -> dict | None:
     """Run the enrichment pipeline for a keyword query."""
@@ -161,19 +165,21 @@ async def enrich_title(keywords: str, year: int | None = None,
     from app import ai as ai_mod
     ai_on = ai_mod.is_configured()
 
-    # 1-2. the old way: search API -> imdb id -> TMDB; then TMDB search.
+    # 1-2. web-search -> imdb id -> TMDB, and plain TMDB title search,
+    # raced in parallel; the imdb-anchored result wins when present.
+    imdb_id, tmdb_meta = await asyncio.gather(
+        _imdb_id_via_websearch(keywords),
+        tmdb.get_movie(keywords, year),
+    )
     meta: dict | None = None
-    imdb_id = await _imdb_id_via_websearch(keywords)
     if imdb_id:
         meta = await tmdb.find_by_imdb(imdb_id)
         if meta:
             meta["source"] = "tmdb_imdb"
-    if meta is None:
-        meta = await tmdb.get_movie(keywords, year)
-        if meta:
-            meta = dict(meta)
-            meta["imdb_id"] = imdb_id
-            meta["source"] = "tmdb_search"
+    if meta is None and tmdb_meta:
+        meta = dict(tmdb_meta)
+        meta["imdb_id"] = imdb_id
+        meta["source"] = "tmdb_search"
 
     # 3. v9.2 AI fallback: title/year only, no search-API response.
     # P1#16: a None from the quota-gated AI path is never cached — a
@@ -190,3 +196,61 @@ async def enrich_title(keywords: str, year: int | None = None,
         for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
             _cache.pop(k, None)
     return meta
+
+
+# --- 2nd search logic: title parsed from web-search results ------------------
+# v10.2: when the DB has nothing for a query, the free web-search API is
+# asked for "<query> movie" and the canonical title is parsed out of the
+# top results (IMDb / Wikipedia result titles look like
+# "Avengers: Endgame (2019) - IMDb"). That title is then searched in the
+# DB — a second chance before AI is consulted.
+_SITE_SUFFIX_RE = re.compile(
+    r"\s*[-|–—:]\s*(IMDb|Wikipedia|Rotten Tomatoes|IMDB|Letterboxd).*$",
+    re.IGNORECASE,
+)
+_YEAR_PAREN_RE = re.compile(r"\s*\((?:19|20)\d{2}[^)]*\)\s*$")
+_FILM_SUFFIX_RE = re.compile(r"\s*\(\s*film\s*\)\s*$", re.IGNORECASE)
+
+
+def _clean_web_title(raw: str) -> str | None:
+    """Turn a search-result title into a plain movie/series title."""
+    t = (raw or "").strip()
+    if not t:
+        return None
+    t = _SITE_SUFFIX_RE.sub("", t)
+    t = _YEAR_PAREN_RE.sub("", t)
+    t = _FILM_SUFFIX_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip(" -–—:|")
+    if len(t) < 2 or len(t) > 120:
+        return None
+    # Skip navigational junk ("IMDb", "Watch ... online").
+    low = t.lower()
+    if low in {"imdb", "wikipedia"} or low.startswith(("watch ", "download ")):
+        return None
+    return t
+
+
+async def parse_title_from_web(query: str) -> str | None:
+    """Parse the canonical movie/series title from web-search results.
+
+    Returns the cleaned title or ``None``. Never raises.
+    """
+    q = (query or "").strip()
+    if len(q) < 2:
+        return None
+    results = await _websearch_raw(f"{q} movie", num=6)
+    if not results:
+        return None
+    # Prefer IMDb / Wikipedia hits — their titles are the most canonical.
+    ordered = sorted(
+        results,
+        key=lambda it: 0 if ("imdb.com/title" in (it.get("url") or "")
+                             or "wikipedia.org" in (it.get("url") or ""))
+        else 1,
+    )
+    for item in ordered:
+        title = _clean_web_title(item.get("title") or "")
+        if title:
+            log.info("web title parse %r -> %r", q[:60], title[:60])
+            return title
+    return None

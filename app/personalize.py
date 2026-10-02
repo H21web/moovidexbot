@@ -230,3 +230,107 @@ async def reset(user_id: int) -> None:
 def fire_record_download(user_id: int, f: dict) -> None:
     """Non-blocking hook for the delivery path."""
     asyncio.create_task(record_download(user_id, f))
+
+
+# --- best pick: the user's keywords and taste choose -------------------------
+# v10.2: the best pick is no longer "first after sort" — every candidate is
+# scored on relevance + the user's explicit keywords (language/quality in
+# THIS query) + learned taste (language/quality from past downloads) +
+# popularity (downloads). Reasons are returned so the card can say WHY.
+import math as _math
+
+# v10.2: weights are scaled so the USER's intent decides the pick —
+# explicit query language/quality first, learned taste second, raw
+# relevance and download-count only as tie-break signals.
+_PICK_W = {
+    "relevance": 1.0,    # base relevance score from the search ranker
+    "lang_query": 6.0,   # language the user typed in this query
+    "qual_query": 3.0,   # quality the user typed in this query
+    "lang_pref": 2.0,    # language the user usually downloads
+    "qual_pref": 1.0,    # quality the user usually downloads
+    "downloads": 0.5,    # log-scaled popularity (one signal among many)
+    "keywords": 1.5,     # per extra query word found in the filename
+}
+
+
+def _top_of(counters: dict, cat: str) -> str | None:
+    cat_c = counters.get(cat) or {}
+    if not cat_c:
+        return None
+    return max(cat_c, key=lambda k: cat_c[k])
+
+
+async def choose_best(files: list[dict], parsed: dict,
+                      user_id: int | None) -> tuple[dict | None, list[str]]:
+    """Pick the best file the way the user would.
+
+    Returns ``(best, reasons)``. Deterministic, quota-free, never raises.
+    """
+    if not files:
+        return None, []
+    prefs: dict = {}
+    if user_id:
+        try:
+            prefs = await get_prefs(user_id)
+        except Exception:  # noqa: BLE001
+            prefs = {}
+    counters = (prefs or {}).get("counters") or {}
+    q_lang = (parsed.get("language") or "").lower() or None
+    q_qual = (parsed.get("quality") or "").lower() or None
+    pref_lang = (_top_of(counters, "language") or "").lower() or None
+    pref_qual = (_top_of(counters, "quality") or "").lower() or None
+    qwords = [w for w in re.split(r"\s+", (parsed.get("query") or "").lower())
+              if len(w) >= 3]
+
+    def _score(qlang: str | None, qqual: str | None):
+        """Score every file; also report whether any file matched the
+        explicit language/quality asks."""
+        out = []
+        lang_hit = qual_hit = False
+        for f in files:
+            name = (f.get("file_name") or "").lower()
+            f_lang = (f.get("language") or "").lower()
+            f_qual = (f.get("quality") or "").lower()
+            score = _PICK_W["relevance"] * float(f.get("score") or 0.0)
+            reasons: list[str] = []
+            if qlang and f_lang == qlang:
+                score += _PICK_W["lang_query"]
+                reasons.append(f_lang)
+                lang_hit = True
+            elif pref_lang and f_lang == pref_lang and not qlang:
+                score += _PICK_W["lang_pref"]
+                reasons.append(f"{f_lang} (your usual)")
+            if qqual and f_qual == qqual:
+                score += _PICK_W["qual_query"]
+                reasons.append(f_qual)
+                qual_hit = True
+            elif pref_qual and f_qual == pref_qual and not qqual:
+                score += _PICK_W["qual_pref"]
+                reasons.append(f"{f_qual} (your usual)")
+            dls = f.get("downloads") or 0
+            if dls > 0:
+                score += _PICK_W["downloads"] * _math.log10(1 + dls)
+                if dls >= 5:
+                    reasons.append(f"⬇ {dls}")
+            hits = sum(1 for w in qwords if w in name)
+            if hits:
+                score += _PICK_W["keywords"] * hits
+            # Bigger file wins ties (usually the better encode).
+            out.append((score, f.get("file_size") or 0, reasons, f))
+        return out, lang_hit, qual_hit
+
+    # If the user asked for a language/quality that NO file has, drop that
+    # ask and fall back to learned taste instead of raw relevance.
+    scored, lang_hit, qual_hit = _score(q_lang, q_qual)
+    if (q_lang and not lang_hit) or (q_qual and not qual_hit):
+        scored, _, _ = _score(
+            None if (q_lang and not lang_hit) else q_lang,
+            None if (q_qual and not qual_hit) else q_qual)
+
+    best: dict | None = None
+    best_score = float("-inf")
+    best_reasons: list[str] = []
+    for score, tiebreak, reasons, f in scored:
+        if (score, tiebreak) > (best_score, (best or {}).get("file_size") or 0):
+            best_score, best, best_reasons = score, f, reasons
+    return best, best_reasons[:3]

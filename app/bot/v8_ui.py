@@ -188,6 +188,9 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
         fmt_size(best.get("file_size"))) if x)
     if bmeta:
         bq.append(esc(bmeta))
+    reasons = best.get("_pick_reasons") or []
+    if reasons:
+        bq.append(f"✅ <i>{esc(' · '.join(reasons))}</i>")
     if ai_note:
         bq.append(f"💡 <i>“{esc(ai_note)}”</i>")
     parts.append("<blockquote>" + "\n".join(bq) + "</blockquote>")
@@ -228,6 +231,9 @@ def v8_results_kb(token: str, best_id: int, user_id: int,
         brow.append(InlineKeyboardButton("⬇ Download", url=d))
     if brow:
         rows.append(brow)
+    # v10.2: AI similar-movies — 1 quota per tap, real work for the AI.
+    rows.append([InlineKeyboardButton("🍿 Similar movies",
+                                      callback_data=f"sim:{token}")])
     # Pagination.
     if pages > 1:
         prow: list = []

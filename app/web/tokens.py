@@ -37,8 +37,24 @@ def parse_watch_token(token: str) -> dict | None:
     return None
 
 
-def watch_url(file_db_id: int, user_id: int) -> str | None:
+def _web_base() -> str:
+    """Public base URL for /watch and /dl links.
+
+    v10.2: Telegram web-app buttons SILENTLY fail on plain http, so an
+    http:// WEB_URL is upgraded to https:// (Render serves https) with a
+    loud warning instead of dead buttons.
+    """
     base = (settings.WEB_URL or "").rstrip("/")
+    if base.startswith("http://"):
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "WEB_URL is http:// -- Telegram web apps need https; upgrading")
+        base = "https://" + base[len("http://"):]
+    return base
+
+
+def watch_url(file_db_id: int, user_id: int) -> str | None:
+    base = _web_base()
     if not base:
         return None
     return f"{base}/watch/{make_watch_token(file_db_id, user_id)}"
@@ -50,7 +66,7 @@ def dl_url(file_db_id: int, user_id: int) -> str | None:
     ``?dl=1`` marks an explicit download hit so the /dl route can count it
     (the web player's stream URL has no such marker — plays ≠ downloads).
     """
-    base = (settings.WEB_URL or "").rstrip("/")
+    base = _web_base()
     if not base:
         return None
     return f"{base}/dl/{make_watch_token(file_db_id, user_id)}?dl=1"

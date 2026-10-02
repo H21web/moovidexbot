@@ -196,9 +196,12 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
                                   chat_id=sent.chat.id))
     # v8.1: per-file download counter (drives "most downloaded = best pick").
     asyncio.create_task(bump_file_downloads(f.id))
-    # PM deliveries fall back to the global auto-delete default
-    # (no per-group row exists for a user id).
-    ad = await effective_autodelete(target_id)
+    # v10.2: the user's own /deltimer wins; otherwise the group/global
+    # default (no per-group row exists for a user id in PM).
+    from app.bot.handlers.deltimer import get_user_del_timer
+    ad = await get_user_del_timer(uid)
+    if ad is None:
+        ad = await effective_autodelete(target_id)
     if ad > 0:
         await autodelete.schedule(sent.chat.id, sent.id, ad)
     # v6: learn from this download (fire-and-forget, plain dict — the ORM
@@ -298,21 +301,91 @@ async def _spell(client: Client, query):
         return
     suggestion = query.data.split(":", 1)[1]
     await query.answer()
-    # Re-run search with the suggestion, reusing the same message.
-    from app.bot.handlers.search import _do_search
+    # v10.2: re-run the full v10 search flow and render the SAME v8 card
+    # model as a normal search — no more old button model anywhere.
+    from app.bot.handlers.search import _search_and_send
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    sent = await _search_and_send(client, query.message.chat.id, uid,
+                                  suggestion)
+    if not sent:
+        await client.send_message(query.message.chat.id,
+                                  "❌ Still nothing found.")
+
+
+async def _similar(client: Client, query):
+    """v10.2 🍿 Similar movies: ``sim:{token}``.
+
+    AI suggests 6 similar titles (1 quota). They arrive as tappable
+    buttons; tapping one runs a full v10 search for that title.
+    """
     uid = query.from_user.id
-    token, groups = await _do_search(client, suggestion, uid)
-    if not token:
-        await query.message.edit_text("❌ Still nothing found.")
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
         return
-    per = settings.RESULTS_PER_PAGE
-    total_pages = max(1, math.ceil(len(groups) / per))
-    chunk = groups[:per]
-    await query.message.edit_text(
-        f"🔍 <b>Results for</b> {ui.esc(suggestion)}\n"
-        f"<i>{len(groups)} found</i>",
-        reply_markup=ui.results_kb(token, 0, total_pages, chunk,
-                                   page_start=0))
+    try:
+        token = query.data.split(":", 1)[1]
+    except (ValueError, IndexError):
+        return
+    data = state.v8_get(token)
+    if not data:
+        await query.answer("⌛ Results expired — search again.",
+                           show_alert=True)
+        return
+    from app import ai as ai_mod, ai_assist
+    if not ai_mod.is_configured():
+        await query.answer("🤖 AI is off right now.", show_alert=True)
+        return
+    if await ai_mod.quota_remaining(uid) <= 0:
+        await query.answer("🤖 Daily AI limit reached — try tomorrow 🌙",
+                           show_alert=True)
+        return
+    await query.answer("🤖 Asking AI…")
+    title = (data.get("meta") or {}).get("title") or data.get("query") or ""
+    titles = await ai_assist.ai_similar_titles(uid, title)
+    if not titles:
+        await query.answer("🤖 No suggestions right now.", show_alert=True)
+        return
+    data["similar"] = titles
+    rows = [[InlineKeyboardButton(
+        f"🔍 {(t[:42] + '…') if len(t) > 42 else t}",
+        callback_data=f"simq:{token}:{i}")]
+        for i, t in enumerate(titles)]
+    try:
+        await client.send_message(
+            query.message.chat.id,
+            f"🍿 <b>Similar to {ui.esc(title[:60])}:</b>",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        log.debug("similar send failed", exc_info=True)
+
+
+async def _simq(client: Client, query):
+    """Tap a similar title: ``simq:{token}:{idx}`` -> full v10 search."""
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    try:
+        _, token, idx = query.data.split(":")
+        idx = int(idx)
+    except (ValueError, IndexError):
+        return
+    data = state.v8_get(token)
+    titles = (data or {}).get("similar") or []
+    if idx < 0 or idx >= len(titles):
+        await query.answer("⌛ Expired — search again.", show_alert=True)
+        return
+    await query.answer(f"🔍 {titles[idx][:40]}")
+    from app.bot.handlers.search import _search_and_send
+    sent = await _search_and_send(client, query.message.chat.id, uid,
+                                  titles[idx])
+    if not sent:
+        await client.send_message(query.message.chat.id,
+                                  "❌ Nothing found for that title.")
 
 
 async def _fsub_retry(client: Client, query):
@@ -466,7 +539,8 @@ async def _v8page(client: Client, query) -> None:
     except (ValueError, IndexError):
         return
     data = state.v8_get(token)
-    if not data or data.get("user_id") != uid:
+    # v10.2: group result cards are shared — any member may paginate.
+    if not data or (not data.get("group") and data.get("user_id") != uid):
         await query.answer("⌛ Results expired — search again.", show_alert=True)
         return
     await query.answer()
@@ -492,7 +566,8 @@ async def _rfilter(client: Client, query) -> None:
     token = parts[1]
     kind = parts[2]
     data = state.v8_get(token)
-    if not data or data.get("user_id") != uid:
+    # v10.2: group result cards are shared — any member may paginate.
+    if not data or (not data.get("group") and data.get("user_id") != uid):
         await query.answer("⌛ Results expired — search again.", show_alert=True)
         return
     await query.answer()
@@ -542,3 +617,5 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
     bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)
     bot.on_callback_query(filters.regex(r"^rf:"))(_rfilter)
+    bot.on_callback_query(filters.regex(r"^sim:"))(_similar)
+    bot.on_callback_query(filters.regex(r"^simq:"))(_simq)

@@ -1,26 +1,31 @@
-"""v9 search module — fast, accurate, AI-free on the hot path.
+"""v10.2 search module — fast on the hot path, smart on recovery.
 
 Pipeline:
 
+**Hot path** (every search, AI-free, ~parallel):
+
 1. **Parse** — local keyword-first parse (``textutil.parse_query``):
    year/language/quality/season/episode come out of the query itself.
-   No AI parse on the search path (speed + quota).
 2. **Multi-sweep (parallel)** — the DB is swept with several query
-   variants (raw, cleaned title, title-only, title+year, language
-   word stripped) via ``asyncio.gather``; hits merge by best score per
-   file id. One query variant missing never sinks the search.
-3. **Fuzzy retry** — when hits are few, a second pass runs with the
-   trigram threshold lowered (0.15) and no filters, so typos and
-   mistagged files still surface.
-4. **Rerank** — personal taste, then score -> quality -> size; the
-   most-downloaded file wins best pick when any downloads exist.
-5. **Confidence** — the best hit's relevance score decides ``ok`` or
-   ``uncertain`` (both render; ``uncertain`` just means weak matches).
+   variants via ``asyncio.gather``; hits merge by best score per file id.
+3. **Fuzzy retry** — when hits are thin, a low-threshold trigram pass so
+   typos and mistagged files still surface.
+   A best hit scoring >= ``GOOD_SCORE`` returns immediately.
 
-AI appears only in the no-results recovery chain
-(:mod:`app.ai_assist`) — never on a successful search. The results
-render instantly; enrichment (poster/info) fills in afterwards via a
-background message edit owned by the search handler.
+**Recovery path** (only when the hot path is weak — the 3 logics):
+
+4. **Spell correction** (local, quota-free) — ``"avangerrs"`` becomes
+   ``"avengers"`` via Levenshtein against real indexed title words;
+   the DB is swept once more with the fixed query.
+5. **Web-search title parse** — the free search API is asked for
+   ``"<query> movie"`` and the canonical title is parsed from the
+   top results (IMDb/Wikipedia titles); the DB is swept with it.
+6. **AI title extraction** (quota-gated) — Groq pulls the movie/series
+   title out of the query; the DB is swept with it.
+
+Then: personal taste re-rank, user-priority best pick, confidence
+(``ok`` / ``uncertain`` / ``no_results``). Results render instantly;
+enrichment (poster/info) fills in via a background edit.
 """
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ import re
 
 from sqlalchemy import func, select
 
-from app import personalize
+from app import ai_assist, enrich as enrich_mod, personalize, spell
 from app.ai_search import _query_season_episode
 from app.bot.v8_ui import sort_best_first
 from app.config import settings
@@ -44,6 +49,7 @@ log = logging.getLogger(__name__)
 MIN_HITS = 8            # below this, the fuzzy retry kicks in
 FUZZY_THRESHOLD = 0.15  # lowered trigram bar for the retry pass
 UNCERTAIN_SCORE = 1.0   # best hit below this -> "uncertain"
+GOOD_SCORE = 2.0        # hot path at/above this skips recovery entirely
 
 _FUZZY_FIELDS = (
     "id", "file_id", "file_name", "file_size", "mime_type", "caption",
@@ -109,33 +115,24 @@ async def _fuzzy_sweep(q: str, limit: int = RESULT_LIMIT) -> list[dict]:
         return []
 
 
-async def smart_search(user_id: int | None, raw: str) -> dict:
-    """Run the v9 search pipeline.
-
-    Returns ``{"status", "files", "best", "title", "parsed",
-    "confidence"}``; status is ``"ok" | "uncertain" | "no_results"``.
-    """
-    raw = (raw or "").strip()
-    parsed = parse_query(raw)
-    parsed = await _ai_parse_if_needed(user_id, raw, parsed)
-    title = (parsed.get("title") or raw).strip()
-
-    # --- multi-sweep (parallel): every variant, best score per file id --
+async def _hot_sweeps(user_id: int | None, raw: str, parsed: dict,
+                    log_q: bool = True) -> dict[int, dict]:
+    """Parallel DB sweeps + fuzzy retry. Returns {file_id: item}."""
     variants = _sweep_queries(raw, parsed)
     merged: dict[int, dict] = {}
 
-    async def _one(variant: str, log_q: bool) -> tuple[str, list]:
+    async def _one(variant: str, do_log: bool) -> tuple[str, list]:
         try:
             items, _ = await search_files(variant, user_id=user_id,
-                                          log_query=log_q)
+                                          log_query=do_log)
             return variant, items
         except Exception as exc:  # noqa: BLE001
-            log.warning("v9 sweep %r failed: %s", variant, exc)
+            log.warning("v10 sweep %r failed: %s", variant, exc)
             return variant, []
 
     if variants:
         for variant, items in await asyncio.gather(
-                *(_one(v, i == 0) for i, v in enumerate(variants))):
+                *(_one(v, log_q and i == 0) for i, v in enumerate(variants))):
             for it in items:
                 fid = it.get("id")
                 if fid is None:
@@ -145,34 +142,125 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                         prev.get("score") or 0):
                     merged[fid] = it
 
-    # --- fuzzy retry when hits are thin ----------------------------------
     if len(merged) < MIN_HITS:
+        title = (parsed.get("title") or raw).strip()
         for it in await _fuzzy_sweep(title or raw):
             fid = it.get("id")
             if fid is None or fid in merged:
                 continue
             merged[fid] = it
+    return merged
+
+
+def _best_score(merged: dict[int, dict]) -> float:
+    return max((float(it.get("score") or 0.0) for it in merged.values()),
+               default=0.0)
+
+
+async def smart_search(user_id: int | None, raw: str) -> dict:
+    """Run the v10.2 search pipeline.
+
+    Returns ``{"status", "files", "best", "best_reasons", "title",
+    "parsed", "confidence", "corrected"}``; status is
+    ``"ok" | "uncertain" | "no_results"``. ``corrected`` is the
+    auto-fixed query when spell correction fired (for display).
+    """
+    raw = (raw or "").strip()
+    parsed = parse_query(raw)
+    parsed = await _ai_parse_if_needed(user_id, raw, parsed)
+    title = (parsed.get("title") or raw).strip()
+    factory = get_session_factory(settings.DATABASE_URL)
+
+    # --- hot path ------------------------------------------------------
+    merged = await _hot_sweeps(user_id, raw, parsed, log_q=True)
+    corrected: str | None = None
+    score = _best_score(merged)
+
+    # --- recovery: 1st logic — local spell correction ------------------
+    if score < GOOD_SCORE:
+        try:
+            fixed = await spell.correct_query(raw, factory)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("spell correction failed: %s", exc)
+            fixed = None
+        if fixed and fixed.lower() != raw.lower():
+            retry = await _hot_sweeps(user_id, fixed, parse_query(fixed),
+                                      log_q=False)
+            if _best_score(retry) > score:
+                merged, score = retry, _best_score(retry)
+                corrected = fixed
+                parsed = parse_query(fixed)
+                parsed["title"] = fixed
+                title = fixed
+
+    # --- recovery: 2nd logic — title parsed from web-search results -----
+    if not merged or score < UNCERTAIN_SCORE:
+        try:
+            web_title = await enrich_mod.parse_title_from_web(raw)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("web title parse failed: %s", exc)
+            web_title = None
+        if web_title:
+            retry = await _hot_sweeps(user_id, web_title,
+                                      parse_query(web_title), log_q=False)
+            if _best_score(retry) > score:
+                merged, score = retry, _best_score(retry)
+                parsed = parse_query(web_title)
+                parsed["title"] = web_title
+                title = web_title
+
+    # --- recovery: 3rd logic — AI extracts the title -------------------
+    if not merged:
+        try:
+            ai_title = await ai_assist.ai_extract_title(user_id, raw)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("AI title extract failed: %s", exc)
+            ai_title = None
+        if ai_title:
+            retry = await _hot_sweeps(user_id, ai_title,
+                                      parse_query(ai_title), log_q=False)
+            if retry:
+                merged, score = retry, _best_score(retry)
+                parsed = parse_query(ai_title)
+                parsed["title"] = ai_title
+                title = ai_title
 
     items = list(merged.values())
     if not items:
         return {"status": "no_results", "files": [], "best": None,
-                "title": title, "parsed": parsed, "confidence": 0.0}
+                "best_reasons": [], "title": title, "parsed": parsed,
+                "confidence": 0.0, "corrected": corrected}
 
-    # --- rerank: taste -> score/quality/size; downloads win best ---------
+    # --- rerank: taste -> score/quality/size ---------------------------
     try:
         items = await personalize.rerank(items, user_id)
     except Exception as exc:  # noqa: BLE001
-        log.debug("v9 personalize failed: %s", exc)
+        log.debug("v10 personalize failed: %s", exc)
     items = sort_best_first(items)
     files = _query_season_episode(parsed, items)
-    top_dl = max(files, key=lambda f: f.get("downloads") or 0, default=None)
-    if top_dl and (top_dl.get("downloads") or 0) > 0:
-        files = [top_dl] + [f for f in files if f.get("id") != top_dl.get("id")]
-    best = files[0]
+
+    # --- best pick: the user's keywords + taste choose -----------------
+    try:
+        best, reasons = await personalize.choose_best(files, parsed, user_id)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("choose_best failed: %s", exc)
+        best, reasons = None, []
+    if best is None:
+        top_dl = max(files, key=lambda f: f.get("downloads") or 0,
+                     default=None)
+        if top_dl and (top_dl.get("downloads") or 0) > 0:
+            best = top_dl
+        else:
+            best = files[0]
+        reasons = []
+    else:
+        files = [best] + [f for f in files if f.get("id") != best.get("id")]
 
     confidence = float(best.get("score") or 0.0)
     status = "ok" if confidence >= UNCERTAIN_SCORE else "uncertain"
-    log.info("v9 search %r: %d files, best score %.2f -> %s",
-             raw[:60], len(files), confidence, status)
+    log.info("v10 search %r: %d files, best score %.2f -> %s%s",
+             raw[:60], len(files), confidence, status,
+             f" (corrected: {corrected})" if corrected else "")
     return {"status": status, "files": files, "best": best,
-            "title": title, "parsed": parsed, "confidence": confidence}
+            "best_reasons": reasons, "title": title, "parsed": parsed,
+            "confidence": confidence, "corrected": corrected}

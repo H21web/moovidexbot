@@ -164,10 +164,22 @@ async def _render_saved(message, uid: int, page: int = 0,
 
 
 async def _saved_cmd(client: Client, message) -> None:
+    """v10.2: reply FIRST, then fill in — this command can never again
+    look like "no response", even if the database is slow."""
     user = await track_user(message)
     if user and user.is_banned:
         return
-    await _render_saved(message, message.from_user.id)
+    wait = await message.reply_text("⭐ <i>Loading your list…</i>",
+                                    parse_mode=ParseMode.HTML)
+    try:
+        await _render_saved(wait, message.from_user.id, edit=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("saved command failed: %s", exc)
+        try:
+            await wait.edit_text("⚠️ Couldn't load your watchlist — "
+                                 "try again in a bit.")
+        except Exception:
+            pass
 
 
 async def _saved_pg(client: Client, query) -> None:
@@ -185,28 +197,41 @@ async def _noop(client: Client, query) -> None:
 
 
 async def _mystats(client: Client, message) -> None:
-    """v10: per-user stats from event_logs."""
+    """v10: per-user stats from event_logs.
+
+    v10.2: reply FIRST, then fill in — never "no response".
+    """
     user = await track_user(message)
     if user and user.is_banned:
         return
     uid = message.from_user.id
-    factory = get_session_factory(settings.DATABASE_URL)
+    wait = await message.reply_text("📊 <i>Crunching your stats…</i>",
+                                    parse_mode=ParseMode.HTML)
     try:
-        async with factory() as s:
-            rows = (await s.execute(
-                select(EventLog.kind, func.count())
-                .where(EventLog.user_id == uid)
-                .group_by(EventLog.kind))).all()
-    except Exception:  # noqa: BLE001
-        rows = []
-    counts = {k: n for k, n in rows}
-    text = (
-        "📊 <b>Your stats</b>\n\n"
-        f"🔍 Searches: <b>{counts.get('search', 0)}</b>\n"
-        f"📥 Downloads: <b>{counts.get('download', 0)}</b>\n"
-        f"🎞 Requests: <b>{counts.get('request', 0)}</b>"
-    )
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+        factory = get_session_factory(settings.DATABASE_URL)
+        try:
+            async with factory() as s:
+                rows = (await s.execute(
+                    select(EventLog.kind, func.count())
+                    .where(EventLog.user_id == uid)
+                    .group_by(EventLog.kind))).all()
+        except Exception:  # noqa: BLE001
+            rows = []
+        counts = {k: n for k, n in rows}
+        text = (
+            "📊 <b>Your stats</b>\n\n"
+            f"🔍 Searches: <b>{counts.get('search', 0)}</b>\n"
+            f"📥 Downloads: <b>{counts.get('download', 0)}</b>\n"
+            f"🎞 Requests: <b>{counts.get('request', 0)}</b>"
+        )
+        await wait.edit_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mystats failed: %s", exc)
+        try:
+            await wait.edit_text("⚠️ Couldn't load your stats — "
+                                 "try again in a bit.")
+        except Exception:
+            pass
 
 
 def register(bot: Client) -> None:

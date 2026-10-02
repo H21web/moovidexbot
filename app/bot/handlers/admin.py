@@ -22,6 +22,69 @@ log = logging.getLogger(__name__)
 
 
 @admin_only
+async def _admin(client: Client, message: Message):
+    """v10.2: the /admin dashboard — the command that was never wired up.
+
+    Health snapshot (web player, AI, TMDB) + tappable sub-commands.
+    """
+    wait = await message.reply_text("👑 <i>Opening admin panel…</i>",
+                                    parse_mode=ParseMode.HTML)
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        try:
+            async with factory() as s:
+                files = (await s.execute(
+                    select(func.count(File.id)))).scalar() or 0
+                users = (await s.execute(
+                    select(func.count(User.id)))).scalar() or 0
+                groups = (await s.execute(
+                    select(func.count(Group.id)))).scalar() or 0
+                open_req = (await s.execute(
+                    select(func.count(MovieRequest.id)).where(
+                        MovieRequest.status == "open"))).scalar() or 0
+            db_ok = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("admin dashboard db failed: %s", exc)
+            files = users = groups = open_req = 0
+            db_ok = False
+
+        from app import ai as ai_mod
+        web = (settings.WEB_URL or "").rstrip("/")
+        if web.startswith("http://"):
+            web_state = "⚠️ http — Telegram web apps need https!"
+        elif web.startswith("https://"):
+            web_state = f"✅ {ui.esc(web)}"
+        else:
+            web_state = ("❌ <b>WEB_URL not set!</b> — no ▶ Play / "
+                         "⬇ Download links on file cards. Set WEB_URL "
+                         "on Render (e.g. https://moovidex.run.place) "
+                         "and redeploy.")
+        ai_state = ("✅ on" if ai_mod.is_configured()
+                    else "❌ off (no GROQ_API_KEY)")
+        tmdb_state = ("✅ on" if settings.TMDB_API_KEY else "❌ off")
+        text = (
+            "👑 <b>Admin panel</b>\n\n"
+            f"🗄 Database: {'✅' if db_ok else '❌'}\n"
+            f"📦 Files: <b>{files:,}</b> · 👥 Users: <b>{users:,}</b> · "
+            f"👪 Groups: <b>{groups:,}</b>\n"
+            f"🎞 Open requests: <b>{open_req}</b>\n\n"
+            f"🌐 Web player: {web_state}\n"
+            f"🤖 AI: {ai_state}\n"
+            f"🎬 TMDB: {tmdb_state}\n\n"
+            "<b>Commands:</b>\n"
+            "/stats /users /requests /broadcast /settings /dbcheck"
+        )
+        await wait.edit_text(text, parse_mode=ParseMode.HTML,
+                             disable_web_page_preview=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("admin dashboard failed: %s", exc)
+        try:
+            await wait.edit_text("⚠️ Admin panel failed — try again.")
+        except Exception:
+            pass
+
+
+@admin_only
 async def _stats(client: Client, message: Message):
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
@@ -305,6 +368,7 @@ async def _settings(client: Client, message: Message):
 
 
 def register(bot: Client) -> None:
+    bot.on_message(filters.private & filters.command("admin"))(_admin)
     bot.on_message(filters.private & filters.command("stats"))(_stats)
     bot.on_message(filters.private & filters.command("users"))(_users)
     bot.on_message(filters.private & filters.command("ban"))(_ban)

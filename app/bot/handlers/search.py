@@ -24,7 +24,6 @@ from app.bot.handlers.common import track_user
 from app.bot.handlers.groups import effective_autodelete
 from app.config import settings
 from app.db import get_session_factory
-from app.search import group_by_title, search_files
 from app.spell import suggest
 from app.tmdb import resolve_title
 from app.web.tokens import watch_url
@@ -50,44 +49,6 @@ async def _get_bot_username(client: Client) -> str | None:
     except Exception:
         log.debug("get_me failed", exc_info=True)
     return _bot_username
-
-
-async def _do_search(client: Client, query_text: str, user_id: int,
-                     personal: bool = True
-                     ) -> tuple[str, object] | tuple[None, None]:
-    """Run search (+ personalization), return (token, groups) or (None, None)."""
-    items, _parsed = await search_files(query_text, user_id=user_id)
-    if personal:
-        items = await personalize.rerank(items, user_id)
-    groups = group_by_title(items)
-    if not groups:
-        return None, None
-    token = state.results_put(groups, query_text, user_id)
-    return token, groups
-
-
-async def _send_results(client: Client, chat_id: int, token: str,
-                        query_text: str, page: int = 0):
-    data = state.results_get(token)
-    if not data:
-        await client.send_message(chat_id, "⌛ Results expired — search again.")
-        return
-    groups = data["groups"]
-    per = settings.RESULTS_PER_PAGE
-    total_pages = max(1, math.ceil(len(groups) / per))
-    page = max(0, min(page, total_pages - 1))
-    chunk = groups[page * per:(page + 1) * per]
-    text = (f"🔍 <b>Results for</b> {ui.esc(query_text)}\n"
-            f"<i>{len(groups)} found</i>")
-    sent = await client.send_message(
-        chat_id, text, reply_markup=ui.results_kb(
-            token, page, total_pages, chunk, page_start=page * per),
-        parse_mode=ParseMode.HTML)
-    # In groups, auto-delete the results message after the group's timer.
-    if str(chat_id).startswith("-"):
-        ad = await effective_autodelete(int(chat_id))
-        if ad > 0:
-            await autodelete.schedule(int(chat_id), sent.id, ad)
 
 
 def _stash_ai_query(q: str) -> str:
@@ -193,16 +154,18 @@ async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
             pass
 
 
-async def render_v8_results(client: Client, message: Message,
-                        token: str, uid: int, page: int = 0) -> None:
-    """Render (or re-render) a v8 results message: best pick + list."""
+async def _build_v8(client: Client, token: str,
+                  uid: int, page: int = 0) -> tuple[str, object] | tuple[None, None]:
+    """Build the (text, keyboard) for a v8 results session.
+
+    Shared by the PM edit-render, the group send-render, and background
+    enrich re-renders. Returns ``(None, None)`` when the session is gone.
+    """
     data = state.v8_get(token)
-    if not data or data.get("user_id") != uid:
-        try:
-            await message.edit_text("⌛ Results expired — search again.")
-        except Exception:
-            pass
-        return
+    if not data:
+        return None, None
+    if not data.get("group") and data.get("user_id") != uid:
+        return None, None
     files = v8_ui.apply_v8_filters(data["files"], data.get("filters") or {})
     best = data["best"]
     rest = [f for f in files if f.get("id") != best.get("id")]
@@ -213,55 +176,88 @@ async def render_v8_results(client: Client, message: Message,
     text = v8_ui.v8_results_text(
         data.get("meta"), best, chunk, page, pages, len(rest),
         data.get("filters") or {}, uid, data.get("ai_note"), username)
+    if data.get("corrected"):
+        text = (f"🔤 Showing results for "
+                f"<b>{ui.esc(data['corrected'])}</b>\n\n" + text)
     kb = v8_ui.v8_results_kb(token, best["id"], uid, page, pages,
                              data.get("filters") or {})
-    prev_page = data.get("page", 0)
+    data["page"] = page
+    return text, kb
+
+
+async def render_v8_results(client: Client, message: Message,
+                        token: str, uid: int, page: int = 0) -> None:
+    """Render (or re-render) a v8 results message: best pick + list."""
+    data = state.v8_get(token)
+    if not data or (not data.get("group") and data.get("user_id") != uid):
+        try:
+            await message.edit_text("⌛ Results expired — search again.")
+        except Exception:
+            pass
+        return
+    built = await _build_v8(client, token, uid, page)
+    if not built[0]:
+        return
+    text, kb = built
     try:
         await message.edit_text(text, reply_markup=kb,
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True)
-        # Only record the page if the user didn't navigate elsewhere
-        # while the edit was in flight — a background enrich re-render
-        # must never clobber a newer pagination.
-        if data.get("page", 0) == prev_page:
-            data["page"] = page  # v9.3: background enrich re-renders this page
     except Exception:
         log.debug("v8 render edit failed", exc_info=True)
 
 
+async def send_v8_results(client: Client, chat_id: int, token: str,
+                         uid: int):
+    """Send a v8 results card as a NEW message (groups, similar-search).
+
+    Returns the sent message or None.
+    """
+    built = await _build_v8(client, token, uid, 0)
+    if not built[0]:
+        return None
+    text, kb = built
+    try:
+        return await client.send_message(
+            chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
+    except Exception:
+        log.debug("v8 send failed", exc_info=True)
+        return None
+
+
 async def _v9_search_flow(client: Client, message: Message,
                          uid: int, q: str) -> bool:
-    """v9.3 PM search: fast + accurate, zero AI on the hot path.
+    """v10.2 PM search: fast hot path, smart recovery, instant render.
 
     Always handles the message (True) except on unexpected failure.
-    Flow: keyword intent -> local parse -> parallel DB sweeps -> instant
-    local verdict -> results render IMMEDIATELY -> enrich (poster/info)
-    fills in via a background edit. AI is used only for the no-results
-    spell-correction chain.
+    Flow: keyword intent -> smart_search (hot sweeps -> spell fix ->
+    web title -> AI title) -> results render IMMEDIATELY -> enrich
+    (poster/info) fills in via a background edit.
     """
     wait = await message.reply_text("\U0001F50D <i>Searching…</i>",
                                     parse_mode=ParseMode.HTML)
     try:
         res = await search_v9.smart_search(uid, q)
     except Exception:  # noqa: BLE001
-        log.exception("v9 search failed")
+        log.exception("v10 search failed")
         try:
             await wait.delete()
         except Exception:
             pass
         return False
 
-    # v9.3: "uncertain" results render as-is — no AI judge, no quota
-    # burn. Recovery runs only when there is truly nothing to show.
+    # v10: smart_search already ran the full recovery chain (spell ->
+    # web title -> AI title). The assist chain below is the last resort
+    # for suggestions only.
     suggestions: list[str] | None = None
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
-        # AI recovery chain: correct the title -> retry once.
         fix = await ai_assist.assist_no_results(uid, q)
         if fix.get("action") == "retry":
             try:
                 res2 = await search_v9.smart_search(uid, fix["query"])
             except Exception:  # noqa: BLE001
-                log.debug("v9 retry search failed", exc_info=True)
+                log.debug("v10 retry search failed", exc_info=True)
                 res2 = {"status": "no_results"}
             if res2.get("best"):
                 res, q = res2, fix["query"]
@@ -277,24 +273,135 @@ async def _v9_search_flow(client: Client, message: Message,
             return True
 
     asyncio.create_task(ai.remember(uid, "user", q))
-    # v9.3: verdict is local (no AI). Results render instantly; enrich
-    # (poster/info) fills in via a background edit when ready.
     ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
+    best = res["best"]
+    best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
         "files": res["files"],
-        "best": res["best"],
+        "best": best,
         "meta": None,  # filled by _fill_meta below
         "query": q,
         "user_id": uid,
         "filters": {},
         "filter_opts": v8_ui.v8_filter_options(res["files"]),
         "ai_note": ai_note,
+        "corrected": res.get("corrected"),
     })
     await render_v8_results(client, wait, token, uid, page=0)
     asyncio.create_task(_fill_meta(client, wait, token, uid,
                                    res["title"] or q,
                                    res["parsed"].get("year")))
     return True
+
+
+async def _search_and_send(client: Client, chat_id: int, uid: int,
+                           q: str) -> bool:
+    """Run a full search and send the v8 card as a new message.
+
+    Shared by the group search flow and the 🍿 similar-movies callback.
+    Returns True when results were sent.
+    """
+    try:
+        res = await search_v9.smart_search(uid, q)
+    except Exception:  # noqa: BLE001
+        log.exception("v10 search_and_send failed")
+        return False
+    if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
+        return False
+    ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
+    best = res["best"]
+    best["_pick_reasons"] = res.get("best_reasons") or []
+    token = state.v8_put({
+        "files": res["files"],
+        "best": best,
+        "meta": None,
+        "query": q,
+        "user_id": uid,
+        "filters": {},
+        "filter_opts": v8_ui.v8_filter_options(res["files"]),
+        "ai_note": ai_note,
+        "corrected": res.get("corrected"),
+        "group": str(chat_id).startswith("-"),
+    })
+    sent = await send_v8_results(client, chat_id, token, uid)
+    if not sent:
+        return False
+    asyncio.create_task(_fill_meta(client, sent, token, uid,
+                                   res["title"] or q,
+                                   res["parsed"].get("year")))
+    return True
+
+
+async def _v9_search_flow_group(client: Client, message: Message,
+                                uid: int, q: str) -> None:
+    """v10.2 group search: the SAME v8 card model as PM (unified UI).
+
+    Best pick + Play/Download/Save buttons + pagination + filters —
+    no more old button model in groups. The results message follows the
+    group's auto-delete timer.
+    """
+    wait = await message.reply_text("🔍 <i>Searching…</i>",
+                                    parse_mode=ParseMode.HTML)
+    try:
+        res = await search_v9.smart_search(uid, q)
+    except Exception:  # noqa: BLE001
+        log.exception("v10 group search failed")
+        try:
+            await wait.edit_text("⚠️ Search failed, try again.")
+        except Exception:
+            pass
+        return
+    if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        factory = get_session_factory(settings.DATABASE_URL)
+        try:
+            async with factory() as s:
+                suggestions = await suggest(s, q)
+        except Exception:  # noqa: BLE001
+            suggestions = []
+        if suggestions:
+            await message.reply_text(
+                "❌ <b>No results found.</b>\nDid you mean:",
+                reply_markup=ui.spell_kb(suggestions),
+                parse_mode=ParseMode.HTML)
+        else:
+            await message.reply_text(
+                "❌ <b>No results found.</b>\n"
+                + ("🎞 Try /request to ask for it!"
+                   if settings.REQUEST_CHANNEL
+                   else "Try a different spelling."),
+                parse_mode=ParseMode.HTML)
+        return
+    ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
+    best = res["best"]
+    best["_pick_reasons"] = res.get("best_reasons") or []
+    token = state.v8_put({
+        "files": res["files"],
+        "best": best,
+        "meta": None,
+        "query": q,
+        "user_id": uid,
+        "filters": {},
+        "filter_opts": v8_ui.v8_filter_options(res["files"]),
+        "ai_note": ai_note,
+        "corrected": res.get("corrected"),
+        "group": True,
+    })
+    sent = await send_v8_results(client, message.chat.id, token, uid)
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    if sent:
+        ad = await effective_autodelete(int(message.chat.id))
+        if ad > 0:
+            await autodelete.schedule(int(message.chat.id), sent.id, ad)
+        asyncio.create_task(_fill_meta(client, sent, token, uid,
+                                       res["title"] or q,
+                                       res["parsed"].get("year")))
 
 
 async def _fill_meta(client: Client, message: Message, token: str,
@@ -314,7 +421,9 @@ async def _fill_meta(client: Client, message: Message, token: str,
     if not meta:
         return
     data = state.v8_get(token)
-    if not data or data.get("user_id") != uid or data.get("meta"):
+    if not data or data.get("meta"):
+        return
+    if not data.get("group") and data.get("user_id") != uid:
         return
     data["meta"] = meta
     # Re-read the page immediately before the final edit: the user may
@@ -372,45 +481,20 @@ async def _on_text(client: Client, message: Message):
             return
     if pm:
         asyncio.create_task(ai.remember(uid, "user", q))
-    wait = await message.reply_text("🔍 <i>Searching…</i>",
-                                    parse_mode=ParseMode.HTML)
-    try:
-        token, groups = await _do_search(client, q, uid, personal=pm)
-        await wait.delete()
-        if not token:
-            if pm:
-                await _no_results_pm(client, message, q)
-            else:
-                factory = get_session_factory(settings.DATABASE_URL)
-                async with factory() as s:
-                    suggestions = await suggest(s, q)
-                if suggestions:
-                    await message.reply_text(
-                        "❌ <b>No results found.</b>\nDid you mean:",
-                        reply_markup=ui.spell_kb(suggestions))
-                else:
-                    await message.reply_text(
-                        "❌ <b>No results found.</b>\n"
-                        + ("🎞 Try /request to ask for it!"
-                           if settings.REQUEST_CHANNEL else
-                           "Try a different spelling."))
-            return
-        await _send_results(client, message.chat.id, token, q)
-    except Exception as exc:
-        log.exception("search failed")
-        try:
-            await wait.edit_text("⚠️ Search failed, try again.")
-        except Exception:
-            pass
+    # v10.2: groups use the SAME v8 card model as PM (unified UI).
+    await _v9_search_flow_group(client, message, uid, q)
 
 
 def register(bot: Client) -> None:
-    # groups + private, but not channels and not commands
+    # groups + private, but not channels and not commands.
+    # v10.2: every real command is excluded so _on_text never double-fires.
     bot.on_message(
         filters.text & ~filters.command(["start", "help", "trending",
                                          "request", "index", "stats",
                                          "broadcast", "ban", "unban", "warn",
                                          "users", "settings", "requests",
-                                         "connect", "groups", "cancel"])
+                                         "connect", "groups", "cancel",
+                                         "saved", "mystats", "admin",
+                                         "deltimer", "dbcheck"])
         & ~filters.channel
     )(_on_text)
