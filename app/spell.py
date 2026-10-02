@@ -77,6 +77,9 @@ async def _title_vocab(session_factory) -> frozenset[str]:
         async with session_factory() as session:
             rows = (await session.execute(
                 select(File.title_key).where(File.title_key.isnot(None))
+                # v10.3: bounded — most-downloaded titles first so the
+                # vocab keeps its quality without a full-table scan.
+                .order_by(File.downloads.desc()).limit(25000)
             )).scalars().all()
         for tk in rows:
             if not tk:

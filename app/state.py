@@ -245,6 +245,13 @@ class _TTLMap(dict):
 pending_dl: dict[int, int] = _TTLMap(max_size=500, ttl=1800.0)
 
 
+# --- pending searches: user id -> query text ---
+# Set when a text search hits the force-sub wall; consumed by
+# fsub_retry after the user joins so they never retype. Short-lived;
+# memory-only is fine.
+pending_search: dict[int, str] = _TTLMap(max_size=500, ttl=1800.0)
+
+
 # --- /index job registry (shared between engine and handlers) ---
 @dataclass
 class IndexJob:

@@ -444,6 +444,9 @@ async def _on_text(client: Client, message: Message):
     uid = message.from_user.id
     kb = await forcesub.ensure_joined(client, uid, chat_id=message.chat.id)
     if kb:
+        # v10.3: remember the query — "✅ I've joined" auto-runs it so
+        # the user never has to retype their search.
+        state.pending_search[uid] = message.text.strip()
         await message.reply_text(
             "📢 <b>Join our channels to use the bot</b>",
             reply_markup=kb)
@@ -451,6 +454,17 @@ async def _on_text(client: Client, message: Message):
     q = message.text.strip()
     if len(q) < 2:
         return
+    await _handle_text_query(client, message, uid, q)
+
+
+async def _handle_text_query(client: Client, message: Message,
+                             uid: int, q: str) -> None:
+    """Everything _on_text does AFTER the force-sub gate.
+
+    Shared by the live handler and fsub_retry (auto-continue after the
+    user joins). ``message`` only needs ``reply_text`` + ``chat.id`` —
+    the acting user is always ``uid``.
+    """
     pm = _is_pm(message.chat.id)
     asyncio.create_task(log_event("search", user_id=uid,
                                   chat_id=message.chat.id))

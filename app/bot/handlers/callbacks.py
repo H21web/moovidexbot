@@ -226,17 +226,20 @@ async def _deliver(client: Client, query):
         return
     src = query.message.chat
     in_group = src.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    try:
+        file_db_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
     kb = await forcesub.ensure_joined(client, uid, chat_id=src.id)
     if kb:
+        # v10.2.1: remember which file they wanted — "✅ I've joined"
+        # auto-delivers it instead of making them tap download again.
+        state.pending_dl[uid] = file_db_id
         # Reuse the card message: swap its content for the join prompt.
         await _safe_edit(
             query.message,
             "📢 <b>Join our channels to download</b>",
             reply_markup=kb)
-        return
-    try:
-        file_db_id = int(query.data.split(":")[1])
-    except (ValueError, IndexError):
         return
     f = await _get_file(file_db_id)
     if not f:
@@ -397,13 +400,28 @@ async def _fsub_retry(client: Client, query):
                            show_alert=True)
     else:
         await query.answer("✅ All joined!", show_alert=True)
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        # Deep-link flow: user came from a group file button via
-        # /start dl_<id> — deliver the waiting file now.
+        # v10.2.1: auto-deliver the waiting file (download / deep-link).
+        # v10.3: auto-continue the waiting search — no retyping.
         dl_id = state.pending_dl.pop(uid, None)
+        q = state.pending_search.pop(uid, None)
+        if q:
+            # Turn the join prompt into a status line (photo-safe), then
+            # run the normal search flow against it.
+            await _safe_edit(
+                query.message,
+                "✅ <i>All joined — continuing your search…</i>")
+            try:
+                from app.bot.handlers import search as search_handlers
+                await search_handlers._handle_text_query(
+                    client, query.message, uid, q)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("post-join search failed for user %d: %s",
+                            uid, exc)
+        else:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
         if dl_id:
             f = await _get_file(dl_id)
             if f:
@@ -418,7 +436,7 @@ async def _fsub_retry(client: Client, query):
                                  "Try again later.")
                     except Exception:
                         pass
-        else:
+        if not dl_id and not q:
             # The join prompt is gone and this callback carries no
             # results token — point the user back to search.
             try:
