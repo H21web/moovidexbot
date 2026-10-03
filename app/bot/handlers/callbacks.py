@@ -367,6 +367,59 @@ async def _ait(client: Client, query):
         log.exception("ait choose-flow failed")
 
 
+async def _ais(client: Client, query):
+    """AI suggestion picker: ``ais:{token}:{idx}`` / ``ais:{token}:req``.
+
+    v10.8.8: the titles had no files, so tapping one saves THAT title
+    as a movie request; ``req`` saves the ORIGINAL search instead.
+    """
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    try:
+        _, token, action = query.data.split(":")
+    except (ValueError, AttributeError):
+        return
+    data = state.ait_tokens.pop(token, None)
+    if not data or data.get("uid") != uid:
+        await query.answer("⌛ Expired — search again.", show_alert=True)
+        return
+    sid = data.get("sid")
+    original = data.get("original") or ""
+    titles = data.get("titles") or []
+    if action == "req":
+        wanted = original
+    else:
+        try:
+            wanted = titles[int(action)]
+        except (ValueError, IndexError, TypeError):
+            await query.answer("⌛ Expired — search again.",
+                               show_alert=True)
+            return
+    if not (wanted or "").strip():
+        await query.answer("⌛ Expired — search again.", show_alert=True)
+        return
+    await query.answer("🎞 Saving as request…")
+    log.info("[s:%s] ai-suggest: requesting %r", sid, wanted[:60])
+    try:
+        from app.bot.handlers.requests import submit_request
+        await submit_request(client, uid, query.message.chat.id, wanted)
+    except Exception:  # noqa: BLE001
+        log.exception("ais request submit failed")
+        await query.message.reply_text("❌ Could not save your request — "
+                                       "try again later.")
+        return
+    try:
+        await query.message.edit_text(
+            "✅ <b>Request submitted!</b>\n\n"
+            f"🎬 <b>{ui.esc(wanted[:80])}</b>\n"
+            "<i>We'll try to add it soon.</i>",
+            parse_mode=ParseMode.HTML)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _fsub_retry(client: Client, query):
     uid = query.from_user.id
     kb = await forcesub.ensure_joined(client, uid,
@@ -545,6 +598,7 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
     bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
     bot.on_callback_query(filters.regex(r"^ait:"))(_ait)
+    bot.on_callback_query(filters.regex(r"^ais:"))(_ais)
     bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
     bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
     bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)

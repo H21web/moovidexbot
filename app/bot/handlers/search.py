@@ -138,6 +138,44 @@ async def _ai_choose(client: Client, wait: Message, uid: int,
     return True
 
 
+async def _ai_suggest(client: Client, wait: Message, uid: int,
+                      res: dict, group: bool = False) -> bool:
+    """v10.8.8: JustWatch/AI returned titles but none have files.
+
+    Show them as tappable buttons — tapping a title requests THAT
+    title; "request instead" requests the original message text.
+    """
+    suggestions = res.get("suggestions") or []
+    original_q = res.get("raw") or ""
+    sid = res.get("sid")
+    token = secrets.token_hex(8)
+    state.ait_tokens[token] = {"uid": uid, "original": original_q,
+                               "titles": [s["title"] for s in suggestions],
+                               "sid": sid, "group": group}
+    rows = []
+    for i, s in enumerate(suggestions[:5]):
+        label = s["title"][:40]
+        if s.get("year"):
+            label += f" ({s['year']})"
+        rows.append([InlineKeyboardButton(
+            f"🎬 {label}", callback_data=f"ais:{token}:{i}")])
+    rows.append([InlineKeyboardButton("📝 None — request my text instead",
+                                      callback_data=f"ais:{token}:req")])
+    kb = InlineKeyboardMarkup(rows)
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    log.info("[s:%s] flow: suggest %d titles (original %r)", sid,
+             len(suggestions), original_q[:60])
+    await wait.reply_text(
+        "🤔 <b>No files found — did you mean one of these?</b>\n\n"
+        f"<i>Nothing in the library for {ui.esc(original_q[:60])}. "
+        "Tap a title to request it:</i>",
+        reply_markup=kb, parse_mode=ParseMode.HTML)
+    return True
+
+
 async def _build_v8(client: Client, token: str,
                   uid: int, page: int = 0) -> tuple[str, object] | tuple[None, None]:
     """Build the (text, keyboard) for a v8 results session.
@@ -237,6 +275,8 @@ async def _v9_search_flow(client: Client, message: Message,
     sid = res.get("sid")
     if res.get("status") == "choose" and not _confirmed:
         return await _ai_choose(client, wait, uid, res)
+    if res.get("status") == "suggest" and not _confirmed:
+        return await _ai_suggest(client, wait, uid, res)
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
         log.info("[s:%s] flow: no results -> request card", sid)
         try:
@@ -328,6 +368,8 @@ async def _v9_search_flow_group(client: Client, message: Message,
         return
     if res.get("status") == "choose":
         return await _ai_choose(client, wait, uid, res, group=True)
+    if res.get("status") == "suggest":
+        return await _ai_suggest(client, wait, uid, res, group=True)
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
         try:
             await wait.delete()

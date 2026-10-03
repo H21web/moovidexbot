@@ -191,13 +191,15 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
        only), 1-5 titles; each verified against the DB.
     4. Exactly one verified title -> use it directly.
        Several verified titles -> ``status="choose"`` (user picks).
+       Titles found but none with files -> ``status="suggest"``
+       (tappable buttons; tap = request that title).
        None -> ``no_results``.
 
     Returns ``{"status", "files", "best", "best_reasons", "title",
     "parsed", "confidence", "corrected", "corrected_via", "sid",
-    "choices", "raw"}``; status is
-    ``"ok" | "uncertain" | "no_results" | "choose"``.
-    ``corrected_via`` is ``"justwatch" | "web" | "ai" | None``; ``sid``
+    "choices", "suggestions", "raw"}``; status is
+    ``"ok" | "uncertain" | "no_results" | "choose" | "suggest"``.
+    ``corrected_via`` is ``"justwatch" | "ai" | None``; ``sid``
     is the per-search trace id used in the log lines.
     """
     t0 = _time.time()
@@ -221,6 +223,16 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     # --- 2. JustWatch title API (free, clean titles) ---------------------
     # --- 3. Grok AI title extraction (only if JustWatch found nothing) --
     choices: list[dict] = []
+    suggestions: list[dict] = []  # titles with no DB files -> suggest card
+    seen_sug: set[str] = set()
+
+    def _suggest(title: str, year: int | None, typ: str | None) -> None:
+        k = (title or "").strip().lower()
+        if k and k not in seen_sug:
+            seen_sug.add(k)
+            suggestions.append({"title": (title or "").strip(),
+                                "year": year, "type": typ})
+
     if not merged:
         from app import enrich as enrich_mod
         try:
@@ -245,6 +257,8 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                                 "reason": "justwatch",
                                 "via": "justwatch",
                                 "hits": retry, "parsed": t_parsed})
+            else:
+                _suggest(jt["title"], jt.get("year"), jt.get("type"))
         if not choices:
             log.info("[s:%s] grok: asking (original query only) (%dms)",
                      sid, el())
@@ -275,6 +289,8 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                                     "reason": t.get("reason"),
                                     "via": "ai",
                                     "hits": retry, "parsed": t_parsed})
+                else:
+                    _suggest(t["title"], t.get("year"), t.get("type"))
         if len(choices) == 1:
             c = choices[0]
             merged, score = c["hits"], _best_score(c["hits"])
@@ -295,7 +311,18 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                     "choices": [{"title": c["title"], "year": c["year"],
                                  "type": c["type"], "reason": c["reason"]}
                                 for c in choices],
-                    "raw": raw}
+                    "suggestions": [], "raw": raw}
+        elif suggestions:
+            # Titles were found (JustWatch/AI) but none have files —
+            # show them as tappable buttons so the user can pick one
+            # to request, instead of a dead "try a different spelling".
+            log.info("[s:%s] suggest: %d titles, no files (%dms)", sid,
+                     len(suggestions), el())
+            return {"status": "suggest", "files": [], "best": None,
+                    "best_reasons": [], "title": title, "parsed": parsed,
+                    "confidence": 0.0, "corrected": None,
+                    "corrected_via": None, "sid": sid, "choices": [],
+                    "suggestions": suggestions[:5], "raw": raw}
 
     items = list(merged.values())
     if not items:
@@ -305,7 +332,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                 "best_reasons": [], "title": title, "parsed": parsed,
                 "confidence": 0.0, "corrected": corrected,
                 "corrected_via": corrected_via, "sid": sid,
-                "choices": [], "raw": raw}
+                "choices": [], "suggestions": [], "raw": raw}
 
     # --- rerank: taste -> score/quality/size ---------------------------
     try:
