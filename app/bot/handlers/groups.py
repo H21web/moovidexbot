@@ -102,6 +102,7 @@ def _panel_kb(g: Group) -> InlineKeyboardMarkup:
     ad_label = next((l for l, s in AD_CHOICES if s == ad), f"{ad // 60}m")
     fsub = (g.settings or {}).get("force_sub") or []
     welcome = (g.settings or {}).get("welcome")
+    imdb = (g.settings or {}).get("imdb_enabled", True)
     rows = [
         [InlineKeyboardButton(f"🗑 Auto-delete: {ad_label}",
                               callback_data=f"grpadmenu:{g.id}")],
@@ -111,6 +112,9 @@ def _panel_kb(g: Group) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             f"👋 Welcome: {'set' if welcome else 'off'}",
             callback_data=f"grpwelcome:{g.id}")],
+        [InlineKeyboardButton(
+            f"🎬 IMDB info: {'ON' if imdb else 'OFF'}",
+            callback_data=f"grpimdb:{g.id}")],
         [InlineKeyboardButton("🔌 Disconnect",
                               callback_data=f"grpdel:{g.id}")],
         [InlineKeyboardButton("⬅️ All groups", callback_data="grplist")],
@@ -123,12 +127,33 @@ def _panel_text(g: Group) -> str:
     ad = int(s.get("autodelete_seconds") or 0)
     ad_txt = "off" if not ad else f"{ad // 60} min"
     fsub = s.get("force_sub") or []
+    imdb = s.get("imdb_enabled", True)
     return (
-        f"👪 <b>{g.title or g.id}</b>\n<code>{g.id}</code>\n\n"
+        f"👪 <b>{ui.esc(g.title or str(g.id))}</b>\n<code>{g.id}</code>\n\n"
         f"🗑 Auto-delete: <b>{ad_txt}</b>\n"
-        f"📢 Force-sub: <b>{', '.join(fsub) if fsub else 'off'}</b>\n"
-        f"👋 Welcome: <b>{'set' if s.get('welcome') else 'off'}</b>"
+        f"📢 Force-sub: <b>{ui.esc(', '.join(fsub) if fsub else 'off')}</b>\n"
+        f"👋 Welcome: <b>{'set' if s.get('welcome') else 'off'}</b>\n"
+        f"🎬 IMDB info: <b>{'ON' if imdb else 'OFF'}</b>"
     )
+
+
+def _can_manage(uid: int | None, g: Group | None) -> bool:
+    """Bot admin, or the group admin who connected this group."""
+    if not uid or not g:
+        return False
+    if settings.is_admin(uid):
+        return True
+    return (g.settings or {}).get("connected_by") == uid
+
+
+async def _manageable_groups(uid: int) -> list[Group]:
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        rows = (await s.execute(select(Group).order_by(Group.title))).all()
+        groups = [r[0] for r in rows]
+    if settings.is_admin(uid):
+        return groups
+    return [g for g in groups if _can_manage(uid, g)]
 
 
 # ---------- /connect (in group) ----------
@@ -168,17 +193,18 @@ async def _bot_added(client: Client, message: Message):
             pass
 
 
-# ---------- /groups (PM, bot admin) ----------
+# ---------- /groups (PM) ----------
 
-@admin_only
 async def _groups(client: Client, message: Message):
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        rows = (await s.execute(select(Group).order_by(Group.title))).all()
-        groups = [r[0] for r in rows]
+    """v10.10.1: any user sees the groups THEY connected; the bot admin
+    sees everything."""
+    uid = message.from_user.id if message.from_user else None
+    groups = await _manageable_groups(uid) if uid else []
     if not groups:
         await message.reply_text(
-            "No groups connected yet.\nAdd me to a group and run /connect there.")
+            "No groups connected yet.\n"
+            "Add me to your group as admin, run /connect there, "
+            "then manage it from here 👇")
         return
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"👪 {(g.title or g.id)}"[:40],
@@ -200,10 +226,8 @@ async def _grp_open(client: Client, query):
 
 
 async def _grp_list(client: Client, query):
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        rows = (await s.execute(select(Group).order_by(Group.title))).all()
-        groups = [r[0] for r in rows]
+    uid = query.from_user.id if query.from_user else None
+    groups = await _manageable_groups(uid) if uid else []
     if not groups:
         await query.message.edit_text("No groups connected yet.")
         return
@@ -349,6 +373,43 @@ def _admin_cb(func):
     return wrapper
 
 
+def _mgr_cb(func):
+    """v10.10.1: the bot admin, or the group admin who connected it."""
+    async def wrapper(client: Client, query):
+        uid = query.from_user.id if query.from_user else None
+        if settings.is_admin(uid):
+            return await func(client, query)
+        gid = None
+        try:
+            gid = int((query.data or "").split(":")[1])
+        except (ValueError, IndexError):
+            pass
+        g = await _get_group(gid) if gid else None
+        if not _can_manage(uid, g):
+            await query.answer("⛔ Only this group's admin can do that.",
+                               show_alert=True)
+            return
+        return await func(client, query)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+async def _grp_imdb(client: Client, query):
+    """Toggle per-group IMDB info/posters."""
+    gid = int(query.data.split(":")[1])
+    g = await _get_group(gid)
+    if not g:
+        await query.answer("Group not found.", show_alert=True)
+        return
+    cur = bool((g.settings or {}).get("imdb_enabled", True))
+    await _save_group(gid, None,
+                      mutate=lambda s: {**s, "imdb_enabled": not cur})
+    g = await _get_group(gid)
+    await query.message.edit_text(_panel_text(g), reply_markup=_panel_kb(g),
+                                  parse_mode=ParseMode.HTML)
+    await query.answer(f"🎬 IMDB {'ON' if not cur else 'OFF'}")
+
+
 def register(bot: Client) -> None:
     bot.on_message(filters.group & filters.command("connect"))(_connect)
     bot.on_message(filters.group & filters.new_chat_members)(_bot_added)
@@ -357,17 +418,18 @@ def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.text,
                    group=-1)(_pending_reply)
 
-    bot.on_callback_query(filters.regex(r"^grp:\d+$"))(_admin_cb(_grp_open))
-    bot.on_callback_query(filters.regex(r"^grplist$"))(_admin_cb(_grp_list))
-    bot.on_callback_query(filters.regex(r"^grpadmenu:\d+$"))(_admin_cb(_ad_menu))
-    bot.on_callback_query(filters.regex(r"^grpad:\d+:\d+$"))(_admin_cb(_ad_set))
+    bot.on_callback_query(filters.regex(r"^grp:\d+$"))(_mgr_cb(_grp_open))
+    bot.on_callback_query(filters.regex(r"^grplist$"))(_grp_list)
+    bot.on_callback_query(filters.regex(r"^grpadmenu:\d+$"))(_mgr_cb(_ad_menu))
+    bot.on_callback_query(filters.regex(r"^grpad:\d+:\d+$"))(_mgr_cb(_ad_set))
     bot.on_callback_query(filters.regex(r"^grpfsub:\d+$"))(
-        _admin_cb(lambda c, q: _ask_reply(
+        _mgr_cb(lambda c, q: _ask_reply(
             c, q, "fsub",
             "📢 Send the force-sub channels (comma separated @usernames), or <code>off</code> to clear.")))
     bot.on_callback_query(filters.regex(r"^grpwelcome:\d+$"))(
-        _admin_cb(lambda c, q: _ask_reply(
+        _mgr_cb(lambda c, q: _ask_reply(
             c, q, "welcome",
             "👋 Send the welcome text for new members, or <code>off</code> to clear.")))
-    bot.on_callback_query(filters.regex(r"^grpdel:\d+$"))(_admin_cb(_grp_del))
-    bot.on_callback_query(filters.regex(r"^grpdelok:\d+$"))(_admin_cb(_grp_del_ok))
+    bot.on_callback_query(filters.regex(r"^grpimdb:\d+$"))(_mgr_cb(_grp_imdb))
+    bot.on_callback_query(filters.regex(r"^grpdel:\d+$"))(_mgr_cb(_grp_del))
+    bot.on_callback_query(filters.regex(r"^grpdelok:\d+$"))(_mgr_cb(_grp_del_ok))

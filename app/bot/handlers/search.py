@@ -207,6 +207,60 @@ async def _build_v8(client: Client, token: str,
     return text, kb
 
 
+async def _edit_via_botapi(message: Message, text: str,
+                           kb, img_url: str) -> bool:
+    """Edit via Bot API HTTP to force the link preview ABOVE the text.
+
+    v10.10.1: Pyrogram 2.0.106 doesn't expose ``show_above_text`` —
+    the Bot API does. Falls back to False so the caller can use the
+    normal MTProto edit.
+    """
+    try:
+        import httpx
+
+        token = settings.BOT_TOKEN
+        if not token:
+            return False
+        kb_dict = None
+        if kb is not None:
+            rows = []
+            for row in kb.inline_keyboard:
+                brow = []
+                for b in row:
+                    bd = {"text": b.text}
+                    if getattr(b, "url", None):
+                        bd["url"] = b.url
+                    elif getattr(b, "callback_data", None):
+                        bd["callback_data"] = b.callback_data
+                    else:
+                        continue
+                    brow.append(bd)
+                if brow:
+                    rows.append(brow)
+            kb_dict = {"inline_keyboard": rows} if rows else None
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={
+                    "chat_id": message.chat.id,
+                    "message_id": message.id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": kb_dict,
+                    "link_preview_options": {
+                        "url": img_url,
+                        "show_above_text": True,
+                    },
+                })
+            if r.status_code != 200:
+                log.debug("botapi edit %d: %s", r.status_code,
+                          r.text[:200])
+            return r.status_code == 200
+    except Exception as exc:  # noqa: BLE001
+        log.debug("botapi edit failed: %s", exc)
+        return False
+
+
 async def render_v8_results(client: Client, message: Message,
                         token: str, uid: int, page: int = 0) -> None:
     """Render (or re-render) a v8 results message: best pick + list."""
@@ -225,11 +279,16 @@ async def render_v8_results(client: Client, message: Message,
     # to a poster/backdrop image — that renders the big preview on top.
     # Without an image the preview stays off (avoids junk t.me previews).
     meta = data.get("meta") or {}
-    allow_preview = bool(meta.get("backdrop_url") or meta.get("poster_url"))
+    img = meta.get("backdrop_url") or meta.get("poster_url")
+    if img:
+        # v10.10.1: Bot API edit forces the preview ABOVE the text
+        # (Pyrogram can't set show_above_text).
+        if await _edit_via_botapi(message, text, kb, img):
+            return
     try:
         await message.edit_text(text, reply_markup=kb,
                                 parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=not allow_preview)
+                                disable_web_page_preview=not img)
     except Exception:
         log.debug("v8 render edit failed", exc_info=True)
 
@@ -354,6 +413,26 @@ async def _search_and_send(client: Client, chat_id: int, uid: int,
     return True
 
 
+async def _group_imdb_enabled(chat_id: int) -> bool:
+    """Per-group IMDB info toggle (default ON)."""
+    try:
+        from sqlalchemy import select
+
+        from app.db import get_session_factory
+        from app.models import Group
+
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            g = (await s.execute(
+                select(Group).where(Group.id == chat_id)
+            )).scalar_one_or_none()
+            if g and g.settings:
+                return bool(g.settings.get("imdb_enabled", True))
+    except Exception:
+        pass
+    return True
+
+
 async def _v9_search_flow_group(client: Client, message: Message,
                                 uid: int, q: str) -> None:
     """v10.2 group search: the SAME v8 card model as PM (unified UI).
@@ -413,9 +492,12 @@ async def _v9_search_flow_group(client: Client, message: Message,
         ad = await effective_autodelete(int(message.chat.id))
         if ad > 0:
             await autodelete.schedule(int(message.chat.id), sent.id, ad)
-        asyncio.create_task(_fill_meta(client, sent, token, uid,
-                                       res["title"] or q,
-                                       res["parsed"].get("year")))
+        # v10.10.1: per-group IMDB toggle — skip posters/info when off.
+        imdb_on = await _group_imdb_enabled(int(message.chat.id))
+        if imdb_on:
+            asyncio.create_task(_fill_meta(client, sent, token, uid,
+                                           res["title"] or q,
+                                           res["parsed"].get("year")))
 
 
 async def _fill_meta(client: Client, message: Message, token: str,

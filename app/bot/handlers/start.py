@@ -16,7 +16,7 @@ from app.bot.handlers.common import is_banned, track_user
 from app import runtime as rt
 from app.config import settings
 from app.db import get_session_factory
-from app.models import File
+from app.models import File, Group, User
 from app.search import get_trending
 
 log = logging.getLogger(__name__)
@@ -28,16 +28,21 @@ START_TEXT = (
 )
 
 HELP_TEXT = (
-    "❓ <b>Help</b>\n\n"
-    "🔍 <b>Search</b> — just type the movie name.\n"
-    "   Filters: <code>1080p</code> <code>720p</code> <code>4k</code> "
-    "<code>hindi</code> <code>malayalam</code> <code>tamil</code> "
-    "<code>2024</code> <code>s01 e02</code>\n\n"
-    "✨ <b>Smart for you</b> — results order themselves by your taste "
-    "as you download. /settings to control it.\n"
-    "🎞 <b>Request</b> — <code>/request Movie Name 2024</code>\n"
-    "📊 <b>Trending</b> — /trending\n\n"
-    "⚙️ <b>Admin</b>: /index /stats /broadcast /ban /unban /warn /requests /groups"
+    "❓ <b>How to use Moovidex</b>\n\n"
+    "🔍 <b>Search</b>\n"
+    "Just type a movie or series name, like <code>avengers</code>.\n"
+    "Add filters if you want: <code>dune 1080p hindi 2024</code>\n\n"
+    "⭐ <b>Best pick</b>\n"
+    "The top result is picked for you — tap a quality button "
+    "to get the file.\n\n"
+    "📊 <b>Trending</b>\n"
+    "See what everyone is searching this week.\n\n"
+    "🎞 <b>Request</b>\n"
+    "<code>/request Movie Name 2024</code> — we'll try to add it.\n\n"
+    "👤 <b>My Account</b>\n"
+    "Your stats, saved files and taste preferences.\n\n"
+    "💡 <b>Tip:</b> the more you download, the smarter your "
+    "results get."
 )
 
 
@@ -146,10 +151,18 @@ async def _file_count(client: Client, query):
 # v10.9.0: My Account
 # ---------------------------------------------------------------------------
 
+async def _get_user_row(uid: int):
+    """Fetch the User row directly (never via the bot's own message)."""
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        return (await s.execute(
+            select(User).where(User.id == uid))).scalar_one_or_none()
+
+
 async def _account_text(uid: int, user) -> str:
-    """Build the My Account panel text."""
+    """Build the My Account panel text — the USER's details."""
     from app import ai as ai_mod
-    from app.models import EventLog, SearchLog, User
+    from app.models import EventLog, SearchLog
 
     name = ui.esc((user.first_name if user else "") or "—")
     username = f"@{ui.esc(user.username)}" if user and user.username else "—"
@@ -166,24 +179,34 @@ async def _account_text(uid: int, user) -> str:
             select(func.count(EventLog.id)).where(
                 EventLog.kind == "download",
                 EventLog.user_id == uid))).scalar() or 0
-    return (
+        # v10.10.1: groups this user connected (group admin).
+        my_groups = (await s.execute(select(Group))).scalars().all()
+        my_groups = [g for g in my_groups
+                     if (g.settings or {}).get("connected_by") == uid]
+    text = (
         "👤 <b>My Account</b>\n\n"
-        f"🙋 <b>{name}</b> ({username})\n"
-        f"🆔 <code>{uid}</code>\n"
-        f"📅 With us since {since}\n\n"
+        f"🙋 <b>{name}</b>\n"
+        f"🔖 Username: {username}\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"📅 Joined: {since}\n\n"
         f"🤖 AI searches: <b>{ai_left}/{ai_total}</b> left today\n"
         f"🔍 Total searches: <b>{n_search:,}</b>\n"
         f"📥 Total downloads: <b>{n_dl:,}</b>"
     )
+    return text, my_groups
 
 
-def _account_kb() -> InlineKeyboardMarkup:
+def _account_kb(has_groups: bool = False) -> InlineKeyboardMarkup:
     from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💾 Saved", callback_data="acc:saved"),
-         InlineKeyboardButton("🎨 Preference", callback_data="acc:prefs")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="acc:home")],
-    ])
+    rows = [[
+        InlineKeyboardButton("💾 Saved", callback_data="acc:saved"),
+        InlineKeyboardButton("🎨 Preference", callback_data="acc:prefs"),
+    ]]
+    if has_groups:
+        rows.append([InlineKeyboardButton("👪 My Groups",
+                                          callback_data="acc:groups")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="acc:start")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _acc_cb(client: Client, query):
@@ -249,14 +272,48 @@ async def _acc_cb(client: Client, query):
         except Exception:
             pass
         return
-    # "acc" / "acc:home" -> account home
+    if action == "groups":
+        # v10.10.1: groups this user connected -> manage from here.
+        await query.answer()
+        from app.bot.handlers.groups import _get_group  # noqa
+        user = await _get_user_row(uid)
+        _, my_groups = await _account_text(uid, user)
+        if not my_groups:
+            await query.answer("No groups connected yet.", show_alert=True)
+            return
+        from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                f"👪 {(g.title or g.id)}"[:40],
+                callback_data=f"grp:{g.id}")]
+             for g in my_groups[:20]]
+            + [[InlineKeyboardButton("⬅️ Back", callback_data="acc")]])
+        try:
+            await query.message.edit_text(
+                "👪 <b>My Groups</b> — tap to manage:",
+                reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+    if action == "start":
+        # v10.10.1: back to the /start home.
+        await query.answer()
+        try:
+            await query.message.edit_text(
+                START_TEXT, reply_markup=ui.start_kb(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+        except Exception:
+            pass
+        return
+    # "acc" / "acc:home" -> account home (the USER's details).
     await query.answer()
-    user = await track_user(query.message)
-    text = await _account_text(uid, user)
+    user = await _get_user_row(uid)
+    text, my_groups = await _account_text(uid, user)
     try:
-        await query.message.edit_text(text, reply_markup=_account_kb(),
-                                      parse_mode=ParseMode.HTML,
-                                      disable_web_page_preview=True)
+        await query.message.edit_text(
+            text, reply_markup=_account_kb(bool(my_groups)),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception:
         pass
 

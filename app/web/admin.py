@@ -345,13 +345,29 @@ async def activity(request: Request, kind: str = "", q: str = "",
         base = select(ActivityLog)
         if kind in ACT_KINDS:
             base = base.where(ActivityLog.kind == kind)
-        if q and q.lstrip("-").isdigit():
-            base = base.where(ActivityLog.user_id == int(q))
+        uname_like = None
+        if q:
+            if q.lstrip("-").isdigit():
+                base = base.where(ActivityLog.user_id == int(q))
+            else:
+                uname_like = f"%{q.lstrip('@')}%"
+                base = base.where(ActivityLog.user_id.in_(
+                    select(User.id).where(User.username.ilike(uname_like))))
         total = (await s.execute(
             select(func.count()).select_from(base.subquery()))).scalar() or 0
+        # v10.10.1: join username for display.
+        uq = (select(ActivityLog, User.username.label("uname"))
+              .outerjoin(User, User.id == ActivityLog.user_id))
+        if kind in ACT_KINDS:
+            uq = uq.where(ActivityLog.kind == kind)
+        if q:
+            if q.lstrip("-").isdigit():
+                uq = uq.where(ActivityLog.user_id == int(q))
+            else:
+                uq = uq.where(User.username.ilike(f"%{q.lstrip('@')}%"))
         rows = (await s.execute(
-            base.order_by(ActivityLog.id.desc())
-            .offset((page_num - 1) * per).limit(per))).scalars().all()
+            uq.order_by(ActivityLog.id.desc())
+            .offset((page_num - 1) * per).limit(per))).all()
 
     tabs = (f"<a class='btn sm {'green' if not kind else 'grey'}' "
             f"href='/admin/activity'>all</a> ")
@@ -360,15 +376,20 @@ async def activity(request: Request, kind: str = "", q: str = "",
         f"href='/admin/activity?kind={k}'>{ACT_ICONS.get(k, '')} {k}</a>"
         for k in ACT_KINDS)
     lines = ""
-    for r in rows:
+    for r, uname in rows:
         ts = esc(str(r.created_at)[:19] if r.created_at else "—")
         color = ACT_COLORS.get(r.kind, "#8fa0bd")
         icon = ACT_ICONS.get(r.kind, "📝")
+        who = (f"<code>{r.user_id}</code>"
+               + (f" @{esc(uname)}" if uname else ""))
+        chat = (f"<span class='usr'>{'👪' if r.chat_id and r.chat_id < 0 else '👤'}"
+                f"<code>{r.chat_id or '—'}</code></span>")
         lines += (
             "<div class='logline'>"
             f"<span class='ts'>{ts}</span>"
             f"<span class='kind' style='color:{color}'>{icon} {esc(r.kind)}</span>"
-            f"<span class='usr'><code>{r.user_id or '—'}</code></span>"
+            f"<span class='usr'>{who}</span>"
+            f"{chat}"
             f"<span class='det'>{_render_detail(r.kind, r.detail or '')}</span>"
             "</div>")
     if not lines:
@@ -387,7 +408,7 @@ async def activity(request: Request, kind: str = "", q: str = "",
     body = (f"<h2>📝 Activity log</h2><style>{_LOG_CSS}</style>"
             f"<div class='pager'>{tabs}</div>"
             "<form method='get'><div class='row'><div>"
-            "<input type='text' name='q' placeholder='Filter by user id…' "
+            "<input type='text' name='q' placeholder='Filter by user id or @username…' "
             f"value='{esc(q)}'>"
             + (f"<input type='hidden' name='kind' value='{esc(kind)}'>"
                if kind else "") +
