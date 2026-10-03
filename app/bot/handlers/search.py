@@ -47,20 +47,16 @@ async def _get_bot_username(client: Client) -> str | None:
     return _bot_username
 
 
-def _verdict_line(best: dict, title: str) -> str:
-    """One-line best-pick note. Local only — no AI, no quota.
+def _verdict_line(best: dict) -> str:
+    """Tiny best-pick note. Empty unless something is worth saying.
 
-    (moved from app.ai_assist, which is deleted.) Always returns a
-    non-empty line, so the verdict renders on every result.
+    v10.10.2: kept small — the quality/language already sit on the
+    meta line, so the verdict only speaks up for popular picks.
     """
     dl = (best or {}).get("downloads") or 0
-    if dl:
-        return f"Most downloaded pick — {dl} downloads"
-    bits = [x for x in ((best or {}).get("quality"),
-                        (best or {}).get("language")) if x]
-    if bits:
-        return f"Best {' '.join(bits)} match for \u201c{title}\u201d"
-    return f"Top match for \u201c{title}\u201d"
+    if dl >= 5:
+        return f"⬇ {dl} downloads"
+    return ""
 
 
 def _no_results_kb(base: InlineKeyboardMarkup | None = None,
@@ -79,7 +75,7 @@ def _no_results_kb(base: InlineKeyboardMarkup | None = None,
         token = secrets.token_hex(8)
         state.req_tokens[token] = {"uid": uid, "q": query,
                                    "chat_id": None, "sid": sid}
-        rows.append([InlineKeyboardButton("🎞 Request Movie",
+        rows.append([InlineKeyboardButton("📩 Request",
                                           callback_data=f"req:{token}")])
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -92,11 +88,13 @@ async def _no_results_pm(client: Client, message: Message, q: str,
     carrying the ORIGINAL user message.
     """
     log.info("[s:%s] flow: no-results card for %r", sid, q[:60])
-    text = (f"📭 <b>No results found</b>\n\n"
-            f"I looked everywhere for \"<b>{ui.esc(q[:80])}</b>\"."
-            f"\n\nTap 🎞 <b>Request Movie</b> and we'll try to add it."
-            if settings.REQUEST_CHANNEL
-            else f"\n\nTry a different spelling.")
+    if settings.REQUEST_CHANNEL:
+        text = (f"📭 <b>No results found</b>\n\n"
+                f"<i>Nothing for \"<b>{ui.esc(q[:80])}</b>\" yet.</i>")
+    else:
+        text = (f"📭 <b>No results found</b>\n\n"
+                f"<i>Nothing for \"<b>{ui.esc(q[:80])}</b>\". "
+                f"Try a different spelling.</i>")
     await message.reply_text(
         text, reply_markup=_no_results_kb(uid=uid, query=q, sid=sid),
         parse_mode=ParseMode.HTML)
@@ -122,7 +120,7 @@ async def _ai_choose(client: Client, wait: Message, uid: int,
             label += f" ({c['year']})"
         rows.append([InlineKeyboardButton(f"🎬 {label}",
                                           callback_data=f"ait:{token}:{i}")])
-    rows.append([InlineKeyboardButton("🎞 None — request instead",
+    rows.append([InlineKeyboardButton("📩 Request",
                                       callback_data=f"ait:{token}:req")])
     kb = InlineKeyboardMarkup(rows)
     try:
@@ -133,7 +131,7 @@ async def _ai_choose(client: Client, wait: Message, uid: int,
              len(choices), original_q[:60])
     await wait.reply_text(
         "🎬 <b>Which one did you mean?</b>\n\n"
-        "<i>Tap the movie/series you want:</i>",
+        "<i>Tap a title:</i>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
     return True
 
@@ -159,7 +157,7 @@ async def _ai_suggest(client: Client, wait: Message, uid: int,
             label += f" ({s['year']})"
         rows.append([InlineKeyboardButton(
             f"🎬 {label}", callback_data=f"ais:{token}:{i}")])
-    rows.append([InlineKeyboardButton("📝 None — request my text instead",
+    rows.append([InlineKeyboardButton("📩 Request",
                                       callback_data=f"ais:{token}:req")])
     kb = InlineKeyboardMarkup(rows)
     try:
@@ -169,9 +167,9 @@ async def _ai_suggest(client: Client, wait: Message, uid: int,
     log.info("[s:%s] flow: suggest %d titles (original %r)", sid,
              len(suggestions), original_q[:60])
     await wait.reply_text(
-        "🤔 <b>No files found — did you mean one of these?</b>\n\n"
-        f"<i>Nothing in the library for {ui.esc(original_q[:60])}. "
-        "Tap a title to request it:</i>",
+        "🤔 <b>No files found</b>\n\n"
+        f"<i>Nothing for \"<b>{ui.esc(original_q[:60])}</b>\" yet — "
+        "tap a title to request it:</i>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
     return True
 
@@ -354,7 +352,7 @@ async def _v9_search_flow(client: Client, message: Message,
 
     log.info("[s:%s] flow: rendering %d files", sid, len(res["files"]))
 
-    ai_note = _verdict_line(res["best"], res["title"] or q)
+    ai_note = _verdict_line(res["best"])
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -389,7 +387,7 @@ async def _search_and_send(client: Client, chat_id: int, uid: int,
         return False
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
         return False
-    ai_note = _verdict_line(res["best"], res["title"] or q)
+    ai_note = _verdict_line(res["best"])
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -468,7 +466,7 @@ async def _v9_search_flow_group(client: Client, message: Message,
                else "Try a different spelling."),
             parse_mode=ParseMode.HTML)
         return
-    ai_note = _verdict_line(res["best"], res["title"] or q)
+    ai_note = _verdict_line(res["best"])
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({

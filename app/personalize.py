@@ -359,14 +359,14 @@ async def choose_best(files: list[dict], parsed: dict,
                 lang_hit = True
             elif pref_lang and f_lang == pref_lang and not qlang:
                 score += _PICK_W["lang_pref"]
-                reasons.append(f"{f_lang} (your usual)")
+                reasons.append(f_lang)
             if qqual and f_qual == qqual:
                 score += _PICK_W["qual_query"]
                 reasons.append(f_qual)
                 qual_hit = True
             elif pref_qual and f_qual == pref_qual and not qqual:
                 score += _PICK_W["qual_pref"]
-                reasons.append(f"{f_qual} (your usual)")
+                reasons.append(f_qual)
             dls = f.get("downloads") or 0
             if dls > 0:
                 score += _PICK_W["downloads"] * _math.log10(1 + dls)

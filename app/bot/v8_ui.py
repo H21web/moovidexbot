@@ -114,10 +114,21 @@ def v8_file_kb(file_db_id: int, user_id: int):
 
 
 def _clean_disp_name(name: str) -> str:
-    """Display-clean file name: dots/underscores -> spaces, squeeze gaps."""
+    """Display-clean file name: short, no year/quality/language.
+
+    Those live on the meta line, so strip them here. Extension dropped
+    too. e.g. ``Dune.2024.1080p.BluRay.mkv`` -> ``Dune BluRay``.
+    """
     import re as _re
-    s = _re.sub(r"[._]+", " ", name or "").strip()
-    return _re.sub(r"\s+", " ", s)
+    s = (name or "").strip()
+    s = _re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|ts|m4v)$", "",
+                s, flags=_re.I)                       # extension
+    s = _re.sub(r"[._]+", " ", s).strip()             # dots -> spaces
+    s = _re.sub(r"\b(19|20)\d{2}\b", " ", s)           # year
+    s = _re.sub(r"\b(480p|720p|1080p|2160p|4320p|4[Kk])\b", " ", s)
+    s = _re.sub(r"\b(english|hindi|malayalam|tamil|telugu|kannada|"
+                r"dual(?:-audio)?|multi)\b", " ", s, flags=_re.I)
+    return _re.sub(r"\s+", " ", s).strip()
 
 
 def _v8_file_line(idx: int, f: dict, user_id: int,
@@ -204,6 +215,7 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
         start = page * V8_PAGE_SIZE
         for i, f in enumerate(files, start=start + 1):
             parts.append(_v8_file_line(i, f, user_id, bot_username))
+            parts.append("")  # v10.10.2: breathing room between files
     text = "\n".join(parts)
     # Telegram hard limit: 4096 chars. Never cut mid-HTML-tag (Telegram
     # rejects the edit) — cut back to the last complete ">" before the
