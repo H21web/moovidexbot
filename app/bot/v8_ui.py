@@ -153,7 +153,13 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     parts: list[str] = []
     if meta:
         icon = kind_icon(meta)
-        head = f"{icon} <b>{esc(meta.get('title'))}</b>"
+        # v10.8.7: the title links to the backdrop/poster image —
+        # Telegram fetches it and shows a large preview above the text.
+        title_html = f"<b>{esc(meta.get('title'))}</b>"
+        img = meta.get("backdrop_url") or meta.get("poster_url")
+        if img:
+            title_html = f'<a href="{esc(img)}">{title_html}</a>'
+        head = f"{icon} {title_html}"
         if meta.get("year"):
             head += f" ({meta['year']})"
         if meta.get("rating"):

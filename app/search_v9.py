@@ -187,11 +187,9 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     1. Clean the message, instant DB search (parallel sweeps + fuzzy
        retry inside ``_hot_sweeps``).
     2. No files -> JustWatch title API (free, clean title+year+type).
-    3. Still no files -> free web-search API title lookup
-       (typo-tolerant, "<query> movie").
-    4. Still no files -> Grok AI title extraction (original query
+    3. Still no files -> Grok AI title extraction (original query
        only), 1-5 titles; each verified against the DB.
-    5. Exactly one verified title -> use it directly.
+    4. Exactly one verified title -> use it directly.
        Several verified titles -> ``status="choose"`` (user picks).
        None -> ``no_results``.
 
@@ -221,8 +219,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
              score, el())
 
     # --- 2. JustWatch title API (free, clean titles) ---------------------
-    # --- 3. web-search API title lookup (typo-tolerant) ------------------
-    # --- 4. Grok AI title extraction (only if both found nothing) -------
+    # --- 3. Grok AI title extraction (only if JustWatch found nothing) --
     choices: list[dict] = []
     if not merged:
         from app import enrich as enrich_mod
@@ -248,25 +245,6 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                                 "reason": "justwatch",
                                 "via": "justwatch",
                                 "hits": retry, "parsed": t_parsed})
-        if not choices:
-            try:
-                web_titles = await enrich_mod.web_title_candidates(
-                    raw, limit=3)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("web title candidates failed: %s", exc)
-                web_titles = []
-            for wt in web_titles:
-                t_parsed = _with_original_filters(parse_query(wt),
-                                                  orig_parsed)
-                retry = await _hot_sweeps(user_id, wt, t_parsed,
-                                          log_q=False)
-                log.info("[s:%s] web: tried %r -> %d files (%dms)", sid,
-                         wt[:50], len(retry), el())
-                if retry:
-                    choices.append({"title": wt, "year": None,
-                                    "type": None, "reason": "web",
-                                    "via": "web",
-                                    "hits": retry, "parsed": t_parsed})
         if not choices:
             log.info("[s:%s] grok: asking (original query only) (%dms)",
                      sid, el())

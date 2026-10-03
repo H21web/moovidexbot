@@ -28,6 +28,8 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 # Per-key cooldowns: {api_key: unix_ts_until}. Set when Groq answers
 # rate_limit_exceeded for that key; the key is skipped until then.
 _KEY_COOLDOWN: dict[str, float] = {}
+# Keys rejected with 401 (invalid/revoked) — never retried in-process.
+_DEAD_KEYS: set[str] = set()
 
 
 def _groq_keys() -> list[str]:
@@ -45,9 +47,10 @@ def _groq_keys() -> list[str]:
 
 
 def _live_keys() -> list[str]:
-    """Keys not currently in rate-limit cooldown."""
+    """Keys usable right now: not dead (401) and not in cooldown."""
     now = time.time()
-    return [k for k in _groq_keys() if _KEY_COOLDOWN.get(k, 0) <= now]
+    return [k for k in _groq_keys()
+            if k not in _DEAD_KEYS and _KEY_COOLDOWN.get(k, 0) <= now]
 
 
 def _parse_retry_after(body: str) -> float:
@@ -169,10 +172,17 @@ async def groq_complete(messages: list[dict],
     tried in order when a key is rate-limited; each key has its own
     cooldown. Keys from different Groq accounts get separate daily
     token budgets (Groq TPD is per-organization).
+    v10.8.7: 401 handling — a key rejected as invalid/revoked is
+    marked dead and the next key is tried immediately; a clear
+    message is logged when every key is dead.
     """
     keys = _live_keys()
     if not keys:
-        if _groq_keys():
+        if _DEAD_KEYS:
+            log.error("groq: all %d key(s) rejected (401 invalid) — "
+                      "check GROQ_API_KEY/GROQ_API_KEYS on Render",
+                      len(_DEAD_KEYS))
+        elif _groq_keys():
             log.debug("groq: all %d key(s) in rate-limit cooldown, "
                       "skipping", len(_groq_keys()))
         return None
@@ -223,6 +233,17 @@ async def groq_complete(messages: list[dict],
                     body = exc.response.text or ""
                 except Exception:  # noqa: BLE001
                     pass
+                status = None
+                try:
+                    status = exc.response.status_code
+                except Exception:  # noqa: BLE001
+                    pass
+                if status == 401 or "invalid_api_key" in body:
+                    _DEAD_KEYS.add(key)
+                    log.warning("groq %s rejected (401 invalid key) — "
+                                "marked dead, trying next key; check the "
+                                "key on Render", tag)
+                    continue  # next key, same payload
                 if "rate_limit_exceeded" in body or "rate_limit" in body:
                     wait = _parse_retry_after(body)
                     _KEY_COOLDOWN[key] = time.time() + wait + 5
