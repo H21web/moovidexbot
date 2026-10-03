@@ -212,7 +212,8 @@ def _candidate_score(query: str, title: str, url: str) -> float:
     return score
 
 
-async def web_title_candidates(query: str, limit: int = 5) -> list[str]:
+async def web_title_candidates(query: str, limit: int = 5,
+                                 sid: str | None = None) -> list[str]:
     """Best-guess movie/series titles from web-search results.
 
     Returns cleaned titles ordered best-first, each verified to
@@ -246,8 +247,8 @@ async def web_title_candidates(query: str, limit: int = 5) -> list[str]:
         if len(out) >= limit:
             break
     if out:
-        log.info("web title candidates %r -> %r", q[:60],
-                 [t[:40] for t in out])
+        log.info("[s:%s] web candidates %r -> %r", sid or "-",
+                 q[:60], [t[:40] for t in out])
     return out
 
 

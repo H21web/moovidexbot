@@ -228,7 +228,8 @@ def _parse_title_json(raw: str | None) -> tuple[str | None, float]:
     return title.strip(), conf
 
 
-async def ai_extract_title(user_id: int | None, q: str) -> str | None:
+async def ai_extract_title(user_id: int | None, q: str,
+                           sid: str | None = None) -> str | None:
     """Ask Grok for the intended title. Original query only — never any
     search-API response. ``None`` when unconfigured, out of quota,
     low confidence, or Grok can't tell."""
@@ -250,5 +251,6 @@ async def ai_extract_title(user_id: int | None, q: str) -> str | None:
     if not title:
         return None
     await quota_use(user_id)
-    log.info("grok title %r -> %r (%.2f)", q[:60], title[:60], conf)
+    log.info("[s:%s] grok title %r -> %r (conf %.2f)", sid or "-",
+             q[:60], title[:60], conf)
     return title

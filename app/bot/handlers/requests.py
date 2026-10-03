@@ -100,6 +100,8 @@ async def _request_cb(client: Client, query):
         return
     q = data.get("q") or ""
     await query.answer("🎞 Submitting request…")
+    log.info("[s:%s] request-movie button -> submitting %r", data.get("sid"),
+             q[:60])
     try:
         rid = await submit_request(client, uid, query.message.chat.id, q)
     except Exception:  # noqa: BLE001

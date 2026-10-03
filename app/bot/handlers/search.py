@@ -68,7 +68,8 @@ def _verdict_line(best: dict, title: str) -> str:
 
 def _no_results_kb(base: InlineKeyboardMarkup | None = None,
                    uid: int | None = None,
-                   query: str | None = None
+                   query: str | None = None,
+                   sid: str | None = None
                    ) -> InlineKeyboardMarkup:
     """No-results keyboard: keep ``base`` rows, add Request Movie.
 
@@ -80,7 +81,7 @@ def _no_results_kb(base: InlineKeyboardMarkup | None = None,
     if settings.REQUEST_CHANNEL and uid is not None and query:
         token = secrets.token_hex(8)
         state.req_tokens[token] = {"uid": uid, "q": query,
-                                   "chat_id": None}
+                                   "chat_id": None, "sid": sid}
         rows.append([InlineKeyboardButton("🎞 Request Movie",
                                           callback_data=f"req:{token}")])
     return InlineKeyboardMarkup(rows) if rows else None
@@ -88,7 +89,8 @@ def _no_results_kb(base: InlineKeyboardMarkup | None = None,
 
 async def _no_results_pm(client: Client, message: Message, q: str,
                         uid: int | None = None,
-                        suggestions: list[str] | None = None):
+                        suggestions: list[str] | None = None,
+                        sid: str | None = None):
     """No-results flow for PM: TMDB correction -> spell suggestions.
 
     v9: the AI recovery chain (title correction -> retry) already ran
@@ -108,7 +110,7 @@ async def _no_results_pm(client: Client, message: Message, q: str,
                 "📭 It's not in the database yet."
             )
             await message.reply_text(
-                text, reply_markup=_no_results_kb(uid=uid, query=q),
+                text, reply_markup=_no_results_kb(uid=uid, query=q, sid=sid),
                 parse_mode=ParseMode.HTML)
             return
         try:
@@ -119,18 +121,19 @@ async def _no_results_pm(client: Client, message: Message, q: str,
             suggestions = []
     if suggestions:
         text += "\n\n<b>Did you mean:</b>"
-        kb = _no_results_kb(ui.spell_kb(suggestions), uid=uid, query=q)
+        kb = _no_results_kb(ui.spell_kb(suggestions), uid=uid, query=q, sid=sid)
     else:
         text += ("\n\nTap 🎞 <b>Request Movie</b> — we'll try to add it."
                  if settings.REQUEST_CHANNEL
                  else "\n\nTry a different spelling.")
-        kb = _no_results_kb(uid=uid, query=q)
+        kb = _no_results_kb(uid=uid, query=q, sid=sid)
     await message.reply_text(text, reply_markup=kb,
                              parse_mode=ParseMode.HTML)
 
 
 async def _did_you_mean(client: Client, wait: Message, uid: int,
-                       original_q: str, corrected_title: str) -> bool:
+                       original_q: str, corrected_title: str,
+                       sid: str | None = None) -> bool:
     """Flow diagram: a Search-API / Grok corrected title found files —
     confirm with the user before showing results.
 
@@ -139,7 +142,8 @@ async def _did_you_mean(client: Client, wait: Message, uid: int,
     """
     token = secrets.token_hex(8)
     state.dym_tokens[token] = {"uid": uid, "original": original_q,
-                               "corrected": corrected_title}
+                               "corrected": corrected_title,
+                               "sid": sid}
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Yes, show files",
                               callback_data=f"dym:{token}:yes")],
@@ -150,6 +154,8 @@ async def _did_you_mean(client: Client, wait: Message, uid: int,
         await wait.delete()
     except Exception:
         pass
+    log.info("[s:%s] flow: did-you-mean %r (original %r)", sid,
+             corrected_title[:60], original_q[:60])
     await wait.reply_text(
         f"🔍 <b>Did you mean</b>\n"
         f"🎬 <b>{ui.esc(corrected_title)}</b>\n\n"
@@ -255,20 +261,23 @@ async def _v9_search_flow(client: Client, message: Message,
     # v10: smart_search already ran the full recovery chain (spell ->
     # web title -> Grok AI). Nothing found -> Request Movie card.
     suggestions: list[str] | None = None
+    sid = res.get("sid")
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
+        log.info("[s:%s] flow: no results -> request card", sid)
         try:
             await wait.delete()
         except Exception:
             pass
         await _no_results_pm(client, message, q, uid,
-                             suggestions=suggestions)
+                             suggestions=suggestions, sid=sid)
         return True
 
     # v10.6 (flow diagram): a Search-API / Grok corrected title found
     # files — confirm before showing results.
     if not _confirmed and res.get("corrected_via") in ("web", "ai"):
         return await _did_you_mean(client, wait, uid, q,
-                                   res["title"] or q)
+                                   res["title"] or q, sid=sid)
+    log.info("[s:%s] flow: rendering %d files", sid, len(res["files"]))
 
     ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]

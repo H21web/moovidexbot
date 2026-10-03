@@ -32,6 +32,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
+import time as _time
 
 from sqlalchemy import func, select
 
@@ -199,9 +201,13 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     "parsed", "confidence", "corrected", "corrected_via"}``; status is
     ``"ok" | "uncertain" | "no_results"``. ``corrected`` is the
     auto-fixed query when a recovery stage fired (for display);
-    ``corrected_via`` is ``"spell" | "web" | "ai" | None``.
+    ``corrected_via`` is ``"spell" | "web" | "ai" | None``; ``sid`` is
+    the per-search trace id used in the log lines.
     """
+    t0 = _time.time()
+    sid = secrets.token_hex(2)
     raw = (raw or "").strip()
+    log.info("[s:%s] \u25b6 query=%r uid=%s", sid, raw[:80], user_id)
     parsed = parse_query(raw)
     parsed = await _ai_parse_if_needed(user_id, raw, parsed)
     title = (parsed.get("title") or raw).strip()
@@ -212,6 +218,9 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     corrected: str | None = None
     corrected_via: str | None = None  # "spell" | "web" | "ai"
     score = _best_score(merged)
+    el = lambda: int((_time.time() - t0) * 1000)
+    log.info("[s:%s] hot: %d files best=%.2f (%dms)", sid, len(merged),
+             score, el())
 
     # --- recovery: 1st logic — local spell correction ------------------
     if score < GOOD_SCORE:
@@ -223,13 +232,22 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
         if fixed and fixed.lower() != raw.lower():
             retry = await _hot_sweeps(user_id, fixed, parse_query(fixed),
                                       log_q=False)
-            if _best_score(retry) > score:
-                merged, score = retry, _best_score(retry)
+            rs = _best_score(retry)
+            if rs > score:
+                merged, score = retry, rs
                 corrected = fixed
                 corrected_via = "spell"
                 parsed = parse_query(fixed)
                 parsed["title"] = fixed
                 title = fixed
+                log.info("[s:%s] spell: %r -> %r (%d files best=%.2f) (%dms)",
+                         sid, raw[:50], fixed[:50], len(retry), rs, el())
+            else:
+                log.info("[s:%s] spell: %r -> %r not better "
+                         "(%.2f <= %.2f) (%dms)",
+                         sid, raw[:50], fixed[:50], rs, score, el())
+        else:
+            log.info("[s:%s] spell: no correction (%dms)", sid, el())
 
     # --- recovery: 2nd logic: Search API title candidates ----------------
     # v10.7 rework: ONLY when the DB found zero files. Candidates are
@@ -238,15 +256,19 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     # set is never hijacked by a web guess anymore.
     if not merged:
         try:
-            candidates = await enrich_mod.web_title_candidates(raw)
+            candidates = await enrich_mod.web_title_candidates(raw, sid=sid)
         except Exception as exc:  # noqa: BLE001
             log.debug("web title parse failed: %s", exc)
             candidates = []
+        log.info("[s:%s] web: %d candidate(s) %r (%dms)", sid,
+                 len(candidates), [c[:40] for c in candidates[:3]], el())
         for web_title in candidates[:3]:
             new_parsed = _with_original_filters(parse_query(web_title),
                                                 parsed)
             retry = await _hot_sweeps(user_id, web_title,
                                       new_parsed, log_q=False)
+            log.info("[s:%s] web: tried %r -> %d files (%dms)", sid,
+                     web_title[:50], len(retry), el())
             if retry:
                 merged, score = retry, _best_score(retry)
                 parsed = new_parsed
@@ -260,13 +282,17 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     # Runs only when the Search API found no usable title. The original
     # user query only is sent to Grok — never any search-API response.
     if not merged:
+        log.info("[s:%s] grok: asking (original query only) (%dms)",
+                 sid, el())
         try:
             from app import ai as ai_mod
-            ai_title = await ai_mod.ai_extract_title(user_id, raw)
+            ai_title = await ai_mod.ai_extract_title(user_id, raw, sid=sid)
         except Exception as exc:  # noqa: BLE001
             log.debug("AI title extract failed: %s", exc)
             ai_title = None
         if ai_title:
+            log.info("[s:%s] grok: %r -> trying DB (%dms)", sid,
+                     ai_title[:50], el())
             new_parsed = _with_original_filters(parse_query(ai_title),
                                                 parsed)
             retry = await _hot_sweeps(user_id, ai_title,
@@ -281,10 +307,12 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
 
     items = list(merged.values())
     if not items:
+        log.info("[s:%s] \u25c0 status=no_results title=%r (%dms)",
+                 sid, title[:60], el())
         return {"status": "no_results", "files": [], "best": None,
                 "best_reasons": [], "title": title, "parsed": parsed,
                 "confidence": 0.0, "corrected": corrected,
-                "corrected_via": corrected_via}
+                "corrected_via": corrected_via, "sid": sid}
 
     # --- rerank: taste -> score/quality/size ---------------------------
     try:
@@ -313,10 +341,11 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
 
     confidence = float(best.get("score") or 0.0)
     status = "ok" if confidence >= UNCERTAIN_SCORE else "uncertain"
-    log.info("v10 search %r: %d files, best score %.2f -> %s%s",
-             raw[:60], len(files), confidence, status,
-             f" (corrected: {corrected})" if corrected else "")
+    log.info("[s:%s] \u25c0 status=%s title=%r via=%s files=%d "
+             "best=%r (%dms)",
+             sid, status, title[:60], corrected_via, len(files),
+             (best.get("file_name") or "")[:60], el())
     return {"status": status, "files": files, "best": best,
             "best_reasons": reasons, "title": title, "parsed": parsed,
             "confidence": confidence, "corrected": corrected,
-            "corrected_via": corrected_via}
+            "corrected_via": corrected_via, "sid": sid}

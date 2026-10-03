@@ -337,10 +337,12 @@ async def _dym(client: Client, query):
     if not data or data.get("uid") != uid:
         await query.answer("⌛ Expired — search again.", show_alert=True)
         return
+    sid = data.get("sid")
     original = data.get("original") or ""
     corrected = data.get("corrected") or ""
     if action == "yes" and corrected:
         await query.answer(f"🔍 {corrected[:40]}")
+        log.info("[s:%s] dym: yes -> searching %r", sid, corrected[:60])
         try:
             await query.message.edit_text(
                 f"🔍 <i>Searching <b>{ui.esc(corrected[:80])}</b>…</i>",
@@ -356,6 +358,7 @@ async def _dym(client: Client, query):
         return
     # no -> save the original search as a movie request
     await query.answer("🎞 Saving as request…")
+    log.info("[s:%s] dym: no -> request %r", sid, original[:60])
     try:
         from app.bot.handlers.requests import submit_request
         rid = await submit_request(client, uid,
