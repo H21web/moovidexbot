@@ -38,6 +38,8 @@ Rules:
 - Never claim availability, provide links, file IDs, or ask questions.
 - Do not include language, quality, actor, director, genre, plot, or explanations.
 - Return null only if no likely title can be identified.
+- You have a browser search tool. Use it when the query is ambiguous,
+  names an actor/director, or asks about a new/recent/unknown title.
 
 Return exactly:
 {"titles":[{"title":null,"year":null,"type":null,"reason":"direct|similar|season|franchise"}]}"""
@@ -101,25 +103,35 @@ async def quota_use(user_id: int | None) -> None:
 
 
 # --- Groq call ---------------------------------------------------------------
-async def groq_complete(system: str, prompt: str,
+async def groq_complete(messages: list[dict],
                         max_tokens: int = 300,
-                        json_mode: bool = False) -> str | None:
+                        tools: list[dict] | None = None,
+                        tool_choice: str | None = None,
+                        reasoning_effort: str | None = None) -> str | None:
     """One Groq chat completion; returns the text or ``None``.
 
     v10.3.1: retry once without ``response_format`` when Groq answers
     ``json_validate_failed`` (gpt-oss-20b quirk).
+    v10.8.2: ``tools=[{"type": "browser_search"}]`` gives gpt-oss-20b
+    Groq's built-in web search (server-side, no extra setup). Note:
+    browser search is NOT compatible with ``response_format`` — never
+    combine them.
+    v10.8.3: prompt + user query go as ONE user message (better output
+    from gpt-oss-20b than split system/user).
     """
     if not is_configured():
         return None
     payload = {
         "model": settings.AI_MODEL,
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.2,
     }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice or "auto"
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     headers = {"Authorization": f"Bearer {settings.GROQ_API_KEY}"}
     try:
         r = await _get_client().post(GROQ_URL, json=payload,
@@ -131,11 +143,9 @@ async def groq_complete(system: str, prompt: str,
             body = exc.response.text or ""
         except Exception:  # noqa: BLE001
             pass
-        if json_mode and "json_validate_failed" in body:
-            log.info("groq json_validate_failed — retrying without "
-                     "response_format")
+        if "json_validate_failed" in body:
+            log.info("groq json_validate_failed — retrying once")
             try:
-                payload.pop("response_format", None)
                 r = await _get_client().post(GROQ_URL, json=payload,
                                              headers=headers)
                 r.raise_for_status()
@@ -280,8 +290,17 @@ async def ai_extract_titles(user_id: int | None, q: str,
     if await quota_remaining(user_id) <= 0:
         log.debug("ai_extract_titles: quota exhausted for %s", user_id)
         return []
-    raw = await groq_complete(TITLE_LIST_SYSTEM, q[:200], max_tokens=400,
-                              json_mode=False)
+    # v10.8.3: prompt + query as ONE user message.
+    content = f"{TITLE_LIST_SYSTEM}\n\nUser search:\n\"{q[:200]}\""
+    messages = [{"role": "user", "content": content}]
+    raw = await groq_complete(messages, max_tokens=800,
+                              tools=[{"type": "browser_search"}],
+                              tool_choice="required",
+                              reasoning_effort="low")
+    if raw is None:
+        log.info("[s:%s] grok: no response (API failed)", sid or "-")
+        return []
+    log.info("[s:%s] grok raw response: %r", sid or "-", raw[:800])
     titles = _parse_title_list(raw, q)
     if not titles:
         log.info("[s:%s] grok: no title identified for %r", sid or "-",

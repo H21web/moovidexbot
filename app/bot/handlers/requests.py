@@ -43,9 +43,12 @@ async def submit_request(client: Client, user_id: int, chat_id: int,
             await client.send_message(
                 target,
                 f"🎞 <b>New request #{rid}</b>\n"
-                f"From: {who}\n{text[:400]}")
+                f"From: {who}\n{ui_esc(text[:400])}",
+                parse_mode=ParseMode.HTML)
+            log.info("request #%d posted to %s", rid, target)
         except Exception as exc:  # noqa: BLE001
-            log.debug("request notify failed: %s", exc)
+            log.warning("request #%d notify to %s failed: %s",
+                        rid, target, exc)
     return rid
 
 
@@ -64,7 +67,8 @@ async def _request(client: Client, message: Message):
         # interactive: ask for the name
         await message.reply_text(
             "🎞 <b>What movie should I add?</b>\n"
-            "Reply with <code>/request Movie Name 2024</code>")
+            "Reply with <code>/request Movie Name 2024</code>",
+            parse_mode=ParseMode.HTML)
         return
     rid = await submit_request(client, message.from_user.id,
                                message.chat.id, text,
@@ -104,6 +108,8 @@ async def _request_cb(client: Client, query):
              q[:60])
     try:
         rid = await submit_request(client, uid, query.message.chat.id, q)
+        log.info("[s:%s] request-movie button -> saved as request #%d",
+                 data.get("sid"), rid)
     except Exception:  # noqa: BLE001
         log.exception("request submit failed")
         await query.message.reply_text("❌ Could not save your request — "
