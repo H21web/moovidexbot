@@ -251,3 +251,72 @@ async def web_title_candidates(query: str, limit: int = 3) -> list[str]:
         log.info("web title candidates %r -> %r", q[:60],
                  [t[:40] for t in out])
     return out
+
+
+# --- JustWatch title API (v10.8.5) --------------------------------------------
+# https://imdb.iamidiotareyoutoo.com/justwatch?q=<query>&L=en_IN
+# Clean structured titles (no scraping): title, year, type (MOVIE/SHOW),
+# posters. Used BEFORE the web-search API and Groq — free and fast.
+# Note: this API does NOT fuzzy-match typos ("kerma" returns unrelated
+# titles), so results are sanity-checked against the query; the
+# web-search stage stays as the typo-tolerant fallback.
+_JW_BASE = "https://imdb.iamidiotareyoutoo.com/justwatch"
+
+
+def _norm_alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
+    """Title candidates from the JustWatch API.
+
+    Returns ``[{title, year, type}]`` — type is ``"movie"``/``"series"``.
+    Results are sanity-checked against the query (normalized
+    containment) so unrelated API hits are dropped. Empty list on
+    failure. Never raises.
+    """
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+    try:
+        r = await _get_client().get(_JW_BASE,
+                                    params={"q": q[:100], "L": "en_IN"})
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("justwatch api failed: %s", exc)
+        return []
+    if not data.get("ok"):
+        return []
+    nq = _norm_alnum(q)
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in (data.get("description") or []):
+        title = (item.get("title") or "").strip()
+        if not title or len(title) > 120:
+            continue
+        nt = _norm_alnum(title)
+        # Sanity: query and title must contain one another once
+        # normalized ("spiderman" in "theamazingspiderman"). The API
+        # doesn't fuzzy-match, so junk like "kerma" -> "Hum Dil De
+        # Chuke Sanam" is rejected here.
+        if not nq or not nt or (nq not in nt and nt not in nq):
+            continue
+        try:
+            year = int(item.get("year")) if item.get("year") else None
+        except (TypeError, ValueError):
+            year = None
+        typ = ("series" if (item.get("type") or "").upper() == "SHOW"
+               else "movie")
+        key = (title.lower(), typ)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": title, "year": year, "type": typ,
+                    "reason": "justwatch"})
+        if len(out) >= limit:
+            break
+    if out:
+        log.info("justwatch candidates %r -> %r", q[:60],
+                 [t["title"][:40] for t in out])
+    return out
