@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 import httpx
 
@@ -61,7 +62,6 @@ async def enrich_title(keywords: str, year: int | None = None,
     search, then to a JustWatch-only card (title/year/images) when
     TMDB is unavailable.
     """
-    import time
     keywords = (keywords or "").strip()
     if not keywords:
         return None
@@ -124,6 +124,29 @@ def _norm_alnum(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 
+# v10.8.9: cache JustWatch answers 6h — repeated zero-result searches
+# reuse them with zero HTTP calls.
+_JW_TTL = 60 * 60 * 6
+_jw_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _jw_cache_get(q: str) -> list[dict] | None:
+    hit = _jw_cache.get((q or "").strip().lower())
+    if hit and time.time() - hit[0] < _JW_TTL:
+        return hit[1]
+    return None
+
+
+def _jw_cache_put(q: str, items: list[dict]) -> None:
+    key = (q or "").strip().lower()
+    if not key:
+        return
+    _jw_cache[key] = (time.time(), items)
+    if len(_jw_cache) > 500:
+        for k in sorted(_jw_cache, key=lambda k: _jw_cache[k][0])[:100]:
+            _jw_cache.pop(k, None)
+
+
 async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
     """Title candidates from the JustWatch API.
 
@@ -137,6 +160,10 @@ async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
     q = (query or "").strip()
     if len(q) < 2:
         return []
+    cached = _jw_cache_get(q)
+    if cached is not None:
+        log.debug("justwatch cache hit for %r", q[:50])
+        return cached[:limit]
     try:
         r = await _get_client().get(_JW_BASE,
                                     params={"q": q[:100], "L": "en_IN"})
@@ -183,4 +210,5 @@ async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
     if out:
         log.info("justwatch candidates %r -> %r", q[:60],
                  [t["title"][:40] for t in out])
+    _jw_cache_put(q, out)
     return out

@@ -63,6 +63,31 @@ def _parse_retry_after(body: str) -> float:
         return float(m.group(1))
     return 300.0
 
+
+# --- repeated-search cache ------------------------------------------------
+# v10.8.9: the same zero-result query often repeats (user retries, or
+# several users ask the same thing). Cache Grok's answer 6h so repeats
+# cost zero tokens and zero quota.
+_TITLES_TTL = 60 * 60 * 6
+_titles_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _titles_cache_get(q: str) -> list[dict] | None:
+    hit = _titles_cache.get((q or "").strip().lower())
+    if hit and time.time() - hit[0] < _TITLES_TTL:
+        return hit[1]
+    return None
+
+
+def _titles_cache_put(q: str, titles: list[dict]) -> None:
+    key = (q or "").strip().lower()
+    if not key:
+        return
+    _titles_cache[key] = (time.time(), titles)
+    if len(_titles_cache) > 500:
+        for k in sorted(_titles_cache, key=lambda k: _titles_cache[k][0])[:100]:
+            _titles_cache.pop(k, None)
+
 TITLE_LIST_SYSTEM = """You are a movie-title correction module for a Telegram AutoFilter bot.
 
 Identify the likely intended movie or series title from the user's search. Handle spelling mistakes, missing spaces, transliteration errors, incomplete words, and technical filename words.
@@ -388,6 +413,11 @@ async def ai_extract_titles(user_id: int | None, q: str,
     q = (q or "").strip()
     if not q or not is_configured():
         return []
+    cached = _titles_cache_get(q)
+    if cached is not None:
+        log.info("[s:%s] grok: cache hit for %r (%d titles)", sid or "-",
+                 q[:50], len(cached))
+        return cached
     if await quota_remaining(user_id) <= 0:
         log.debug("ai_extract_titles: quota exhausted for %s", user_id)
         return []
@@ -408,8 +438,10 @@ async def ai_extract_titles(user_id: int | None, q: str,
     if not titles:
         log.info("[s:%s] grok: no title identified for %r", sid or "-",
                  q[:60])
+        _titles_cache_put(q, [])
         return []
     await quota_use(user_id)
+    _titles_cache_put(q, titles)
     log.info("[s:%s] grok titles %r -> %r", sid or "-", q[:60],
              [(t["title"][:40], t["type"], t["year"]) for t in titles])
     return titles
