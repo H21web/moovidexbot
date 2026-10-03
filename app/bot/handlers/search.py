@@ -1,4 +1,4 @@
-"""Text search (private + groups) — v9: smart search + AI intent router + AI assist."""
+"""Text search (private + groups) — v10.6: smart search (DB -> Search API -> Grok fallback) + did-you-mean confirm + Request Movie."""
 from __future__ import annotations
 
 import asyncio
@@ -15,8 +15,8 @@ from pyrogram.types import (
     Message,
 )
 
-from app import ai, personalize, state
-from app import ai_assist, intent as intent_mod, search_v9
+from app import personalize, state
+from app import intent as intent_mod, search_v9
 from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui, v8_ui
@@ -26,7 +26,6 @@ from app.config import settings
 from app.db import get_session_factory
 from app.spell import suggest
 from app.tmdb import resolve_title
-from app.web.tokens import watch_url
 
 log = logging.getLogger(__name__)
 
@@ -51,42 +50,51 @@ async def _get_bot_username(client: Client) -> str | None:
     return _bot_username
 
 
-def _stash_ai_query(q: str) -> str:
-    """Store a query for the 🤖 AI Search button.
+def _verdict_line(best: dict, title: str) -> str:
+    """One-line best-pick note. Local only — no AI, no quota.
 
-    Consumed by ``ai.take_query`` in the ``aiq:`` callback. The 64-byte
-    callback-data limit is why the full text lives server-side keyed by
-    token (ai.py keeps the store + TTL; this is its producer).
+    (moved from app.ai_assist, which is deleted.) Always returns a
+    non-empty line, so the verdict renders on every result.
     """
-    token = secrets.token_hex(8)
-    ai._ai_queries[token] = (time.time(), q)
-    return token
+    dl = (best or {}).get("downloads") or 0
+    if dl:
+        return f"Most downloaded pick — {dl} downloads"
+    bits = [x for x in ((best or {}).get("quality"),
+                        (best or {}).get("language")) if x]
+    if bits:
+        return f"Best {' '.join(bits)} match for \u201c{title}\u201d"
+    return f"Top match for \u201c{title}\u201d"
 
 
-def _no_results_kb(ai_token: str,
-                   base: InlineKeyboardMarkup | None = None
+def _no_results_kb(base: InlineKeyboardMarkup | None = None,
+                   uid: int | None = None,
+                   query: str | None = None
                    ) -> InlineKeyboardMarkup:
-    """No-results keyboard: keep ``base`` rows, add AI Search (+ Request)."""
+    """No-results keyboard: keep ``base`` rows, add Request Movie.
+
+    v10.6 (flow diagram): the button carries a one-time token, so
+    tapping it saves the original search as a movie request and the
+    user gets "Request submitted" — no extra typing.
+    """
     rows = [list(r) for r in (base.inline_keyboard if base else [])]
-    ai_row = [InlineKeyboardButton("🤖 AI Search",
-                                   callback_data=f"aiq:{ai_token}")]
-    if settings.REQUEST_CHANNEL:
-        ai_row.append(InlineKeyboardButton("🎞 Request",
-                                           callback_data="request"))
-    rows.append(ai_row)
-    return InlineKeyboardMarkup(rows)
+    if settings.REQUEST_CHANNEL and uid is not None and query:
+        token = secrets.token_hex(8)
+        state.req_tokens[token] = {"uid": uid, "q": query,
+                                   "chat_id": None}
+        rows.append([InlineKeyboardButton("🎞 Request Movie",
+                                          callback_data=f"req:{token}")])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def _no_results_pm(client: Client, message: Message, q: str,
+                        uid: int | None = None,
                         suggestions: list[str] | None = None):
     """No-results flow for PM: TMDB correction -> spell suggestions.
 
     v9: the AI recovery chain (title correction -> retry) already ran
     inside _v9_search_flow. ``suggestions`` lets the caller pass
     pre-computed spell suggestions so they aren't looked up twice.
-    The 🤖 AI Search button (promised in /help) is always attached.
     """
-    ai_token = _stash_ai_query(q)
     text = "❌ <b>No results found.</b>"
     if suggestions is None:
         # Never send raw user text to TMDB: resolve a clean title first
@@ -101,7 +109,7 @@ async def _no_results_pm(client: Client, message: Message, q: str,
                    if settings.REQUEST_CHANNEL else "")
             )
             await message.reply_text(
-                text, reply_markup=_no_results_kb(ai_token),
+                text, reply_markup=_no_results_kb(uid=uid, query=q),
                 parse_mode=ParseMode.HTML)
             return
         try:
@@ -112,46 +120,44 @@ async def _no_results_pm(client: Client, message: Message, q: str,
             suggestions = []
     if suggestions:
         text += "\nDid you mean:"
-        kb = _no_results_kb(ai_token, ui.spell_kb(suggestions))
+        kb = _no_results_kb(ui.spell_kb(suggestions), uid=uid, query=q)
     else:
-        text += ("\n🎞 Try /request to ask for it!"
+        text += ("\n🎞 Tap Request Movie and we'll try to add it!"
                  if settings.REQUEST_CHANNEL
                  else "\nTry a different spelling.")
-        kb = _no_results_kb(ai_token)
+        kb = _no_results_kb(uid=uid, query=q)
     await message.reply_text(text, reply_markup=kb,
                              parse_mode=ParseMode.HTML)
 
 
-async def _ai_chat_reply(client: Client, message: Message, uid: int, q: str):
-    """Route a question-like PM message to Groq: live web answer first,
-    entertainment chat as fallback."""
-    wait = await message.reply_text("🤖 <i>thinking…</i>",
-                                    parse_mode=ParseMode.HTML)
+async def _did_you_mean(client: Client, wait: Message, uid: int,
+                       original_q: str, corrected_title: str,
+                       via: str) -> bool:
+    """Flow diagram: a Search-API / Grok corrected title found files —
+    confirm with the user before showing results.
+
+    ✅ Yes -> normal AutoFilter search with the corrected title.
+    ❌ No  -> save the ORIGINAL search as a movie request.
+    """
+    token = secrets.token_hex(8)
+    state.dym_tokens[token] = {"uid": uid, "original": original_q,
+                               "corrected": corrected_title}
+    source = "web search" if via == "web" else "AI"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes", callback_data=f"dym:{token}:yes"),
+         InlineKeyboardButton("❌ No", callback_data=f"dym:{token}:no")],
+    ])
     try:
-        reply, status = await ai.ai_web_answer(uid, q)
-        if status == "ok":
-            await wait.edit_text(reply)
-            return
-        if status == "no_quota":
-            await wait.edit_text(
-                "🤖 Daily AI limit reached — try again tomorrow 🌙")
-            return
-        # no_results / failed / ai_off -> fall through to normal chat
-        reply, status = await ai.ai_chat(uid, q)
-        if status in ("ok", "cached"):
-            await wait.edit_text(reply)
-        elif status == "no_quota":
-            await wait.edit_text(
-                "🤖 Daily AI limit reached — try again tomorrow 🌙")
-        else:
-            await wait.edit_text(
-                "🤖 AI is unavailable right now — try searching instead 🔍")
-    except Exception:  # noqa: BLE001
-        log.exception("ai chat failed")
-        try:
-            await wait.edit_text("🤖 Something went wrong — try again.")
-        except Exception:
-            pass
+        await wait.delete()
+    except Exception:
+        pass
+    await wait.reply_text(
+        f"🤔 <b>Did you mean:</b> {ui.esc(corrected_title)}?\n"
+        f"<i>({source} suggestion)</i>\n\n"
+        "Tap ✅ to see its files, or ❌ and I'll save "
+        f"<b>{ui.esc(original_q[:60])}</b> as a movie request.",
+        reply_markup=kb, parse_mode=ParseMode.HTML)
+    return True
 
 
 async def _build_v8(client: Client, token: str,
@@ -179,7 +185,7 @@ async def _build_v8(client: Client, token: str,
     if data.get("corrected"):
         text = (f"🔤 Showing results for "
                 f"<b>{ui.esc(data['corrected'])}</b>\n\n" + text)
-    kb = v8_ui.v8_results_kb(token, best["id"], uid, page, pages,
+    kb = v8_ui.v8_results_kb(token, uid, page, pages,
                              data.get("filters") or {})
     data["page"] = page
     return text, kb
@@ -227,13 +233,14 @@ async def send_v8_results(client: Client, chat_id: int, token: str,
 
 
 async def _v9_search_flow(client: Client, message: Message,
-                         uid: int, q: str) -> bool:
+                         uid: int, q: str, _confirmed: bool = False) -> bool:
     """v10.2 PM search: fast hot path, smart recovery, instant render.
 
     Always handles the message (True) except on unexpected failure.
-    Flow: keyword intent -> smart_search (hot sweeps -> spell fix ->
-    web title -> AI title) -> results render IMMEDIATELY -> enrich
-    (poster/info) fills in via a background edit.
+    Flow (diagram): normalize -> PostgreSQL/AutoFilter -> Search API ->
+    Grok AI -> did-you-mean confirm -> results, else Request Movie.
+    ``_confirmed`` skips the did-you-mean prompt after the user tapped
+    ✅ Yes on it.
     """
     wait = await message.reply_text("\U0001F50D <i>Searching…</i>",
                                     parse_mode=ParseMode.HTML)
@@ -248,32 +255,25 @@ async def _v9_search_flow(client: Client, message: Message,
         return False
 
     # v10: smart_search already ran the full recovery chain (spell ->
-    # web title -> AI title). The assist chain below is the last resort
-    # for suggestions only.
+    # web title -> Grok AI). Nothing found -> Request Movie card.
     suggestions: list[str] | None = None
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
-        fix = await ai_assist.assist_no_results(uid, q)
-        if fix.get("action") == "retry":
-            try:
-                res2 = await search_v9.smart_search(uid, fix["query"])
-            except Exception:  # noqa: BLE001
-                log.debug("v10 retry search failed", exc_info=True)
-                res2 = {"status": "no_results"}
-            if res2.get("best"):
-                res, q = res2, fix["query"]
-        elif fix.get("action") == "suggest":
-            suggestions = fix.get("suggestions")
-        if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
-            try:
-                await wait.delete()
-            except Exception:
-                pass
-            await _no_results_pm(client, message, q,
-                                 suggestions=suggestions)
-            return True
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        await _no_results_pm(client, message, q, uid,
+                             suggestions=suggestions)
+        return True
 
-    asyncio.create_task(ai.remember(uid, "user", q))
-    ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
+    # v10.6 (flow diagram): a Search-API / Grok corrected title found
+    # files — confirm before showing results.
+    if not _confirmed and res.get("corrected_via") in ("web", "ai"):
+        return await _did_you_mean(client, wait, uid, q,
+                                   res["title"] or q,
+                                   res["corrected_via"])
+
+    ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -308,7 +308,7 @@ async def _search_and_send(client: Client, chat_id: int, uid: int,
         return False
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
         return False
-    ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
+    ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -375,7 +375,7 @@ async def _v9_search_flow_group(client: Client, message: Message,
                    else "Try a different spelling."),
                 parse_mode=ParseMode.HTML)
         return
-    ai_note = ai_assist.verdict_line(res["best"], res["title"] or q)
+    ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -477,13 +477,10 @@ async def _handle_text_query(client: Client, message: Message,
             if await _v9_search_flow(client, message, uid, q):
                 return
         elif intent == "question":
-            # ai_chat keeps the memory itself — no separate remember here.
-            if ai.is_configured():
-                await _ai_chat_reply(client, message, uid, q)
-            else:
-                await message.reply_text(
-                    "\U0001F916 AI is off right now — "
-                    "send me a movie name to search \U0001F50D")
+            await message.reply_text(
+                "🔍 <i>I only do movie/series search.</i>\n"
+                "Send me a title to find its files \U0001F50D",
+                parse_mode=ParseMode.HTML)
             return
         elif intent == "greeting":
             await message.reply_text(
@@ -493,8 +490,6 @@ async def _handle_text_query(client: Client, message: Message,
             await message.reply_text(
                 "\U0001F39E To request a movie, use /request &lt;movie name&gt;")
             return
-    if pm:
-        asyncio.create_task(ai.remember(uid, "user", q))
     # v10.2: groups use the SAME v8 card model as PM (unified UI).
     await _v9_search_flow_group(client, message, uid, q)
 

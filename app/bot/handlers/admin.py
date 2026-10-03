@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 async def _admin(client: Client, message: Message):
     """v10.2: the /admin dashboard — the command that was never wired up.
 
-    Health snapshot (web player, AI, TMDB) + tappable sub-commands.
+    Health snapshot (web player, TMDB) + tappable sub-commands.
     """
     wait = await message.reply_text("👑 <i>Opening admin panel…</i>",
                                     parse_mode=ParseMode.HTML)
@@ -48,7 +48,6 @@ async def _admin(client: Client, message: Message):
             files = users = groups = open_req = 0
             db_ok = False
 
-        from app import ai as ai_mod
         web = (settings.WEB_URL or "").rstrip("/")
         if web.startswith("http://"):
             web_state = "⚠️ http — Telegram web apps need https!"
@@ -59,8 +58,6 @@ async def _admin(client: Client, message: Message):
                          "⬇ Download links on file cards. Set WEB_URL "
                          "on Render (e.g. https://moovidex.run.place) "
                          "and redeploy.")
-        ai_state = ("✅ on" if ai_mod.is_configured()
-                    else "❌ off (no GROQ_API_KEY)")
         tmdb_state = ("✅ on" if settings.TMDB_API_KEY else "❌ off")
         text = (
             "👑 <b>Admin panel</b>\n\n"
@@ -69,7 +66,6 @@ async def _admin(client: Client, message: Message):
             f"👪 Groups: <b>{groups:,}</b>\n"
             f"🎞 Open requests: <b>{open_req}</b>\n\n"
             f"🌐 Web player: {web_state}\n"
-            f"🤖 AI: {ai_state}\n"
             f"🎬 TMDB: {tmdb_state}\n\n"
             "<b>Commands:</b>\n"
             "/stats /users /requests /broadcast /settings /dbcheck"

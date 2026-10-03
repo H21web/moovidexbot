@@ -35,8 +35,7 @@ import re
 
 from sqlalchemy import func, select
 
-from app import ai_assist, enrich as enrich_mod, personalize, spell
-from app.ai_search import _query_season_episode
+from app import enrich as enrich_mod, personalize, spell
 from app.bot.v8_ui import sort_best_first
 from app.config import settings
 from app.db import get_session_factory
@@ -48,6 +47,29 @@ log = logging.getLogger(__name__)
 
 MIN_HITS = 8            # below this, the fuzzy retry kicks in
 FUZZY_THRESHOLD = 0.15  # lowered trigram bar for the retry pass
+def _query_season_episode(parsed: dict, files: list[dict]) -> list[dict]:
+    """Narrow files to the query's season/episode; no-op when absent.
+
+    (moved from app.ai_search, which is deleted — this helper never
+    used AI.) If the filter would empty the set, the full set is kept
+    (boost instead of filter) so a slightly-off tag never yields zero
+    results.
+    """
+    season, episode = parsed.get("season"), parsed.get("episode")
+    if not season and not episode:
+        return files
+    from app.bot.v8_ui import file_season_episode
+    kept = []
+    for f in files:
+        s, e = file_season_episode(f.get("file_name"))
+        if season and s != season:
+            continue
+        if episode and e != episode:
+            continue
+        kept.append(f)
+    return kept or files
+
+
 UNCERTAIN_SCORE = 1.0   # best hit below this -> "uncertain"
 GOOD_SCORE = 2.0        # hot path at/above this skips recovery entirely
 
@@ -161,9 +183,10 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     """Run the v10.2 search pipeline.
 
     Returns ``{"status", "files", "best", "best_reasons", "title",
-    "parsed", "confidence", "corrected"}``; status is
+    "parsed", "confidence", "corrected", "corrected_via"}``; status is
     ``"ok" | "uncertain" | "no_results"``. ``corrected`` is the
-    auto-fixed query when spell correction fired (for display).
+    auto-fixed query when a recovery stage fired (for display);
+    ``corrected_via`` is ``"spell" | "web" | "ai" | None``.
     """
     raw = (raw or "").strip()
     parsed = parse_query(raw)
@@ -174,6 +197,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     # --- hot path ------------------------------------------------------
     merged = await _hot_sweeps(user_id, raw, parsed, log_q=True)
     corrected: str | None = None
+    corrected_via: str | None = None  # "spell" | "web" | "ai"
     score = _best_score(merged)
 
     # --- recovery: 1st logic — local spell correction ------------------
@@ -189,6 +213,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
             if _best_score(retry) > score:
                 merged, score = retry, _best_score(retry)
                 corrected = fixed
+                corrected_via = "spell"
                 parsed = parse_query(fixed)
                 parsed["title"] = fixed
                 title = fixed
@@ -205,14 +230,19 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                                       parse_query(web_title), log_q=False)
             if _best_score(retry) > score:
                 merged, score = retry, _best_score(retry)
+                corrected = web_title
+                corrected_via = "web"
                 parsed = parse_query(web_title)
                 parsed["title"] = web_title
                 title = web_title
 
-    # --- recovery: 3rd logic — AI extracts the title -------------------
+    # --- recovery: 3rd logic — Grok AI title (v10.6, flow diagram) -----
+    # Runs only when the Search API found no usable title. The original
+    # user query only is sent to Grok — never any search-API response.
     if not merged:
         try:
-            ai_title = await ai_assist.ai_extract_title(user_id, raw)
+            from app import ai as ai_mod
+            ai_title = await ai_mod.ai_extract_title(user_id, raw)
         except Exception as exc:  # noqa: BLE001
             log.debug("AI title extract failed: %s", exc)
             ai_title = None
@@ -224,12 +254,15 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                 parsed = parse_query(ai_title)
                 parsed["title"] = ai_title
                 title = ai_title
+                corrected = ai_title
+                corrected_via = "ai"
 
     items = list(merged.values())
     if not items:
         return {"status": "no_results", "files": [], "best": None,
                 "best_reasons": [], "title": title, "parsed": parsed,
-                "confidence": 0.0, "corrected": corrected}
+                "confidence": 0.0, "corrected": corrected,
+                "corrected_via": corrected_via}
 
     # --- rerank: taste -> score/quality/size ---------------------------
     try:
@@ -263,4 +296,5 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
              f" (corrected: {corrected})" if corrected else "")
     return {"status": status, "files": files, "best": best,
             "best_reasons": reasons, "title": title, "parsed": parsed,
-            "confidence": confidence, "corrected": corrected}
+            "confidence": confidence, "corrected": corrected,
+            "corrected_via": corrected_via}

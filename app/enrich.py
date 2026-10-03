@@ -12,7 +12,7 @@ Pipeline:
 
 Returns a dict ``{title, year, plot, rating, poster_url, genres, imdb_id,
 source}`` or ``None``. ``source`` is one of ``"tmdb_imdb"``,
-``"tmdb_search"``, ``"groq_identify"``.
+``"tmdb_search"``.
 """
 from __future__ import annotations
 
@@ -49,17 +49,6 @@ def _get_client() -> httpx.AsyncClient:
         )
     return _client
 
-# --- AI prompts -----------------------------------------------------------
-GROQ_IDENTIFY_SYSTEM = (
-    "You identify a movie or TV series from its title. Reply with ONLY a "
-    "JSON object, no other text: "
-    '{"title": "...", "year": 2022, "plot": "1-2 sentence plot", '
-    '"rating": 7.5, "genres": ["Action", "Drama"]}. '
-    "Set year only if you are sure. rating is 0-10. "
-    "If you cannot identify it with confidence, reply exactly: NONE."
-)
-
-
 # --- search API -----------------------------------------------------------
 async def _websearch_raw(query: str, num: int = 6) -> list[dict] | None:
     """Raw ``/search`` call. ``None`` on failure."""
@@ -94,58 +83,6 @@ async def _imdb_id_via_websearch(keywords: str) -> str | None:
     return None
 
 
-# --- AI steps --------------------------------------------------------------
-async def _groq_identify(keywords: str, year: int | None,
-                       user_id: int) -> dict | None:
-    """v9.2 AI fallback: title/year ONLY — never the search-API response.
-
-    Returns a meta dict or ``None``. The model must reply ``NONE`` when
-    unsure, so this never invents a movie. No poster from this path.
-    """
-    from app import ai as ai_mod
-    if not ai_mod.is_configured():
-        return None
-    if await ai_mod.quota_remaining(user_id) <= 0:
-        log.debug("enrich: AI identify skipped, no quota")
-        return None
-    prompt = f"Title: {keywords[:120]}" + (f" ({year})" if year else "")
-    try:
-        raw = await ai_mod.groq_complete(
-            GROQ_IDENTIFY_SYSTEM, prompt,
-            max_tokens=300, json_mode=True)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("enrich: AI identify failed: %s", exc)
-        return None
-    if not raw or raw.strip() == "NONE":
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:  # noqa: BLE001
-        log.debug("enrich: AI identify bad JSON")
-        return None
-    if not isinstance(data, dict) or not (data.get("title") or "").strip():
-        return None
-    await ai_mod.quota_use(user_id)
-    genres = [str(g) for g in (data.get("genres") or [])][:3]
-    try:
-        rating = float(data.get("rating") or 0.0)
-    except (TypeError, ValueError):
-        rating = 0.0
-    meta = {
-        "title": str(data["title"]).strip()[:120],
-        "year": data.get("year") if isinstance(
-            data.get("year"), int) else year,
-        "plot": str(data.get("plot") or "")[:300],
-        "rating": max(0.0, min(10.0, rating)),
-        "poster_url": None,
-        "genres": genres,
-        "imdb_id": None,
-        "source": "groq_identify",
-    }
-    log.info("enrich: AI identified %r", meta["title"][:60])
-    return meta
-
-
 # --- main pipeline ----------------------------------------------------------
 # v10.2: the two slow lookups (web-search -> imdb id, TMDB title search)
 # now run CONCURRENTLY instead of sequentially — roughly halves the
@@ -161,9 +98,6 @@ async def enrich_title(keywords: str, year: int | None = None,
     hit = _cache.get(cache_key)
     if hit and time.time() - hit[0] < _TTL:
         return hit[1]
-
-    from app import ai as ai_mod
-    ai_on = ai_mod.is_configured()
 
     # 1-2. web-search -> imdb id -> TMDB, and plain TMDB title search,
     # raced in parallel; the imdb-anchored result wins when present.
@@ -181,15 +115,7 @@ async def enrich_title(keywords: str, year: int | None = None,
         meta["imdb_id"] = imdb_id
         meta["source"] = "tmdb_search"
 
-    # 3. v9.2 AI fallback: title/year only, no search-API response.
-    # P1#16: a None from the quota-gated AI path is never cached — a
-    # later user WITH quota must still get a real answer.
-    ai_path = False
-    if meta is None and ai_on and user_id is not None:
-        ai_path = True
-        meta = await _groq_identify(keywords, year, user_id)
-
-    if meta is not None or not ai_path:
+    if meta is not None:
         _cache[cache_key] = (time.time(), meta)
     # P3#17: evict the oldest ~100 instead of nuking the whole cache.
     if len(_cache) > 500:

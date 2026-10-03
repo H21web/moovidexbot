@@ -1,578 +1,165 @@
-"""Groq-powered AI: on-demand RAG search + entertainment chat (v6).
+"""Grok AI fallback for search — v10.6.
 
-Hard rules:
-- The AI NEVER invents file links. Every download button comes from a real
-  DB row returned by ``search_files()`` — Groq only *arranges* results.
-- Every Groq call has a 15s timeout and a graceful fallback message.
-- Quota: per-user daily counter (``AI_DAILY_QUOTA``). Cache: a global
-  question -> answer cache (30-day TTL) is checked BEFORE any Groq call.
-- No Groq key configured -> every entry point degrades gracefully (None).
+Per the user's flow diagram, AI exists for ONE purpose: correcting the
+movie/series title when the Search API found no usable title ("Call Grok
+AI with original user query only"). Model is ``openai/gpt-oss-20b``
+(the live-confirmed working model), 50 uses/user/day.
+
+No chat, no web answers, no similar-movies, no memory — those were
+removed in v10.4 and stay removed.
 """
 from __future__ import annotations
 
-import hashlib
-import json
+import asyncio
+import datetime
 import logging
-import re
-from datetime import date, datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import delete, select, update
 
 from app.config import settings
-from app.db import get_session_factory
-from app.models import AiCache, AiQuota, ChatMemory
 
 log = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-TIMEOUT = 15.0
-CACHE_TTL = timedelta(days=30)
-MEMORY_KEEP = 20
-MEMORY_TTL = timedelta(days=7)
+
+TITLE_SYSTEM = (
+    "You correct movie/series search queries. Reply with ONLY the most "
+    "likely intended movie or series title, nothing else. No year, no "
+    "quotes, no explanation. If you cannot tell what the user meant, "
+    "reply with exactly: NONE"
+)
 
 _client: httpx.AsyncClient | None = None
-
-# ------------------------------------------------------------------ setup
-
-def is_configured() -> bool:
-    return bool(settings.GROQ_API_KEY)
 
 
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         _client = httpx.AsyncClient(
-            base_url="https://api.groq.com/openai",
-            timeout=httpx.Timeout(TIMEOUT, connect=5.0),
-            headers={
-                "Authorization": f"Bearer {settings.GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=20,
+                                max_keepalive_connections=10),
         )
     return _client
-
-
-# ------------------------------------------------------------------ cache
-
-# Short-lived server-side store for AI-button queries: callback data is
-# limited to 64 bytes, so the full query text lives here keyed by token.
-_ai_queries: dict[str, tuple[float, str]] = {}
-_AIQ_TTL = 900
-
-
-# P3: store_query was dead (no producers); take_query stays — it is used
-# by the AI-search button flow in app/bot/handlers/callbacks.py.
-
-def take_query(token: str) -> str | None:
-    import time as _time
-    item = _ai_queries.get(token)
-    if not item:
-        return None
-    ts, text = item
-    if _time.time() - ts > _AIQ_TTL:
-        _ai_queries.pop(token, None)
-        return None
-    return text
-
-
-def _qkey(kind: str, text: str) -> str:
-    norm = re.sub(r"\s+", " ", (text or "").strip().lower())
-    return f"{kind}:" + hashlib.sha1(norm.encode()).hexdigest()
-
-
-async def cache_get(kind: str, text: str) -> str | None:
-    try:
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as session:
-            row = await session.get(AiCache, _qkey(kind, text))
-            if row and row.created_at:
-                ts = row.created_at
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) - ts < CACHE_TTL:
-                    return row.answer
-    except Exception as exc:  # noqa: BLE001
-        log.debug("ai cache get failed: %s", exc)
-    return None
-
-
-async def cache_put(kind: str, text: str, answer: str) -> None:
-    try:
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as session:
-            key = _qkey(kind, text)
-            row = await session.get(AiCache, key)
-            if row:
-                row.answer = answer
-                row.created_at = datetime.now(timezone.utc)
-            else:
-                session.add(AiCache(qkey=key, answer=answer))
-            await session.commit()
-    except Exception as exc:  # noqa: BLE001
-        log.debug("ai cache put failed: %s", exc)
-
-
-# ------------------------------------------------------------------ quota
-
-async def quota_remaining(user_id: int) -> int:
-    try:
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as session:
-            row = await session.get(AiQuota, (user_id, date.today()))
-            used = row.count if row else 0
-            return max(0, settings.AI_DAILY_QUOTA - used)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("quota check failed: %s", exc)
-        return 0
-
-
-async def quota_use(user_id: int) -> bool:
-    """Charge one AI quota unit. Atomic single-statement increment.
-
-    Returns True when the charge was recorded, False on DB failure.
-    """
-    try:
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as session:
-            today = date.today()
-            # P1#11: single UPDATE — no check-then-act TOCTOU race.
-            res = await session.execute(
-                update(AiQuota)
-                .where(AiQuota.user_id == user_id, AiQuota.day == today)
-                .values(count=AiQuota.count + 1)
-            )
-            if res.rowcount == 0:
-                session.add(AiQuota(user_id=user_id, day=today, count=1))
-            await session.commit()
-            return True
-    except Exception as exc:  # noqa: BLE001
-        log.debug("quota use failed: %s", exc)
-        return False
-
-
-# ------------------------------------------------------------------ groq
-
-def _candidate_models(explicit: str | None) -> list[str]:
-    """Primary model first, then the fallback list (deduped, in order)."""
-    models: list[str] = []
-    for m in [explicit or settings.AI_MODEL,
-              *((settings.AI_FALLBACK_MODELS or "").split(","))]:
-        m = (m or "").strip()
-        if m and m not in models:
-            models.append(m)
-    return models
-
-
-def _is_model_not_found(exc: httpx.HTTPStatusError) -> bool:
-    """True when Groq says the model id is unknown for this key."""
-    if exc.response.status_code != 404:
-        return False
-    try:
-        return (exc.response.json().get("error", {}).get("code")
-                == "model_not_found")
-    except Exception:
-        return True  # a 404 on this route is almost always the model
-
-
-async def groq_complete(system: str, user: str,
-                        max_tokens: int = 512,
-                        json_mode: bool = False,
-                        model: str | None = None,
-                        messages: list[dict] | None = None,
-                        temperature: float = 0.7) -> str | None:
-    """One Groq chat call. Returns the text or None on any failure.
-
-    Walks the model cascade on ``model_not_found`` — a key that lost
-    access to one model usually still serves another. Auth, rate-limit
-    and network errors stop the walk (retrying those is pointless).
-
-    Pass ``messages`` (full chat history) instead of ``system``/``user``
-    for multi-turn calls — the cascade still applies.
-    """
-    if not is_configured():
-        return None
-    tried: list[str] = []
-    for m in _candidate_models(model):
-        base_messages = (messages if messages is not None else [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ])
-        payload: dict = {
-            "model": m,
-            "messages": base_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        try:
-            resp = await _get_client().post("/v1/chat/completions",
-                                            json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            if m != (model or settings.AI_MODEL):
-                log.info("groq serving via fallback model %s", m)
-            return ((data["choices"][0]["message"]["content"] or "")
-                    .strip() or None)
-        except httpx.HTTPStatusError as exc:
-            # Log Groq's own error body — it names the real cause.
-            body = ""
-            try:
-                body = (exc.response.text or "")[:300]
-            except Exception:
-                pass
-            log.warning("groq call failed (model %s): %s | groq says: %s",
-                        m, exc, body)
-            # v10.3.1: strict JSON mode can make the model emit nothing
-            # ("json_validate_failed" with an empty generation). One retry
-            # without the straitjacket — callers parse defensively via
-            # _parse_json anyway, so a non-JSON answer degrades the same
-            # way None would.
-            if json_mode and "json_validate_failed" in body:
-                log.info("groq: retrying without json_object (model %s)", m)
-                payload.pop("response_format", None)
-                try:
-                    resp = await _get_client().post("/v1/chat/completions",
-                                                    json=payload)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    return ((data["choices"][0]["message"]["content"] or "")
-                            .strip() or None)
-                except Exception as exc2:  # noqa: BLE001
-                    log.warning("groq json retry failed (model %s): %s",
-                                m, exc2)
-                    return None
-            if not _is_model_not_found(exc):
-                return None
-            tried.append(m)
-            continue
-        except Exception as exc:  # noqa: BLE001 - AI must never break bot
-            log.warning("groq call failed: %s", exc)
-            return None
-    log.warning("groq: no working model among %s", tried or _candidate_models(model))
-    return None
-
-
-def _parse_json(text: str | None) -> dict:
-    if not text:
-        return {}
-    t = text.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?\s*", "", t)
-        t = re.sub(r"\s*```$", "", t)
-    try:
-        obj = json.loads(t)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-PARSE_SYSTEM = (
-    "You are a movie search query parser for a Telegram movie bot. "
-    "Extract structured filters from the user's message. "
-    "Reply with ONLY a JSON object, no other text. Keys: "
-    '"title" (movie/series/anime/documentary title string or null), '
-    '"year" (integer or null), '
-    '"genre" (one of Action, Adventure, Animation, Comedy, Crime, Documentary, '
-    "Drama, Family, Fantasy, History, Horror, Music, Mystery, Romance, Sci-Fi, "
-    'Thriller, War, Western — or null), '
-    '"quality" (one of 480p, 720p, 1080p, 2160p — or null). '
-    'Example: "oru nalla action movie 2023-le, 1080p" -> '
-    '{"title": null, "year": 2023, "genre": "Action", "quality": "1080p"}.'
-)
-
-FORMAT_SYSTEM = (
-    "You are Moovidex AI, a friendly entertainment buddy inside a Telegram "
-    "movie bot. The user writes casually (Manglish-friendly is fine). "
-    "You are given REAL search results from the bot's database as JSON — "
-    "present them warmly and briefly with emoji. "
-    "RULES: never invent movies, files, ratings or download links — only "
-    "mention what is in the provided results. If results are empty, say so "
-    "honestly and suggest /request. "
-    "You ONLY help with entertainment (movies, series, anime, documentaries, "
-    "actors, music). For anything else reply exactly: "
-    "\"ithu ee bot-il cheyyan pattilla 😅 — njan movies/series/anime/"
-    'documentary kaaryangalil mathrame sahayikku." '
-    "Keep it short (under 80 words)."
-)
-
-CHAT_SYSTEM = (
-    "You are Moovidex AI, a friendly entertainment buddy inside a Telegram "
-    "movie bot. Chat naturally like a friend (Manglish-friendly is fine). "
-    "You ONLY discuss entertainment: movies, series, anime, documentaries, "
-    "actors, music, reviews, recommendations. "
-    "For any other topic reply exactly: "
-    "\"ithu ee bot-il cheyyan pattilla 😅 — njan movies/series/anime/"
-    'documentary kaaryangalil mathrame sahayikku." '
-    "Never invent download links or claim files exist — if the user wants a "
-    "file, tell them to search the movie name in the bot. Keep replies "
-    "short (under 100 words)."
-)
-
-
-async def parse_filters(text: str) -> dict:
-    """NL -> {title?, year?, genre?, quality?} via Groq. {} on failure."""
-    raw = await groq_complete(PARSE_SYSTEM, text[:500], max_tokens=256,
-                              json_mode=True)
-    f = _parse_json(raw)
-    out: dict = {}
-    if isinstance(f.get("title"), str) and f["title"].strip():
-        out["title"] = f["title"].strip()[:120]
-    if isinstance(f.get("year"), int) and 1900 <= f["year"] <= 2100:
-        out["year"] = f["year"]
-    if isinstance(f.get("genre"), str) and f["genre"].strip():
-        out["genre"] = f["genre"].strip()[:32]
-    if f.get("quality") in ("480p", "720p", "1080p", "2160p"):
-        out["quality"] = f["quality"]
-    return out
-
-
-# ------------------------------------------------------------------ memory
-
-async def remember(user_id: int, role: str, text: str) -> None:
-    """Store one chat line; trim to last MEMORY_KEEP, 7-day TTL."""
-    text = (text or "").strip()[:1000]
-    if not text or role not in ("user", "assistant"):
-        return
-    try:
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as session:
-            session.add(ChatMemory(user_id=user_id, role=role, text=text))
-            await session.flush()
-            cutoff = datetime.now(timezone.utc) - MEMORY_TTL
-            await session.execute(
-                delete(ChatMemory).where(
-                    ChatMemory.user_id == user_id,
-                    ChatMemory.created_at < cutoff))
-            # Keep only the newest MEMORY_KEEP rows.
-            old_ids = (
-                await session.execute(
-                    select(ChatMemory.id)
-                    .where(ChatMemory.user_id == user_id)
-                    .order_by(ChatMemory.id.desc())
-                    .offset(MEMORY_KEEP))
-            ).scalars().all()
-            if old_ids:
-                await session.execute(
-                    delete(ChatMemory).where(ChatMemory.id.in_(old_ids)))
-            await session.commit()
-    except Exception as exc:  # noqa: BLE001
-        log.debug("remember failed: %s", exc)
-
-
-async def history(user_id: int, limit: int = 10) -> list[dict]:
-    """Recent conversation as [{role, content}] (oldest first)."""
-    try:
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as session:
-            rows = (
-                await session.execute(
-                    select(ChatMemory)
-                    .where(ChatMemory.user_id == user_id)
-                    .order_by(ChatMemory.id.desc())
-                    .limit(limit))
-            ).scalars().all()
-            return [{"role": r.role, "content": r.text}
-                    for r in reversed(rows)]
-    except Exception as exc:  # noqa: BLE001
-        log.debug("history failed: %s", exc)
-        return []
-
-
-# ------------------------------------------------------------------ RAG search
-
-async def ai_search(user_id: int, raw_query: str
-                    ) -> tuple[str | None, list[dict], str]:
-    """Groq RAG search.
-
-    Returns ``(intro_text, groups, status)`` where status is one of
-    "ok" | "no_quota" | "no_results" | "ai_off" | "failed".
-    Groups are DB rows only — the AI never invents files.
-    """
-    from app import personalize
-    from app.search import group_by_title, search_files
-    from app.tmdb import discover
-
-    if not is_configured():
-        return None, [], "ai_off"
-    cached = await cache_get("search", raw_query)
-    if cached is not None:
-        # Quota-free path: re-run the cheap DB search with the raw query
-        # for fresh, clickable groups; reuse the cached friendly intro.
-        groups = await _db_search(raw_query, {}, user_id)
-        return cached, groups, "ok"
-    if await quota_remaining(user_id) <= 0:
-        return None, [], "no_quota"
-
-    filt = await parse_filters(raw_query)
-    # P1#10: the parse is itself a Groq call — charge 1 unit for it.
-    await quota_use(user_id)
-    groups = await _db_search(raw_query, filt, user_id)
-    if not groups:
-        return None, [], "no_results"
-
-    prefs = await personalize.get_prefs(user_id)
-    quality = (prefs.get("counters") or {}).get("quality") or {}
-    top_q = max(quality, key=lambda k: quality[k]) if quality else None
-    results_json = [
-        {"title": g.get("display"), "year": g.get("year"),
-         "qualities": sorted({f.get("quality") for f in g.get("files", [])
-                              if f.get("quality")}),
-         "files": len(g.get("files", []))}
-        for g in groups[:5]
-    ]
-    user_line = (
-        f"User asked: {raw_query[:300]}\n"
-        + (f"User prefers {top_q} quality — mention it warmly.\n"
-           if top_q else "")
-        + f"REAL results JSON: {json.dumps(results_json, ensure_ascii=False)}"
-    )
-    intro = await groq_complete(FORMAT_SYSTEM, user_line, max_tokens=300)
-    if intro:
-        # P2#48: charge for the format call only when it produced a reply.
-        await quota_use(user_id)
-    else:
-        intro = "🤖 <b>AI results</b> — ethokke kitti:"
-    await cache_put("search", raw_query, intro)
-    return intro, groups, "ok"
-
-
-async def _db_search(raw_query: str, filt: dict, user_id: int) -> list[dict]:
-    """Run the DB search from parsed filters + personalization."""
-    from app import personalize
-    from app.search import group_by_title, search_files
-    from app.tmdb import discover
-
-    groups: list[dict] = []
-    title = filt.get("title")
-    if title:
-        q = title
-        if filt.get("year"):
-            q += f" {filt['year']}"
-        if filt.get("quality"):
-            q += f" {filt['quality']}"
-        items, _ = await search_files(q, user_id=user_id, log_query=False)
-        items = await personalize.rerank(items, user_id)
-        groups = group_by_title(items)
-    elif filt.get("genre"):
-        # Genre/year browse: TMDB discover -> titles -> our DB.
-        try:
-            cands = await discover(genre=filt["genre"], year=filt.get("year"),
-                                   limit=8)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("discover failed: %s", exc)
-            cands = []
-        seen: set[str] = set()
-        all_items: list[dict] = []
-        for c in cands:
-            items, _ = await search_files(c["title"], user_id=user_id,
-                                          log_query=False)
-            for it in items:
-                if it["id"] not in seen:
-                    seen.add(it["id"])
-                    all_items.append(it)
-            if len(all_items) >= 40:
-                break
-        all_items = await personalize.rerank(all_items, user_id)
-        # Reuse the standard relevance order as a stable base.
-        all_items.sort(key=lambda i: i.get("score", 0), reverse=True)
-        groups = group_by_title(all_items)
-    else:
-        items, _ = await search_files(raw_query, user_id=user_id,
-                                      log_query=False)
-        items = await personalize.rerank(items, user_id)
-        groups = group_by_title(items)
-    return groups
-
-
-# ------------------------------------------------------------------ chat
-
-async def ai_chat(user_id: int, text: str) -> tuple[str | None, str]:
-    """Entertainment chat with per-user memory.
-
-    Returns ``(reply, status)``; status in "ok" | "no_quota" | "ai_off" |
-    "failed" | "cached".
-    """
-    if not is_configured():
-        return None, "ai_off"
-    cached = await cache_get("chat", text)
-    if cached is not None:
-        await remember(user_id, "user", text)
-        await remember(user_id, "assistant", cached)
-        return cached, "cached"
-    if await quota_remaining(user_id) <= 0:
-        return None, "no_quota"
-
-    hist = await history(user_id, limit=10)
-    messages = [{"role": "system", "content": CHAT_SYSTEM}]
-    messages.extend(hist)
-    messages.append({"role": "user", "content": text[:1000]})
-
-    # v8.3: go through groq_complete so the model cascade applies here too
-    # (this path used to post with the dead default model directly).
-    reply = await groq_complete("", "", max_tokens=300, messages=messages,
-                                temperature=0.8)
-    if not reply:
-        return None, "failed"
-    await quota_use(user_id)
-    await remember(user_id, "user", text)
-    await remember(user_id, "assistant", reply)
-    await cache_put("chat", text, reply)
-    return reply, "ok"
-
-
-# ------------------------------------------------------------------ web RAG
-
-WEBSEARCH_URL = settings.WEBSEARCH_API_URL.rstrip("/")
-
-WEBQA_SYSTEM = (
-    "You answer using ONLY the web search results below. "
-    "Cite sources like [1], [2]. If the results don't contain the answer, "
-    "say so honestly \u2014 never invent. Keep it short (under 100 words). "
-    "Manglish-friendly tone is fine."
-)
-
-
-async def ai_web_answer(user_id: int, query: str) -> tuple[str | None, str]:
-    """Live web Q&A: search API results -> Groq answer.
-
-    Returns ``(answer, status)``; status in "ok" | "no_quota" | "no_results"
-    | "ai_off" | "failed". Uses one quota unit only when an answer is made.
-    """
-    if not is_configured():
-        return None, "ai_off"
-    if await quota_remaining(user_id) <= 0:
-        return None, "no_quota"
-    try:
-        async with httpx.AsyncClient(
-                timeout=httpx.Timeout(20.0, connect=5.0)) as c:
-            r = await c.get(f"{WEBSEARCH_URL}/search",
-                            params={"q": query[:300], "num": 5})
-            r.raise_for_status()
-            results = (r.json() or {}).get("results") or []
-    except Exception as exc:  # noqa: BLE001
-        log.warning("websearch api failed: %s", exc)
-        return None, "failed"
-    if not results:
-        return None, "no_results"
-    ctx = "\n".join(
-        f"[{i + 1}] {(x.get('title') or '').strip()}"
-        + (f": {(x.get('snippet') or '').strip()}" if x.get("snippet") else "")
-        + f" ({x.get('url') or ''})"
-        for i, x in enumerate(results[:5]))
-    ans = await groq_complete(
-        WEBQA_SYSTEM,
-        f"Question: {query[:300]}\n\nWeb search results:\n{ctx}",
-        max_tokens=300)
-    if not ans:
-        return None, "failed"
-    await quota_use(user_id)
-    return ans, "ok"
 
 
 async def close_client() -> None:
     global _client
     if _client is not None:
-        await _client.aclose()
+        try:
+            await _client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
         _client = None
+
+
+def is_configured() -> bool:
+    return bool(settings.GROQ_API_KEY)
+
+
+# --- quota: 50 Grok uses / user / day ---------------------------------------
+_quota: dict[int, list] = {}
+_quota_lock = asyncio.Lock()
+
+
+def _today() -> str:
+    return datetime.date.today().isoformat()
+
+
+async def quota_remaining(user_id: int | None) -> int:
+    if user_id is None:
+        return settings.AI_DAILY_QUOTA
+    async with _quota_lock:
+        day, used = _quota.get(user_id, (_today(), 0))
+        if day != _today():
+            return settings.AI_DAILY_QUOTA
+        return max(0, settings.AI_DAILY_QUOTA - used)
+
+
+async def quota_use(user_id: int | None) -> None:
+    if user_id is None:
+        return
+    async with _quota_lock:
+        day, used = _quota.get(user_id, (_today(), 0))
+        if day != _today():
+            day, used = _today(), 0
+        _quota[user_id] = [day, used + 1]
+
+
+# --- Groq call ---------------------------------------------------------------
+async def groq_complete(system: str, prompt: str,
+                        max_tokens: int = 300,
+                        json_mode: bool = False) -> str | None:
+    """One Groq chat completion; returns the text or ``None``.
+
+    v10.3.1: retry once without ``response_format`` when Groq answers
+    ``json_validate_failed`` (gpt-oss-20b quirk).
+    """
+    if not is_configured():
+        return None
+    payload = {
+        "model": settings.AI_MODEL,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {settings.GROQ_API_KEY}"}
+    try:
+        r = await _get_client().post(GROQ_URL, json=payload,
+                                     headers=headers)
+        r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        body = ""
+        try:
+            body = exc.response.text or ""
+        except Exception:  # noqa: BLE001
+            pass
+        if json_mode and "json_validate_failed" in body:
+            log.info("groq json_validate_failed — retrying without "
+                     "response_format")
+            try:
+                payload.pop("response_format", None)
+                r = await _get_client().post(GROQ_URL, json=payload,
+                                             headers=headers)
+                r.raise_for_status()
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("groq retry failed: %s", exc2)
+                return None
+        else:
+            log.warning("groq failed: %s", exc)
+            return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("groq failed: %s", exc)
+        return None
+    try:
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# --- the one AI feature: title correction ------------------------------------
+async def ai_extract_title(user_id: int | None, q: str) -> str | None:
+    """Ask Grok for the intended title. Original query only — never any
+    search-API response. ``None`` when unconfigured, out of quota, or
+    Grok can't tell."""
+    q = (q or "").strip()
+    if not q or not is_configured():
+        return None
+    if await quota_remaining(user_id) <= 0:
+        log.debug("ai_extract_title: quota exhausted for %s", user_id)
+        return None
+    raw = await groq_complete(TITLE_SYSTEM, q[:200], max_tokens=60,
+                              json_mode=False)
+    if not raw:
+        return None
+    title = raw.strip().strip("\"'").strip()
+    if not title or title.upper() == "NONE" or len(title) > 120:
+        return None
+    if title.lower() == q.lower():
+        return None  # no correction offered
+    await quota_use(user_id)
+    log.info("grok title %r -> %r", q[:60], title[:60])
+    return title

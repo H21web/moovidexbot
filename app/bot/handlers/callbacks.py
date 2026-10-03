@@ -11,7 +11,7 @@ from pyrogram.errors import FloodWait, PeerIdInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
-from app import ai, personalize, state
+from app import personalize, state
 from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui, v8_ui
@@ -318,77 +318,60 @@ async def _spell(client: Client, query):
                                   "❌ Still nothing found.")
 
 
-async def _similar(client: Client, query):
-    """v10.2 🍿 Similar movies: ``sim:{token}``.
+async def _dym(client: Client, query):
+    """Did-you-mean confirm: ``dym:{token}:yes`` / ``dym:{token}:no``.
 
-    AI suggests 6 similar titles (1 quota). They arrive as tappable
-    buttons; tapping one runs a full v10 search for that title.
+    Flow diagram: ✅ Yes -> normal AutoFilter search with the corrected
+    title -> results. ❌ No -> save the ORIGINAL search as a movie
+    request -> "Request submitted".
     """
     uid = query.from_user.id
     if await is_banned(uid):
         await query.answer("⛔ You are banned.", show_alert=True)
         return
     try:
-        token = query.data.split(":", 1)[1]
-    except (ValueError, IndexError):
+        _, token, action = query.data.split(":")
+    except (ValueError, AttributeError):
         return
-    data = state.v8_get(token)
-    if not data:
-        await query.answer("⌛ Results expired — search again.",
-                           show_alert=True)
-        return
-    from app import ai as ai_mod, ai_assist
-    if not ai_mod.is_configured():
-        await query.answer("🤖 AI is off right now.", show_alert=True)
-        return
-    if await ai_mod.quota_remaining(uid) <= 0:
-        await query.answer("🤖 Daily AI limit reached — try tomorrow 🌙",
-                           show_alert=True)
-        return
-    await query.answer("🤖 Asking AI…")
-    title = (data.get("meta") or {}).get("title") or data.get("query") or ""
-    titles = await ai_assist.ai_similar_titles(uid, title)
-    if not titles:
-        await query.answer("🤖 No suggestions right now.", show_alert=True)
-        return
-    data["similar"] = titles
-    rows = [[InlineKeyboardButton(
-        f"🔍 {(t[:42] + '…') if len(t) > 42 else t}",
-        callback_data=f"simq:{token}:{i}")]
-        for i, t in enumerate(titles)]
-    try:
-        await client.send_message(
-            query.message.chat.id,
-            f"🍿 <b>Similar to {ui.esc(title[:60])}:</b>",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML)
-    except Exception:
-        log.debug("similar send failed", exc_info=True)
-
-
-async def _simq(client: Client, query):
-    """Tap a similar title: ``simq:{token}:{idx}`` -> full v10 search."""
-    uid = query.from_user.id
-    if await is_banned(uid):
-        await query.answer("⛔ You are banned.", show_alert=True)
-        return
-    try:
-        _, token, idx = query.data.split(":")
-        idx = int(idx)
-    except (ValueError, IndexError):
-        return
-    data = state.v8_get(token)
-    titles = (data or {}).get("similar") or []
-    if idx < 0 or idx >= len(titles):
+    data = state.dym_tokens.pop(token, None)
+    if not data or data.get("uid") != uid:
         await query.answer("⌛ Expired — search again.", show_alert=True)
         return
-    await query.answer(f"🔍 {titles[idx][:40]}")
-    from app.bot.handlers.search import _search_and_send
-    sent = await _search_and_send(client, query.message.chat.id, uid,
-                                  titles[idx])
-    if not sent:
-        await client.send_message(query.message.chat.id,
-                                  "❌ Nothing found for that title.")
+    original = data.get("original") or ""
+    corrected = data.get("corrected") or ""
+    if action == "yes" and corrected:
+        await query.answer(f"🔍 {corrected[:40]}")
+        try:
+            await query.message.edit_text(
+                f"🔍 <i>Searching <b>{ui.esc(corrected[:80])}</b>…</i>",
+                parse_mode=ParseMode.HTML)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from app.bot.handlers import search as search_handlers
+            await search_handlers._v9_search_flow(
+                client, query.message, uid, corrected, _confirmed=True)
+        except Exception:  # noqa: BLE001
+            log.exception("dym yes-flow failed")
+        return
+    # no -> save the original search as a movie request
+    await query.answer("🎞 Saving as request…")
+    try:
+        from app.bot.handlers.requests import submit_request
+        rid = await submit_request(client, uid,
+                                   query.message.chat.id, original)
+    except Exception:  # noqa: BLE001
+        log.exception("dym request submit failed")
+        await query.message.reply_text("❌ Could not save your request — "
+                                       "try again later.")
+        return
+    try:
+        await query.message.edit_text(
+            f"✅ <b>Request submitted!</b>\n"
+            f"We'll try to add <b>{ui.esc(original[:80])}</b> soon. 🎬",
+            parse_mode=ParseMode.HTML)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _fsub_retry(client: Client, query):
@@ -461,67 +444,6 @@ async def _ixstop(client: Client, query):
         return
     job.cancel_event.set()
     await query.answer("🛑 Stopping…", show_alert=False)
-
-
-async def _aiq(client: Client, query):
-    """🤖 AI Search button: Groq parses the query, real DB files only."""
-    uid = query.from_user.id
-    if await is_banned(uid):
-        await query.answer("⛔ You are banned.", show_alert=True)
-        return
-    token = query.data.split(":", 1)[1] if ":" in query.data else ""
-    q = ai.take_query(token)
-    if not q:
-        await query.answer("⌛ Expired — search again.", show_alert=True)
-        return
-    await query.answer("🤖 AI is thinking…")
-    try:
-        intro, groups, status = await ai.ai_search(uid, q)
-    except Exception:  # noqa: BLE001
-        log.exception("ai search failed")
-        status, intro, groups = "failed", None, []
-    if status == "ai_off":
-        await query.message.edit_text(
-            "🤖 AI search isn't configured on this bot yet.")
-        return
-    if status == "no_quota":
-        await query.message.edit_text(
-            "🤖 Daily AI limit reached — try again tomorrow 🌙")
-        return
-    if status != "ok" or not groups:
-        text = "🤖 AI couldn't find it either."
-        if settings.REQUEST_CHANNEL:
-            text += " Try /request to ask for it! 🎞"
-        await query.message.edit_text(text)
-        return
-    new_token = state.results_put(groups, q, uid)
-    g = groups[0]
-    try:
-        meta = await get_movie(g.get("display"), g.get("year"))
-    except Exception:  # noqa: BLE001
-        meta = None
-    prefs = await personalize.get_prefs(uid)
-    qorder = None
-    if prefs["enabled"] and prefs["downloads"] >= personalize.MIN_DOWNLOADS:
-        qorder = personalize.quality_order(prefs)
-    card = ui.movie_card(g, meta=meta, personalized=bool(qorder))
-    # intro is raw AI text — escape it before mixing into HTML.
-    text = ((ui.esc(intro) if intro else "🤖 <b>AI results</b>")
-            + "\n\n" + card)[:3800]
-    kb = ui.movie_kb(new_token, 0, g, 0, qorder=qorder,
-                     more=len(groups) > 1)
-    poster = (meta or {}).get("poster_url")
-    if poster:
-        try:
-            await query.message.reply_photo(
-                poster, caption=text[:1000], reply_markup=kb,
-                parse_mode=ParseMode.HTML)
-            await query.message.delete()
-            return
-        except Exception:  # noqa: BLE001
-            log.debug("ai card photo failed, falling back to text")
-    await query.message.edit_text(text, reply_markup=kb,
-                                  parse_mode=ParseMode.HTML)
 
 
 async def _pset(client: Client, query):
@@ -630,10 +552,8 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
     bot.on_callback_query(filters.regex(r"^sp:"))(_spell)
     bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
+    bot.on_callback_query(filters.regex(r"^dym:"))(_dym)
     bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
-    bot.on_callback_query(filters.regex(r"^aiq:"))(_aiq)
     bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
     bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)
     bot.on_callback_query(filters.regex(r"^rf:"))(_rfilter)
-    bot.on_callback_query(filters.regex(r"^sim:"))(_similar)
-    bot.on_callback_query(filters.regex(r"^simq:"))(_simq)

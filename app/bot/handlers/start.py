@@ -38,8 +38,6 @@ HELP_TEXT = (
     "<code>2024</code> <code>s01 e02</code>\n\n"
     "✨ <b>Smart for you</b> — results order themselves by your taste "
     "as you download. /settings to control it.\n"
-    "🤖 <b>AI</b> — ask me a question (\"oru nalla comedy movie parayamo?\") "
-    "or tap <b>🤖 AI Search</b> when nothing is found.\n\n"
     "🎞 <b>Request</b> — <code>/request Movie Name 2024</code>\n"
     "📊 <b>Trending</b> — /trending\n\n"
     "⚙️ <b>Admin</b>: /index /stats /broadcast /ban /unban /warn /requests /groups"

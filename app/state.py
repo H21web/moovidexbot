@@ -252,6 +252,18 @@ pending_dl: dict[int, int] = _TTLMap(max_size=500, ttl=1800.0)
 pending_search: dict[int, str] = _TTLMap(max_size=500, ttl=1800.0)
 
 
+# --- did-you-mean tokens: token -> {uid, original, corrected, chat_id} ----
+# Set when a Search-API / Grok corrected title finds files (flow diagram:
+# confirm before showing results). Consumed by the dym: callback.
+dym_tokens: dict[str, dict] = _TTLMap(max_size=500, ttl=1800.0)
+
+
+# --- request-movie tokens: token -> {uid, q, chat_id} ----------------------
+# Set on the no-results card's Request Movie button; consumed by the
+# req: callback which saves the original search as a movie request.
+req_tokens: dict[str, dict] = _TTLMap(max_size=500, ttl=1800.0)
+
+
 # --- /index job registry (shared between engine and handlers) ---
 @dataclass
 class IndexJob:

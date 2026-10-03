@@ -18,6 +18,37 @@ from app.models import MovieRequest
 log = logging.getLogger(__name__)
 
 
+async def submit_request(client: Client, user_id: int, chat_id: int,
+                         text: str, mention: str | None = None) -> int:
+    """Save a movie request; notify the channel; feed /mystats.
+
+    Shared by /request, the Request Movie button and the did-you-mean
+    "No" path. Returns the request id.
+    """
+    text = (text or "").strip()[:500]
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        req = MovieRequest(user_id=user_id, text=text)
+        s.add(req)
+        await s.commit()
+        rid = req.id
+    # v10.1: feed /mystats — requests were never logged, so the counter
+    # was stuck at 0 forever.
+    asyncio.create_task(log_event("request", user_id=user_id,
+                                  chat_id=chat_id))
+    target = settings.REQUEST_CHANNEL
+    if target:
+        try:
+            who = mention or f"<code>{user_id}</code>"
+            await client.send_message(
+                target,
+                f"🎞 <b>New request #{rid}</b>\n"
+                f"From: {who}\n{text[:400]}")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("request notify failed: %s", exc)
+    return rid
+
+
 async def _request(client: Client, message: Message):
     user = await track_user(message)
     if user and user.is_banned:
@@ -35,35 +66,46 @@ async def _request(client: Client, message: Message):
             "🎞 <b>What movie should I add?</b>\n"
             "Reply with <code>/request Movie Name 2024</code>")
         return
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        req = MovieRequest(user_id=message.from_user.id, text=text[:500])
-        s.add(req)
-        await s.commit()
-        rid = req.id
-    # v10.1: feed /mystats — requests were never logged, so the counter
-    # was stuck at 0 forever.
-    asyncio.create_task(log_event("request", user_id=message.from_user.id,
-                                  chat_id=message.chat.id))
+    rid = await submit_request(client, message.from_user.id,
+                               message.chat.id, text,
+                               mention=message.from_user.mention)
     await message.reply_text(
         f"✅ <b>Request #{rid} noted!</b>\nWe'll add it soon. 🎬")
-    # notify request channel / admins
-    target = settings.REQUEST_CHANNEL
-    if target:
-        try:
-            await client.send_message(
-                target,
-                f"🎞 <b>New request #{rid}</b>\n"
-                f"From: {message.from_user.mention} "
-                f"(<code>{message.from_user.id}</code>)\n{text[:400]}")
-        except Exception as exc:
-            log.debug("request notify failed: %s", exc)
 
 
 async def _request_cb(client: Client, query):
-    await query.answer()
-    await query.message.reply_text(
-        "🎞 Send <code>/request Movie Name 2024</code> to ask for a movie.")
+    """🎞 Request Movie button: ``req:{token}`` — save the stashed
+    original search as a movie request (flow diagram terminal)."""
+    from app import state as state_mod
+    from app.bot.handlers.common import is_banned
+    uid = query.from_user.id
+    if await is_banned(uid):
+        await query.answer("⛔ You are banned.", show_alert=True)
+        return
+    try:
+        _, token = query.data.split(":", 1)
+    except (ValueError, AttributeError):
+        token = ""
+    data = state_mod.req_tokens.pop(token, None) if token else None
+    if not data or data.get("uid") != uid:
+        await query.answer("⌛ Expired — search again.", show_alert=True)
+        return
+    q = data.get("q") or ""
+    await query.answer("🎞 Submitting request…")
+    try:
+        rid = await submit_request(client, uid, query.message.chat.id, q)
+    except Exception:  # noqa: BLE001
+        log.exception("request submit failed")
+        await query.message.reply_text("❌ Could not save your request — "
+                                       "try again later.")
+        return
+    try:
+        await query.message.edit_text(
+            f"✅ <b>Request submitted!</b>\n"
+            f"We'll try to add <b>{q[:80]}</b> soon. 🎬",
+            parse_mode=ParseMode.HTML)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _request_group(client: Client, message: Message):
@@ -73,5 +115,5 @@ async def _request_group(client: Client, message: Message):
 
 def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.command("request"))(_request)
+    bot.on_callback_query(filters.regex(r"^req:"))(_request_cb)
     bot.on_message(filters.group & filters.command("request"))(_request_group)
-    bot.on_callback_query(filters.regex(r"^request$"))(_request_cb)
