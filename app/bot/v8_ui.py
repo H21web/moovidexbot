@@ -114,33 +114,22 @@ def v8_file_kb(file_db_id: int, user_id: int):
 
 
 def _clean_disp_name(name: str) -> str:
-    """Display-clean file name: short, no year/quality/language.
-
-    Those live on the meta line, so strip them here. Extension dropped
-    too. e.g. ``Dune.2024.1080p.BluRay.mkv`` -> ``Dune BluRay``.
-    """
+    """Display-clean file name: full name, dots/underscores -> spaces."""
     import re as _re
-    s = (name or "").strip()
-    s = _re.sub(r"\.(mkv|mp4|avi|mov|wmv|flv|webm|ts|m4v)$", "",
-                s, flags=_re.I)                       # extension
-    s = _re.sub(r"[._]+", " ", s).strip()             # dots -> spaces
-    s = _re.sub(r"\b(19|20)\d{2}\b", " ", s)           # year
-    s = _re.sub(r"\b(480p|720p|1080p|2160p|4320p|4[Kk])\b", " ", s)
-    s = _re.sub(r"\b(english|hindi|malayalam|tamil|telugu|kannada|"
-                r"dual(?:-audio)?|multi)\b", " ", s, flags=_re.I)
-    return _re.sub(r"\s+", " ", s).strip()
+    s = _re.sub(r"[._]+", " ", name or "").strip()
+    return _re.sub(r"\s+", " ", s)
 
 
 def _v8_file_line(idx: int, f: dict, user_id: int,
                   bot_username: str | None = None) -> str:
+    """One file as its own blockquote — full name + meta inside."""
     name = _clean_disp_name(f.get("file_name") or "file")
-    short = name if len(name) <= 48 else name[:45] + "…"
     # Tapping the file name delivers the file (deep link -> dl_ handler).
     deep = file_deep_link(bot_username, f["id"])
     if deep:
-        disp = f'<b><a href="{deep}">{esc(short)}</a></b>'
+        disp = f'<b><a href="{deep}">{esc(name)}</a></b>'
     else:
-        disp = f"<b>{esc(short)}</b>"
+        disp = f"<b>{esc(name)}</b>"
     icon = kind_icon(file_name=name)
     meta = " · ".join(x for x in (
         f.get("quality"), f.get("language"), fmt_size(f.get("file_size"))) if x)
@@ -150,10 +139,10 @@ def _v8_file_line(idx: int, f: dict, user_id: int,
         if e:
             se += f"E{e:02d}"
         meta = se + (" · " + meta if meta else "")
-    line = f"{icon} {disp}"
+    inner = f"{icon} {disp}"
     if meta:
-        line += f"\n   <i>{esc(meta)}</i>"
-    return line
+        inner += f"\n<i>{esc(meta)}</i>"
+    return f"<blockquote>{inner}</blockquote>"
 
 
 def v8_results_text(meta: dict | None, best: dict, files: list[dict],
@@ -183,23 +172,19 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
             parts.append(f"<i>{esc(plot[:170] + '…' if len(plot) > 170 else plot)}</i>")
         parts.append("")
     bname = _clean_disp_name(best.get("file_name") or "")
-    bshort = bname if len(bname) <= 60 else bname[:57] + "…"
     bdeep = file_deep_link(bot_username, best["id"])
     bq: list[str] = []
     if bdeep:
-        bq.append(f'📁 <a href="{bdeep}"><b>{esc(bshort)}</b></a>')
+        bq.append(f'📁 <a href="{bdeep}"><b>{esc(bname)}</b></a>')
     else:
-        bq.append(f"📁 <b>{esc(bshort)}</b>")
+        bq.append(f"📁 <b>{esc(bname)}</b>")
     bmeta = " · ".join(x for x in (
         best.get("quality"), best.get("language"),
         fmt_size(best.get("file_size"))) if x)
     if bmeta:
         bq.append(f"<i>{esc(bmeta)}</i>")
-    reasons = best.get("_pick_reasons") or []
-    if reasons:
-        bq.append(f"✅ <i>{esc(' · '.join(reasons))}</i>")
     if ai_note:
-        bq.append(f"💡 <i>“{esc(ai_note)}”</i>")
+        bq.append(f"💡 <i>{esc(ai_note)}</i>")
     parts.append("<blockquote>⭐ <b>Best Pick</b>\n" + "\n".join(bq) +
                  "</blockquote>")
     parts.append("")

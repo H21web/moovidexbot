@@ -158,6 +158,15 @@ async def _manageable_groups(uid: int) -> list[Group]:
 
 # ---------- /connect (in group) ----------
 
+async def _group_start(client: Client, message: Message):
+    """v10.10.3: /start inside a group — the private handler is PM-only."""
+    await message.reply_text(
+        "👋 <b>Moovidex</b> — your personal movie finder.\n\n"
+        "🔍 Just type a movie or series name here to search.\n"
+        "🛠 Group admins: run /connect to manage this group.",
+        parse_mode=ParseMode.HTML)
+
+
 async def _connect(client: Client, message: Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply_text("Run /connect inside the group.")
@@ -412,24 +421,25 @@ async def _grp_imdb(client: Client, query):
 
 def register(bot: Client) -> None:
     bot.on_message(filters.group & filters.command("connect"))(_connect)
+    bot.on_message(filters.group & filters.command("start"))(_group_start)
     bot.on_message(filters.group & filters.new_chat_members)(_bot_added)
     bot.on_message(filters.private & filters.command("groups"))(_groups)
     # pending replies must run before the search text handler
     bot.on_message(filters.private & filters.text,
                    group=-1)(_pending_reply)
 
-    bot.on_callback_query(filters.regex(r"^grp:\d+$"))(_mgr_cb(_grp_open))
+    bot.on_callback_query(filters.regex(r"^grp:-?\d+$"))(_mgr_cb(_grp_open))
     bot.on_callback_query(filters.regex(r"^grplist$"))(_grp_list)
-    bot.on_callback_query(filters.regex(r"^grpadmenu:\d+$"))(_mgr_cb(_ad_menu))
-    bot.on_callback_query(filters.regex(r"^grpad:\d+:\d+$"))(_mgr_cb(_ad_set))
-    bot.on_callback_query(filters.regex(r"^grpfsub:\d+$"))(
+    bot.on_callback_query(filters.regex(r"^grpadmenu:-?\d+$"))(_mgr_cb(_ad_menu))
+    bot.on_callback_query(filters.regex(r"^grpad:-?\d+:\d+$"))(_mgr_cb(_ad_set))
+    bot.on_callback_query(filters.regex(r"^grpfsub:-?\d+$"))(
         _mgr_cb(lambda c, q: _ask_reply(
             c, q, "fsub",
             "📢 Send the force-sub channels (comma separated @usernames), or <code>off</code> to clear.")))
-    bot.on_callback_query(filters.regex(r"^grpwelcome:\d+$"))(
+    bot.on_callback_query(filters.regex(r"^grpwelcome:-?\d+$"))(
         _mgr_cb(lambda c, q: _ask_reply(
             c, q, "welcome",
             "👋 Send the welcome text for new members, or <code>off</code> to clear.")))
-    bot.on_callback_query(filters.regex(r"^grpimdb:\d+$"))(_mgr_cb(_grp_imdb))
-    bot.on_callback_query(filters.regex(r"^grpdel:\d+$"))(_mgr_cb(_grp_del))
-    bot.on_callback_query(filters.regex(r"^grpdelok:\d+$"))(_mgr_cb(_grp_del_ok))
+    bot.on_callback_query(filters.regex(r"^grpimdb:-?\d+$"))(_mgr_cb(_grp_imdb))
+    bot.on_callback_query(filters.regex(r"^grpdel:-?\d+$"))(_mgr_cb(_grp_del))
+    bot.on_callback_query(filters.regex(r"^grpdelok:-?\d+$"))(_mgr_cb(_grp_del_ok))

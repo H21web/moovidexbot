@@ -47,16 +47,23 @@ async def _get_bot_username(client: Client) -> str | None:
     return _bot_username
 
 
-def _verdict_line(best: dict) -> str:
-    """Tiny best-pick note. Empty unless something is worth saying.
+def _verdict_line(best: dict, title: str) -> str:
+    """One-line best-pick verdict — why this file won.
 
-    v10.10.2: kept small — the quality/language already sit on the
-    meta line, so the verdict only speaks up for popular picks.
+    Clean and short: download popularity wins, otherwise the
+    quality/language edge behind the pick.
     """
     dl = (best or {}).get("downloads") or 0
     if dl >= 5:
-        return f"⬇ {dl} downloads"
-    return ""
+        return f"⬇ {dl} downloads · community favourite"
+    bits = [x for x in ((best or {}).get("quality"),
+                        (best or {}).get("language")) if x]
+    t = (title or "").strip()
+    if bits and t:
+        return f"Best {' · '.join(bits)} for \u201c{t}\u201d"
+    if t:
+        return f"Top match for \u201c{t}\u201d"
+    return "Top pick"
 
 
 def _no_results_kb(base: InlineKeyboardMarkup | None = None,
@@ -352,7 +359,7 @@ async def _v9_search_flow(client: Client, message: Message,
 
     log.info("[s:%s] flow: rendering %d files", sid, len(res["files"]))
 
-    ai_note = _verdict_line(res["best"])
+    ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -387,7 +394,7 @@ async def _search_and_send(client: Client, chat_id: int, uid: int,
         return False
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
         return False
-    ai_note = _verdict_line(res["best"])
+    ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
@@ -466,7 +473,7 @@ async def _v9_search_flow_group(client: Client, message: Message,
                else "Try a different spelling."),
             parse_mode=ParseMode.HTML)
         return
-    ai_note = _verdict_line(res["best"])
+    ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
     best["_pick_reasons"] = res.get("best_reasons") or []
     token = state.v8_put({
