@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -71,13 +72,19 @@ async def log_event(kind: str, user_id: int | None = None,
         log.debug("log_event %s failed: %s", kind, exc)
         return
     # Mirror to the log channel (fire-and-forget inside fire-and-forget).
-    icon = {"search_pm": "🔍", "search_group": "👪🔍", "ai": "🤖",
+    labels = {"search_pm": "Search", "search_group": "Group search",
+              "ai": "AI search", "request": "Request",
+              "download": "Download", "start": "Start"}
+    icon = {"search_pm": "🔍", "search_group": "👪", "ai": "🤖",
             "request": "🎞", "download": "📥", "start": "▶️"}.get(
                 a_kind, "📝")
-    who = f"<code>{user_id}</code>" if user_id else "—"
-    line = f"{icon} <b>{a_kind}</b> · {who}"
+    line = f"{icon} <b>{labels.get(a_kind, a_kind)}</b>"
+    if user_id:
+        line += f"\n👤 <code>{user_id}</code>"
+        if a_kind == "search_group" and chat_id:
+            line += f" · 👪 <code>{chat_id}</code>"
     if detail:
-        line += f"\n{(detail or '')[:200]}"
+        line += f"\n💬 {html.escape((detail or '')[:200])}"
     asyncio.create_task(_send_to_log_channel(line))
 
 

@@ -139,9 +139,9 @@ def _v8_file_line(idx: int, f: dict, user_id: int,
         if e:
             se += f"E{e:02d}"
         meta = se + (" · " + meta if meta else "")
-    line = f"{idx}. {icon} {disp}"
+    line = f"{icon} {disp}"
     if meta:
-        line += f"\n   {esc(meta)}"
+        line += f"\n   <i>{esc(meta)}</i>"
     return line
 
 
@@ -174,24 +174,23 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     bname = _clean_disp_name(best.get("file_name") or "")
     bshort = bname if len(bname) <= 60 else bname[:57] + "…"
     bdeep = file_deep_link(bot_username, best["id"])
-    bicon = kind_icon(meta, bname)
     bq: list[str] = []
     if bdeep:
-        bq.append(f"⭐ <b>Best pick</b> {bicon}\n"
-                  f'📁 <a href="{bdeep}">{esc(bshort)}</a>')
+        bq.append(f'📁 <a href="{bdeep}"><b>{esc(bshort)}</b></a>')
     else:
-        bq.append(f"⭐ <b>Best pick</b> {bicon}\n📁 {esc(bshort)}")
+        bq.append(f"📁 <b>{esc(bshort)}</b>")
     bmeta = " · ".join(x for x in (
         best.get("quality"), best.get("language"),
         fmt_size(best.get("file_size"))) if x)
     if bmeta:
-        bq.append(esc(bmeta))
+        bq.append(f"<i>{esc(bmeta)}</i>")
     reasons = best.get("_pick_reasons") or []
     if reasons:
         bq.append(f"✅ <i>{esc(' · '.join(reasons))}</i>")
     if ai_note:
         bq.append(f"💡 <i>“{esc(ai_note)}”</i>")
-    parts.append("<blockquote>" + "\n".join(bq) + "</blockquote>")
+    parts.append("<blockquote>⭐ <b>Best Pick</b>\n" + "\n".join(bq) +
+                 "</blockquote>")
     parts.append("")
     # v8.1: no other files besides the best pick -> skip the list section.
     if files:
