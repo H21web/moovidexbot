@@ -24,31 +24,24 @@ log = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-TITLE_SYSTEM = """You are a movie title correction module for a Telegram AutoFilter bot.
+TITLE_LIST_SYSTEM = """You are a movie-title correction module for a Telegram AutoFilter bot.
 
-Your only task is to identify the likely intended movie title from a user search containing spelling mistakes, missing spaces, incorrect transliteration, or incomplete words.
+Identify the likely intended movie or series title from the user's search. Handle spelling mistakes, missing spaces, transliteration errors, incomplete words, and technical filename words.
 
 Rules:
-1. Return JSON only. Do not use Markdown.
-2. Return only one likely corrected movie title, or null.
-3. Never claim that the movie exists in the bot database.
-4. Never provide file names, file IDs, Telegram links, download links, streaming links, or availability information.
-5. Do not ask the user any questions.
-6. Do not mention language, video quality, actor, director, genre, plot, release date, or explanation.
-7. Remove technical filename words such as 480p, 720p, 1080p, 4k, WEB-DL, WEBRip, BluRay, x264, x265, MKV, MP4, and dubbed.
-8. Correct only when reasonably confident.
-9. If you cannot identify one likely title, return null.
-10. Do not include words not related to the movie title.
+- Return JSON only. No Markdown.
+- Return 1–5 likely titles, ordered from most to least likely.
+- Include type: "movie" or "series".
+- Include year when confident; otherwise null.
+- If the query includes "similar", "related", "like", "season", "part", or a known franchise, return matching titles and related titles/seasons.
+- Remove technical words: 480p, 720p, 1080p, 4k, WEB-DL, WEBRip, BluRay, x264, x265, MKV, MP4, dubbed, etc.
+- Never claim availability, provide links, file IDs, or ask questions.
+- Do not include language, quality, actor, director, genre, plot, or explanations.
+- Return null only if no likely title can be identified.
 
-Return exactly this JSON format:
+Return exactly:
+{"titles":[{"title":null,"year":null,"type":null,"reason":"direct|similar|season|franchise"}]}"""
 
-{
-  "corrected_title": null,
-  "confidence": 0.0
-}"""
-
-# Minimum self-reported confidence before a Grok correction is used.
-MIN_AI_CONFIDENCE = 0.6
 
 _client: httpx.AsyncClient | None = None
 
@@ -170,6 +163,9 @@ _LEAD_IN_RE = re.compile(
     re.IGNORECASE)
 _TRAIL_YEAR_RE = re.compile(
     r"\s*(?:[\(\[]\s*)?(19\d{2}|20\d{2})(?:\s*[\)\]])?\s*$")
+_AI_SITE_SUFFIX_RE = re.compile(
+    r"\s*[-–—|]\s*(imdb|wikipedia|rotten tomatoes|letterboxd)\s*$",
+    re.IGNORECASE)
 
 
 def clean_ai_title(raw: str | None, original_q: str) -> str | None:
@@ -191,10 +187,11 @@ def clean_ai_title(raw: str | None, original_q: str) -> str | None:
             break
     if not line:
         return None
-    t = line.strip().strip("*_` \t")
+    t = line.strip()
     t = _LEAD_IN_RE.sub("", t).strip()
+    t = _AI_SITE_SUFFIX_RE.sub("", t).strip()
     t = _TRAIL_YEAR_RE.sub("", t).strip()
-    t = t.strip("\"'\u201c\u201d\u2018\u2019").strip()
+    t = t.strip("*_` \t").strip("\"'\u201c\u201d\u2018\u2019").strip()
     if not t or len(t) > 100:
         return None
     if t.upper() == "NONE":
@@ -208,49 +205,73 @@ def clean_ai_title(raw: str | None, original_q: str) -> str | None:
     return t
 
 
-def _parse_title_json(raw: str | None) -> tuple[str | None, float]:
-    """Parse Grok's ``{"corrected_title", "confidence"}`` reply."""
+def _parse_title_list(raw: str | None, q: str) -> list[dict]:
+    """Parse Grok's ``{"titles": [{title, year, type, reason}]}`` reply.
+
+    Returns cleaned title dicts, most-likely first. Empty list when
+    Grok can't identify anything.
+    """
     if not raw:
-        return None, 0.0
+        return []
     try:
         data = json.loads(raw)
     except Exception:  # noqa: BLE001
-        return None, 0.0
+        return []
     if not isinstance(data, dict):
-        return None, 0.0
-    title = data.get("corrected_title")
-    if not title or not isinstance(title, str):
-        return None, 0.0
-    try:
-        conf = float(data.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        conf = 0.0
-    return title.strip(), conf
+        return []
+    items = data.get("titles")
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for item in items[:5]:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        if not title or not isinstance(title, str):
+            continue
+        # Local cleaner: second safety net so the DB search runs on
+        # the bare title only.
+        title = clean_ai_title(title, q)
+        if not title:
+            continue
+        year = item.get("year")
+        try:
+            year = int(year) if year is not None else None
+        except (TypeError, ValueError):
+            year = None
+        if year is not None and not 1900 <= year <= 2100:
+            year = None
+        typ = item.get("type")
+        typ = typ if typ in ("movie", "series") else None
+        reason = item.get("reason")
+        reason = reason if isinstance(reason, str) else None
+        out.append({"title": title, "year": year, "type": typ,
+                    "reason": reason})
+    return out
 
 
-async def ai_extract_title(user_id: int | None, q: str,
-                           sid: str | None = None) -> str | None:
-    """Ask Grok for the intended title. Original query only — never any
-    search-API response. ``None`` when unconfigured, out of quota,
-    low confidence, or Grok can't tell."""
+async def ai_extract_titles(user_id: int | None, q: str,
+                            sid: str | None = None) -> list[dict]:
+    """Ask Grok for the intended title(s). Original query only.
+
+    Returns 0-5 cleaned ``{title, year, type, reason}`` dicts,
+    most-likely first. Empty list when unconfigured, out of quota,
+    or Grok can't tell.
+    """
     q = (q or "").strip()
     if not q or not is_configured():
-        return None
+        return []
     if await quota_remaining(user_id) <= 0:
-        log.debug("ai_extract_title: quota exhausted for %s", user_id)
-        return None
-    raw = await groq_complete(TITLE_SYSTEM, q[:200], max_tokens=120,
+        log.debug("ai_extract_titles: quota exhausted for %s", user_id)
+        return []
+    raw = await groq_complete(TITLE_LIST_SYSTEM, q[:200], max_tokens=400,
                               json_mode=True)
-    title, conf = _parse_title_json(raw)
-    if title is None or conf < MIN_AI_CONFIDENCE:
-        log.debug("ai_extract_title: rejected (confidence %.2f)", conf)
-        return None
-    # Second safety net: the local cleaner strips any junk the model
-    # left behind so the DB search runs on the bare title only.
-    title = clean_ai_title(title, q)
-    if not title:
-        return None
+    titles = _parse_title_list(raw, q)
+    if not titles:
+        log.info("[s:%s] grok: no title identified for %r", sid or "-",
+                 q[:60])
+        return []
     await quota_use(user_id)
-    log.info("[s:%s] grok title %r -> %r (conf %.2f)", sid or "-",
-             q[:60], title[:60], conf)
-    return title
+    log.info("[s:%s] grok titles %r -> %r", sid or "-", q[:60],
+             [(t["title"][:40], t["type"], t["year"]) for t in titles])
+    return titles

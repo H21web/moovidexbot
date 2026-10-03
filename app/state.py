@@ -252,10 +252,10 @@ pending_dl: dict[int, int] = _TTLMap(max_size=500, ttl=1800.0)
 pending_search: dict[int, str] = _TTLMap(max_size=500, ttl=1800.0)
 
 
-# --- did-you-mean tokens: token -> {uid, original, corrected, chat_id} ----
-# Set when a Search-API / Grok corrected title finds files (flow diagram:
-# confirm before showing results). Consumed by the dym: callback.
-dym_tokens: dict[str, dict] = _TTLMap(max_size=500, ttl=1800.0)
+# --- AI title-chooser tokens: token -> {uid, original, titles, sid} -------
+# Set when Grok returns several verified titles (v10.8 choose flow).
+# Consumed by the ait: callback.
+ait_tokens: dict[str, dict] = _TTLMap(max_size=500, ttl=1800.0)
 
 
 # --- request-movie tokens: token -> {uid, q, chat_id} ----------------------

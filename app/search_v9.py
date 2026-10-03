@@ -1,31 +1,18 @@
-"""v10.2 search module — fast on the hot path, smart on recovery.
+"""v10.8 search module — simple pipeline.
 
-Pipeline:
+1. **Clean + instant search** — the message is cleaned
+   (``textutil.parse_query``) and the DB is swept with several query
+   variants via ``asyncio.gather``; hits merge by best score per file
+   id. A low-threshold trigram pass (fuzzy) fires when hits are thin.
+2. **Grok AI title extraction** — only when zero files were found.
+   Grok gets the original query only and returns 1-5
+   ``{title, year, type, reason}`` candidates; every candidate is
+   verified against the DB (year applied for movies only, never
+   series). One verified title -> used directly. Several ->
+   ``status="choose"`` so the user picks. None -> ``no_results``.
 
-**Hot path** (every search, AI-free, ~parallel):
-
-1. **Parse** — local keyword-first parse (``textutil.parse_query``):
-   year/language/quality/season/episode come out of the query itself.
-2. **Multi-sweep (parallel)** — the DB is swept with several query
-   variants via ``asyncio.gather``; hits merge by best score per file id.
-3. **Fuzzy retry** — when hits are thin, a low-threshold trigram pass so
-   typos and mistagged files still surface.
-   A best hit scoring >= ``GOOD_SCORE`` returns immediately.
-
-**Recovery path** (only when the hot path is weak — the 3 logics):
-
-4. **Spell correction** (local, quota-free) — ``"avangerrs"`` becomes
-   ``"avengers"`` via Levenshtein against real indexed title words;
-   the DB is swept once more with the fixed query.
-5. **Web-search title parse** — the free search API is asked for
-   ``"<query> movie"`` and the canonical title is parsed from the
-   top results (IMDb/Wikipedia titles); the DB is swept with it.
-6. **AI title extraction** (quota-gated) — Groq pulls the movie/series
-   title out of the query; the DB is swept with it.
-
-Then: personal taste re-rank, user-priority best pick, confidence
-(``ok`` / ``uncertain`` / ``no_results``). Results render instantly;
-enrichment (poster/info) fills in via a background edit.
+No Search-API stage, no local spell stage — the pipeline is
+instant search -> fuzzy -> AI, nothing else.
 """
 from __future__ import annotations
 
@@ -37,7 +24,7 @@ import time as _time
 
 from sqlalchemy import func, select
 
-from app import enrich as enrich_mod, personalize, spell
+from app import personalize
 from app.bot.v8_ui import sort_best_first
 from app.config import settings
 from app.db import get_session_factory
@@ -195,14 +182,22 @@ def _with_original_filters(new_parsed: dict, orig_parsed: dict) -> dict:
 
 
 async def smart_search(user_id: int | None, raw: str) -> dict:
-    """Run the v10.2 search pipeline.
+    """Run the v10.8 search pipeline.
+
+    1. Clean the message, instant DB search (parallel sweeps + fuzzy
+       retry inside ``_hot_sweeps``).
+    2. No files -> Grok AI title extraction (original query only),
+       1-5 titles; each verified against the DB.
+    3. Exactly one verified title -> use it directly.
+       Several verified titles -> ``status="choose"`` (user picks).
+       None -> ``no_results``.
 
     Returns ``{"status", "files", "best", "best_reasons", "title",
-    "parsed", "confidence", "corrected", "corrected_via"}``; status is
-    ``"ok" | "uncertain" | "no_results"``. ``corrected`` is the
-    auto-fixed query when a recovery stage fired (for display);
-    ``corrected_via`` is ``"spell" | "web" | "ai" | None``; ``sid`` is
-    the per-search trace id used in the log lines.
+    "parsed", "confidence", "corrected", "corrected_via", "sid",
+    "choices", "raw"}``; status is
+    ``"ok" | "uncertain" | "no_results" | "choose"``.
+    ``corrected_via`` is ``"ai" | None``; ``sid`` is the per-search
+    trace id used in the log lines.
     """
     t0 = _time.time()
     sid = secrets.token_hex(2)
@@ -211,99 +206,66 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     parsed = parse_query(raw)
     parsed = await _ai_parse_if_needed(user_id, raw, parsed)
     title = (parsed.get("title") or raw).strip()
-    factory = get_session_factory(settings.DATABASE_URL)
+    orig_parsed = dict(parsed)
 
-    # --- hot path ------------------------------------------------------
+    # --- 1. instant search (normal + fuzzy) ------------------------------
     merged = await _hot_sweeps(user_id, raw, parsed, log_q=True)
     corrected: str | None = None
-    corrected_via: str | None = None  # "spell" | "web" | "ai"
+    corrected_via: str | None = None  # "ai" | None
     score = _best_score(merged)
     el = lambda: int((_time.time() - t0) * 1000)
     log.info("[s:%s] hot: %d files best=%.2f (%dms)", sid, len(merged),
              score, el())
 
-    # --- recovery: 1st logic — local spell correction ------------------
-    if score < GOOD_SCORE:
-        try:
-            fixed = await spell.correct_query(raw, factory)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("spell correction failed: %s", exc)
-            fixed = None
-        if fixed and fixed.lower() != raw.lower():
-            retry = await _hot_sweeps(user_id, fixed, parse_query(fixed),
-                                      log_q=False)
-            rs = _best_score(retry)
-            if rs > score:
-                merged, score = retry, rs
-                corrected = fixed
-                corrected_via = "spell"
-                parsed = parse_query(fixed)
-                parsed["title"] = fixed
-                title = fixed
-                log.info("[s:%s] spell: %r -> %r (%d files best=%.2f) (%dms)",
-                         sid, raw[:50], fixed[:50], len(retry), rs, el())
-            else:
-                log.info("[s:%s] spell: %r -> %r not better "
-                         "(%.2f <= %.2f) (%dms)",
-                         sid, raw[:50], fixed[:50], rs, score, el())
-        else:
-            log.info("[s:%s] spell: no correction (%dms)", sid, el())
-
-    # --- recovery: 2nd logic: Search API title candidates ----------------
-    # v10.7 rework: ONLY when the DB found zero files. Candidates are
-    # scored against the query (junk/franchise pages rejected); the
-    # first candidate with real DB files wins. A weak-but-real result
-    # set is never hijacked by a web guess anymore.
-    if not merged:
-        try:
-            candidates = await enrich_mod.web_title_candidates(raw, sid=sid)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("web title parse failed: %s", exc)
-            candidates = []
-        log.info("[s:%s] web: %d candidate(s) %r (%dms)", sid,
-                 len(candidates), [c[:40] for c in candidates[:3]], el())
-        for web_title in candidates[:3]:
-            new_parsed = _with_original_filters(parse_query(web_title),
-                                                parsed)
-            retry = await _hot_sweeps(user_id, web_title,
-                                      new_parsed, log_q=False)
-            log.info("[s:%s] web: tried %r -> %d files (%dms)", sid,
-                     web_title[:50], len(retry), el())
-            if retry:
-                merged, score = retry, _best_score(retry)
-                parsed = new_parsed
-                parsed["title"] = web_title
-                title = web_title
-                corrected = web_title
-                corrected_via = "web"
-                break
-
-    # --- recovery: 3rd logic — Grok AI title (v10.6, flow diagram) -----
-    # Runs only when the Search API found no usable title. The original
-    # user query only is sent to Grok — never any search-API response.
+    # --- 2. Grok AI title extraction (only on zero files) ---------------
+    choices: list[dict] = []
     if not merged:
         log.info("[s:%s] grok: asking (original query only) (%dms)",
                  sid, el())
         try:
             from app import ai as ai_mod
-            ai_title = await ai_mod.ai_extract_title(user_id, raw, sid=sid)
+            ai_titles = await ai_mod.ai_extract_titles(user_id, raw,
+                                                       sid=sid)
         except Exception as exc:  # noqa: BLE001
             log.debug("AI title extract failed: %s", exc)
-            ai_title = None
-        if ai_title:
-            log.info("[s:%s] grok: %r -> trying DB (%dms)", sid,
-                     ai_title[:50], el())
-            new_parsed = _with_original_filters(parse_query(ai_title),
-                                                parsed)
-            retry = await _hot_sweeps(user_id, ai_title,
-                                      new_parsed, log_q=False)
+            ai_titles = []
+        # Verify every AI title against the DB — only titles with real
+        # files survive. Year is applied for movies only, never series.
+        for t in ai_titles:
+            t_parsed = _with_original_filters(parse_query(t["title"]),
+                                              orig_parsed)
+            if t.get("type") == "movie" and t.get("year"):
+                t_parsed["year"] = t["year"]
+            retry = await _hot_sweeps(user_id, t["title"], t_parsed,
+                                      log_q=False)
+            log.info("[s:%s] grok: tried %r (%s) -> %d files (%dms)", sid,
+                     t["title"][:50], t.get("type"), len(retry), el())
             if retry:
-                merged, score = retry, _best_score(retry)
-                parsed = new_parsed
-                parsed["title"] = ai_title
-                title = ai_title
-                corrected = ai_title
-                corrected_via = "ai"
+                choices.append({"title": t["title"], "year": t.get("year"),
+                                "type": t.get("type"),
+                                "reason": t.get("reason"),
+                                "hits": retry, "parsed": t_parsed})
+        if len(choices) == 1:
+            c = choices[0]
+            merged, score = c["hits"], _best_score(c["hits"])
+            parsed = c["parsed"]
+            parsed["title"] = c["title"]
+            title = c["title"]
+            corrected = c["title"]
+            corrected_via = "ai"
+            log.info("[s:%s] grok: single title %r -> using it (%dms)",
+                     sid, title[:50], el())
+        elif len(choices) > 1:
+            log.info("[s:%s] grok: %d titles -> asking user (%dms)", sid,
+                     len(choices), el())
+            return {"status": "choose", "files": [], "best": None,
+                    "best_reasons": [], "title": title, "parsed": parsed,
+                    "confidence": 0.0, "corrected": None,
+                    "corrected_via": None, "sid": sid,
+                    "choices": [{"title": c["title"], "year": c["year"],
+                                 "type": c["type"], "reason": c["reason"]}
+                                for c in choices],
+                    "raw": raw}
 
     items = list(merged.values())
     if not items:
@@ -312,7 +274,8 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
         return {"status": "no_results", "files": [], "best": None,
                 "best_reasons": [], "title": title, "parsed": parsed,
                 "confidence": 0.0, "corrected": corrected,
-                "corrected_via": corrected_via, "sid": sid}
+                "corrected_via": corrected_via, "sid": sid,
+                "choices": [], "raw": raw}
 
     # --- rerank: taste -> score/quality/size ---------------------------
     try:
@@ -348,4 +311,5 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     return {"status": status, "files": files, "best": best,
             "best_reasons": reasons, "title": title, "parsed": parsed,
             "confidence": confidence, "corrected": corrected,
-            "corrected_via": corrected_via, "sid": sid}
+            "corrected_via": corrected_via, "sid": sid,
+            "choices": [], "raw": raw}

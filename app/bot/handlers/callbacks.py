@@ -297,33 +297,11 @@ async def _deliver(client: Client, query):
             pass
 
 
-async def _spell(client: Client, query):
-    uid = query.from_user.id
-    if await is_banned(uid):
-        await query.answer("⛔ You are banned.", show_alert=True)
-        return
-    suggestion = query.data.split(":", 1)[1]
-    await query.answer()
-    # v10.2: re-run the full v10 search flow and render the SAME v8 card
-    # model as a normal search — no more old button model anywhere.
-    from app.bot.handlers.search import _search_and_send
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    sent = await _search_and_send(client, query.message.chat.id, uid,
-                                  suggestion)
-    if not sent:
-        await client.send_message(query.message.chat.id,
-                                  "❌ Still nothing found.")
+async def _ait(client: Client, query):
+    """AI title chooser: ``ait:{token}:{idx}`` / ``ait:{token}:req``.
 
-
-async def _dym(client: Client, query):
-    """Did-you-mean confirm: ``dym:{token}:yes`` / ``dym:{token}:no``.
-
-    Flow diagram: ✅ Yes -> normal AutoFilter search with the corrected
-    title -> results. ❌ No -> save the ORIGINAL search as a movie
-    request -> "Request submitted".
+    v10.8: idx -> normal AutoFilter search with the chosen title.
+    req -> save the ORIGINAL search as a movie request.
     """
     uid = query.from_user.id
     if await is_banned(uid):
@@ -333,49 +311,60 @@ async def _dym(client: Client, query):
         _, token, action = query.data.split(":")
     except (ValueError, AttributeError):
         return
-    data = state.dym_tokens.pop(token, None)
+    data = state.ait_tokens.pop(token, None)
     if not data or data.get("uid") != uid:
         await query.answer("⌛ Expired — search again.", show_alert=True)
         return
     sid = data.get("sid")
     original = data.get("original") or ""
-    corrected = data.get("corrected") or ""
-    if action == "yes" and corrected:
-        await query.answer(f"🔍 {corrected[:40]}")
-        log.info("[s:%s] dym: yes -> searching %r", sid, corrected[:60])
+    titles = data.get("titles") or []
+    if action == "req":
+        # save the original search as a movie request
+        await query.answer("🎞 Saving as request…")
+        log.info("[s:%s] ai-choose: request instead %r", sid,
+                 original[:60])
+        try:
+            from app.bot.handlers.requests import submit_request
+            rid = await submit_request(client, uid,
+                                       query.message.chat.id, original)
+        except Exception:  # noqa: BLE001
+            log.exception("ait request submit failed")
+            await query.message.reply_text("❌ Could not save your request — "
+                                           "try again later.")
+            return
         try:
             await query.message.edit_text(
-                f"🔍 <i>Searching <b>{ui.esc(corrected[:80])}</b>…</i>",
+                "✅ <b>Request submitted!</b>\n\n"
+                f"🎬 <b>{ui.esc(original[:80])}</b>\n"
+                "<i>We'll try to add it soon.</i>",
                 parse_mode=ParseMode.HTML)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            from app.bot.handlers import search as search_handlers
-            await search_handlers._v9_search_flow(
-                client, query.message, uid, corrected, _confirmed=True)
-        except Exception:  # noqa: BLE001
-            log.exception("dym yes-flow failed")
         return
-    # no -> save the original search as a movie request
-    await query.answer("🎞 Saving as request…")
-    log.info("[s:%s] dym: no -> request %r", sid, original[:60])
     try:
-        from app.bot.handlers.requests import submit_request
-        rid = await submit_request(client, uid,
-                                   query.message.chat.id, original)
-    except Exception:  # noqa: BLE001
-        log.exception("dym request submit failed")
-        await query.message.reply_text("❌ Could not save your request — "
-                                       "try again later.")
+        idx = int(action)
+        chosen = titles[idx]
+    except (ValueError, IndexError, TypeError):
+        await query.answer("⌛ Expired — search again.", show_alert=True)
         return
+    await query.answer(f"🔍 {chosen[:40]}")
+    log.info("[s:%s] ai-choose: %r -> searching", sid, chosen[:60])
     try:
         await query.message.edit_text(
-            f"✅ <b>Request submitted!</b>\n\n"
-            f"🎬 <b>{ui.esc(original[:80])}</b>\n"
-            f"<i>We'll try to add it soon.</i>",
+            f"🔍 <i>Searching <b>{ui.esc(chosen[:80])}</b>…</i>",
             parse_mode=ParseMode.HTML)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from app.bot.handlers import search as search_handlers
+        if data.get("group"):
+            await search_handlers._v9_search_flow_group(
+                client, query.message, uid, chosen)
+        else:
+            await search_handlers._v9_search_flow(
+                client, query.message, uid, chosen, _confirmed=True)
+    except Exception:  # noqa: BLE001
+        log.exception("ait choose-flow failed")
 
 
 async def _fsub_retry(client: Client, query):
@@ -554,9 +543,8 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^mv:"))(_movie)
     bot.on_callback_query(filters.regex(r"^bk:"))(_back)
     bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
-    bot.on_callback_query(filters.regex(r"^sp:"))(_spell)
     bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
-    bot.on_callback_query(filters.regex(r"^dym:"))(_dym)
+    bot.on_callback_query(filters.regex(r"^ait:"))(_ait)
     bot.on_callback_query(filters.regex(r"^ixstop:"))(_ixstop)
     bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
     bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)

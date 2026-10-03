@@ -129,12 +129,6 @@ def movie_kb(token: str, midx: int, group: dict,
     return InlineKeyboardMarkup(rows)
 
 
-def spell_kb(suggestions: list[str]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"🔍 {s[:50]}", callback_data=f"sp:{s[:50]}")]
-            for s in suggestions[:3]]
-    return InlineKeyboardMarkup(rows)
-
-
 def ai_search_kb(query_token: str) -> InlineKeyboardMarkup:
     """On-demand AI search button (shown when normal search finds nothing)."""
     return InlineKeyboardMarkup([[
