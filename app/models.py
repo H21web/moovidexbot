@@ -153,6 +153,26 @@ class EventLog(Base):
     )
 
 
+class ActivityLog(Base):
+    """v10.8.10: human-readable bot activity log for the admin dashboard.
+
+    AI usage, PM/group searches, requests, downloads, starts — one row
+    per event with a short detail. The dashboard shows the last 30 days;
+    older rows are pruned (the log channel keeps the permanent copy).
+    """
+
+    __tablename__ = "activity_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
 class TmdbCache(Base):
     __tablename__ = "tmdb_cache"
 

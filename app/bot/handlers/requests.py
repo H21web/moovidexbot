@@ -35,7 +35,7 @@ async def submit_request(client: Client, user_id: int, chat_id: int,
     # v10.1: feed /mystats — requests were never logged, so the counter
     # was stuck at 0 forever.
     asyncio.create_task(log_event("request", user_id=user_id,
-                                  chat_id=chat_id))
+                                  chat_id=chat_id, detail=text[:120]))
     target = settings.REQUEST_CHANNEL
     if target:
         try:

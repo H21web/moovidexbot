@@ -4,6 +4,7 @@ from __future__ import annotations
 from pyrogram import Client
 
 from app.bot.handlers import admin, callbacks, deltimer, groups, index, inline, requests, saved, search, start
+from app.bot import forcesub
 
 
 def register_all(bot: Client) -> None:
@@ -17,3 +18,4 @@ def register_all(bot: Client) -> None:
     saved.register(bot)   # v10: watchlist + /saved + /mystats
     deltimer.register(bot)  # v10.2: /deltimer per-user auto-delete
     inline.register(bot)  # v10: inline mode
+    forcesub.register(bot)  # v10.8.10: auto-approve join requests

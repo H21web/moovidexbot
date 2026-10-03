@@ -221,10 +221,15 @@ async def render_v8_results(client: Client, message: Message,
     if not built[0]:
         return
     text, kb = built
+    # v10.8.10: allow Telegram's link preview ONLY when the title links
+    # to a poster/backdrop image — that renders the big preview on top.
+    # Without an image the preview stays off (avoids junk t.me previews).
+    meta = data.get("meta") or {}
+    allow_preview = bool(meta.get("backdrop_url") or meta.get("poster_url"))
     try:
         await message.edit_text(text, reply_markup=kb,
                                 parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True)
+                                disable_web_page_preview=not allow_preview)
     except Exception:
         log.debug("v8 render edit failed", exc_info=True)
 
@@ -240,6 +245,8 @@ async def send_v8_results(client: Client, chat_id: int, token: str,
         return None
     text, kb = built
     try:
+        # v10.8.10: fresh sends have no poster yet (meta fills in
+        # background) — keep preview off; _fill_meta turns it on.
         return await client.send_message(
             chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML,
             disable_web_page_preview=True)
@@ -474,7 +481,8 @@ async def _handle_text_query(client: Client, message: Message,
     """
     pm = _is_pm(message.chat.id)
     asyncio.create_task(log_event("search", user_id=uid,
-                                  chat_id=message.chat.id))
+                                  chat_id=message.chat.id,
+                                  detail=q[:120]))
     # v9: AI intent router — no more what/when prefix matching. AI works
     # whether or not there are results; every message gets a real route.
     if pm:

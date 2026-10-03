@@ -350,12 +350,6 @@ async def _ait(client: Client, query):
     await query.answer(f"🔍 {chosen[:40]}")
     log.info("[s:%s] ai-choose: %r -> searching", sid, chosen[:60])
     try:
-        await query.message.edit_text(
-            f"🔍 <i>Searching <b>{ui.esc(chosen[:80])}</b>…</i>",
-            parse_mode=ParseMode.HTML)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
         from app.bot.handlers import search as search_handlers
         if data.get("group"):
             await search_handlers._v9_search_flow_group(
@@ -422,11 +416,25 @@ async def _ais(client: Client, query):
 
 async def _fsub_retry(client: Client, query):
     uid = query.from_user.id
-    kb = await forcesub.ensure_joined(client, uid,
-                                      chat_id=query.message.chat.id)
-    if kb:
+    missing = await forcesub.missing_channels(client, uid,
+                                              chat_id=query.message.chat.id)
+    if missing:
+        # v10.8.10 fallback: the user may have a *pending* join request
+        # (tapped "Request to Join" but auto-approve lagged). Approve it
+        # on the spot, then re-check before complaining.
+        approved = await forcesub.approve_pending(client, uid, missing)
+        if approved:
+            missing = await forcesub.missing_channels(
+                client, uid, chat_id=query.message.chat.id)
+    if missing:
+        kb = await forcesub.join_kb(client, missing)
         await query.answer("❌ You haven't joined all channels yet.",
                            show_alert=True)
+        try:
+            await query.message.edit_reply_markup(kb)
+        except Exception:
+            pass
+        return
     else:
         await query.answer("✅ All joined!", show_alert=True)
         # v10.2.1: auto-deliver the waiting file (download / deep-link).

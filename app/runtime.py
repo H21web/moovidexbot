@@ -24,6 +24,17 @@ MANAGED: dict[str, dict] = {
         "hint": "Comma separated @usernames or ids. Empty = off.",
         "env": "FORCE_SUB_CHANNELS",
     },
+    "FSUB_JOIN_REQUEST": {
+        "type": "bool", "label": "Force-sub: request-to-join links",
+        "hint": "Join buttons open a join REQUEST (auto-approved) instead "
+                "of a direct join. Bot must be admin with invite rights.",
+        "env": "FSUB_JOIN_REQUEST", "default": True,
+    },
+    "FSUB_AUTO_APPROVE": {
+        "type": "bool", "label": "Force-sub: auto-approve join requests",
+        "hint": "Automatically approve channel join requests.",
+        "env": "FSUB_AUTO_APPROVE", "default": True,
+    },
     "AUTO_DELETE_SECONDS": {
         "type": "int", "label": "Default auto-delete (seconds)",
         "hint": "0 = off. Per-group values override this.",

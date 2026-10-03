@@ -9,21 +9,114 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import get_session_factory
-from app.models import EventLog, File, MovieRequest, SearchLog, User
+from app.models import ActivityLog, EventLog, File, MovieRequest, SearchLog, User
 
 log = logging.getLogger(__name__)
 
+# v10.8.10: activity-log retention — dashboard DB rows older than this
+# are pruned (the log channel keeps the permanent copy).
+ACTIVITY_RETENTION_DAYS = 30
+
+# search -> pm/group split for the activity log
+def _activity_kind(kind: str, chat_id: int | None) -> str:
+    if kind == "search":
+        return "search_group" if chat_id and chat_id < 0 else "search_pm"
+    return kind
+
+
+def _get_bot():
+    """Lazy bot client (avoids a circular import at module load)."""
+    try:
+        from app.bot import app as bot_app
+        return bot_app.bot
+    except Exception:
+        return None
+
+
+async def _send_to_log_channel(text: str) -> None:
+    chan = (settings.LOG_CHANNEL or "").strip()
+    if not chan:
+        return
+    client = _get_bot()
+    if not client:
+        return
+    try:
+        from pyrogram.enums import ParseMode
+
+        ref = int(chan) if chan.lstrip("-").isdigit() else chan
+        await client.send_message(ref, text, parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("activity log-channel send failed: %s", exc)
+
 
 async def log_event(kind: str, user_id: int | None = None,
-                    chat_id: int | None = None) -> None:
-    """Fire-and-forget analytics event (never breaks the caller)."""
+                    chat_id: int | None = None,
+                    detail: str | None = None) -> None:
+    """Fire-and-forget analytics event (never breaks the caller).
+
+    v10.8.10: also writes the human-readable ActivityLog row (AI usage,
+    pm/group searches, requests, downloads, starts) and mirrors it to
+    the log channel.
+    """
+    a_kind = _activity_kind(kind, chat_id)
     try:
         factory = get_session_factory(settings.DATABASE_URL)
         async with factory() as s:
             s.add(EventLog(kind=kind, user_id=user_id, chat_id=chat_id))
+            s.add(ActivityLog(kind=a_kind, user_id=user_id, chat_id=chat_id,
+                              detail=(detail or "")[:500] or None))
             await s.commit()
     except Exception as exc:
         log.debug("log_event %s failed: %s", kind, exc)
+        return
+    # Mirror to the log channel (fire-and-forget inside fire-and-forget).
+    icon = {"search_pm": "🔍", "search_group": "👪🔍", "ai": "🤖",
+            "request": "🎞", "download": "📥", "start": "▶️"}.get(
+                a_kind, "📝")
+    who = f"<code>{user_id}</code>" if user_id else "—"
+    line = f"{icon} <b>{a_kind}</b> · {who}"
+    if detail:
+        line += f"\n{(detail or '')[:200]}"
+    asyncio.create_task(_send_to_log_channel(line))
+
+
+async def prune_activity_logs(days: int = ACTIVITY_RETENTION_DAYS) -> int:
+    """Delete activity-log rows older than ``days``. Returns rows deleted."""
+    from sqlalchemy import delete as sa_delete
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            res = await s.execute(
+                sa_delete(ActivityLog).where(ActivityLog.created_at < cutoff))
+            await s.commit()
+            n = res.rowcount or 0
+            if n:
+                log.info("pruned %d activity-log rows older than %dd",
+                         n, days)
+            return n
+    except Exception as exc:  # noqa: BLE001
+        log.debug("prune_activity_logs failed: %s", exc)
+        return 0
+
+
+_prune_task: asyncio.Task | None = None
+
+
+async def _prune_worker() -> None:
+    while True:
+        await asyncio.sleep(24 * 3600)
+        await prune_activity_logs()
+
+
+def start_prune_task() -> asyncio.Task:
+    """Spawn the daily activity-log pruner (idempotent)."""
+    global _prune_task
+    if _prune_task is None or _prune_task.done():
+        _prune_task = asyncio.create_task(_prune_worker())
+    return _prune_task
 
 
 async def _daily(table, date_col, days: int = 30,

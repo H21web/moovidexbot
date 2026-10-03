@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from app.bot import app as bot_app
 from app.bot.handlers import register_all
+from app import analytics
 from app import autodelete
 from app.config import settings
 from app.db import get_session_factory
@@ -64,18 +65,26 @@ async def amain() -> None:
         web, host="0.0.0.0", port=settings.PORT, log_level="warning"))
     log.info("web player on port %d", settings.PORT)
     ad_task = autodelete.start()
+    prune_task = analytics.start_prune_task()  # v10.8.10: activity log 30d
     try:
         await server.serve()
     finally:
         # P3: await the cancel — a bare cancel() leaves the task
         # dangling and can swallow shutdown errors.
         ad_task.cancel()
+        prune_task.cancel()
         try:
             await ad_task
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
             log.debug("autodelete shutdown: %s", exc)
+        try:
+            await prune_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("prune shutdown: %s", exc)
         # Close shared httpx clients and the DB pool.
         try:
             from app import ai as ai_mod

@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape as _esc
 
 from fastapi import APIRouter, Form, HTTPException, Request
@@ -28,7 +28,8 @@ from app import analytics
 from app.bot import app as bot_app
 from app.config import settings
 from app.db import get_session_factory
-from app.models import EventLog, File, Group, MovieRequest, SearchLog, User
+from app.models import (ActivityLog, EventLog, File, Group, MovieRequest,
+                        SearchLog, User)
 from app import runtime as rt
 
 log = logging.getLogger(__name__)
@@ -110,6 +111,7 @@ def layout(title: str, body: str, active: str = "") -> str:
 <title>{esc(title)} · Moovidex Admin</title><style>{_CSS}</style></head>
 <body><nav><span class="brand">🎛 Moovidex Admin</span>
 {nav("/", "📊 Dashboard", "dash")}
+{nav("/activity", "📝 Activity", "act")}
 {nav("/users", "👥 Users", "users")}
 {nav("/broadcast", "📢 Broadcast", "bcast")}
 {nav("/files", "📦 Files", "files")}
@@ -177,6 +179,7 @@ async def logout():
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     _need_auth(request)
+
     data = await analytics.overview(30)
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
@@ -189,14 +192,72 @@ async def dashboard(request: Request):
         n_banned = (await s.execute(
             select(func.count(User.id)).where(User.is_banned.is_(True))
         )).scalar() or 0
+        # v10.8.10: total file size.
+        total_bytes = (await s.execute(
+            select(func.coalesce(func.sum(File.file_size), 0)))).scalar() or 0
+        # v10.8.10: request fulfilment stats.
+        req_total = (await s.execute(
+            select(func.count(MovieRequest.id)))).scalar() or 0
+        req_done = (await s.execute(
+            select(func.count(MovieRequest.id)).where(
+                MovieRequest.status == "done"))).scalar() or 0
+        # today's requests -> per-user fulfilment ratio, averaged.
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        today_reqs = (await s.execute(
+            select(MovieRequest.user_id, MovieRequest.status).where(
+                MovieRequest.created_at >= today_start))).all()
+        per_user: dict[int, list[int]] = {}
+        for uid_, st in today_reqs:
+            d, t = per_user.get(uid_, [0, 0])
+            t += 1
+            if st == "done":
+                d += 1
+            per_user[uid_] = [d, t]
+        if per_user:
+            avg_fulfil = (sum(d / t for d, t in per_user.values())
+                          / len(per_user) * 100)
+            fulfil_txt = f"{avg_fulfil:.0f}%"
+        else:
+            fulfil_txt = "—"
+        # v10.8.10: file delivery rate today (downloads / searches).
+        n_search_today = (await s.execute(
+            select(func.count(EventLog.id)).where(
+                EventLog.kind == "search",
+                EventLog.created_at >= today_start))).scalar() or 0
+        n_dl_today = (await s.execute(
+            select(func.count(EventLog.id)).where(
+                EventLog.kind == "download",
+                EventLog.created_at >= today_start))).scalar() or 0
+        if n_search_today:
+            dl_rate = min(100.0, n_dl_today / n_search_today * 100)
+            dl_txt = f"{dl_rate:.0f}%"
+        else:
+            dl_txt = "—"
 
+    unfulfilled = req_total - req_done
+    unf_pct = (unfulfilled / req_total * 100) if req_total else 0
     cards = "".join([
         f'<div class="card"><div class="n">{n_files:,}</div><div class="l">📦 Files</div></div>',
+        f'<div class="card"><div class="n">{_fmt_size(total_bytes)}</div><div class="l">💾 Total file size</div></div>',
         f'<div class="card"><div class="n">{n_users:,}</div><div class="l">👥 Users</div></div>',
         f'<div class="card"><div class="n">{n_groups:,}</div><div class="l">👪 Groups</div></div>',
         f'<div class="card"><div class="n">{n_open}</div><div class="l">🎞 Open requests</div></div>',
         f'<div class="card"><div class="n">{n_banned:,}</div><div class="l">🚫 Banned</div></div>',
     ])
+
+    req_stats = (
+        "<h2>🎞 Requests</h2><table>"
+        "<tr><th>Total</th><th>✅ Fulfilled</th><th>❌ Unfulfilled</th>"
+        "<th>Unfulfilled %</th><th>Avg user fulfilment (today)</th></tr>"
+        f"<tr><td><b>{req_total:,}</b></td><td>{req_done:,}</td>"
+        f"<td>{unfulfilled:,}</td><td>{unf_pct:.1f}%</td>"
+        f"<td><b>{fulfil_txt}</b></td></tr></table>"
+        "<h2>📥 Delivery</h2><table>"
+        "<tr><th>Searches today</th><th>Deliveries today</th>"
+        "<th>Success delivery rate (today)</th></tr>"
+        f"<tr><td><b>{n_search_today:,}</b></td><td>{n_dl_today:,}</td>"
+        f"<td><b>{dl_txt}</b></td></tr></table>")
 
     def period_row(label: str, vals: dict) -> str:
         return ("<tr><td><b>" + esc(label) + "</b></td>" +
@@ -224,8 +285,78 @@ async def dashboard(request: Request):
               "<th>🔍</th><th>📥</th><th>▶️</th><th>👤</th><th>📦</th><th>🎞</th>"
               "</tr>" + rows + "</table>")
 
-    body = f"<h2>📊 Dashboard</h2><div class='cards'>{cards}</div>{summary}{detail}"
+    body = (f"<h2>📊 Dashboard</h2><div class='cards'>{cards}</div>"
+            f"{req_stats}{summary}{detail}")
     return page("Dashboard", body, "dash")
+
+
+# ---------- activity log ----------
+
+ACT_KINDS = ("search_pm", "search_group", "ai", "request", "download",
+             "start")
+ACT_ICONS = {"search_pm": "🔍", "search_group": "👪", "ai": "🤖",
+             "request": "🎞", "download": "📥", "start": "▶️"}
+
+
+@router.get("/activity", response_class=HTMLResponse)
+async def activity(request: Request, kind: str = "", q: str = "",
+                   page_num: int = 1):
+    _need_auth(request)
+    # v10.8.10: lazy retention — prune on every view (the daily worker
+    # is the backstop). Log channel keeps the permanent copy.
+    asyncio.create_task(analytics.prune_activity_logs())
+    per = 30
+    page_num = max(1, page_num)
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        base = select(ActivityLog)
+        if kind in ACT_KINDS:
+            base = base.where(ActivityLog.kind == kind)
+        if q and q.lstrip("-").isdigit():
+            base = base.where(ActivityLog.user_id == int(q))
+        total = (await s.execute(
+            select(func.count()).select_from(base.subquery()))).scalar() or 0
+        rows = (await s.execute(
+            base.order_by(ActivityLog.id.desc())
+            .offset((page_num - 1) * per).limit(per))).scalars().all()
+
+    tabs = (f"<a class='btn sm {'green' if not kind else 'grey'}' "
+            f"href='/admin/activity'>all</a> ")
+    tabs += " ".join(
+        f"<a class='btn sm {'green' if kind == k else 'grey'}' "
+        f"href='/admin/activity?kind={k}'>{ACT_ICONS.get(k, '')} {k}</a>"
+        for k in ACT_KINDS)
+    trs = ""
+    for r in rows:
+        trs += ("<tr><td class='mut'>" +
+                esc(str(r.created_at)[:19] if r.created_at else "—") +
+                "</td><td>" + ACT_ICONS.get(r.kind, "📝") + " " +
+                esc(r.kind) + "</td>"
+                f"<td><code>{r.user_id or '—'}</code></td>"
+                f"<td>{esc((r.detail or '')[:120])}</td></tr>")
+    pages = max(1, (total + per - 1) // per)
+    pager = (f"<div class='pager'><span class='mut'>Page {page_num}/{pages} "
+             f"· {total:,} events (30-day retention)</span>")
+    if page_num > 1:
+        pager += (f" <a class='btn sm grey' href='/admin/activity?kind={esc(kind)}"
+                  f"&q={esc(q)}&page_num={page_num - 1}'>← Prev</a>")
+    if page_num < pages:
+        pager += (f" <a class='btn sm grey' href='/admin/activity?kind={esc(kind)}"
+                  f"&q={esc(q)}&page_num={page_num + 1}'>Next →</a>")
+    pager += "</div>"
+    body = (f"<h2>📝 Activity log</h2><div class='pager'>{tabs}</div>"
+            "<form method='get'><div class='row'><div>"
+            "<input type='text' name='q' placeholder='Filter by user id…' "
+            f"value='{esc(q)}'>"
+            + (f"<input type='hidden' name='kind' value='{esc(kind)}'>"
+               if kind else "") +
+            "</div><div style='flex:0'>"
+            "<button class='btn' type='submit'>Filter</button></div></div></form>"
+            f"{pager}<table><tr><th>Time</th><th>Event</th><th>User</th>"
+            "<th>Detail</th></tr>"
+            + (trs or "<tr><td colspan=4 class='mut'>No events yet.</td></tr>")
+            + "</table>" + pager)
+    return page("Activity", body, "act")
 
 # ---------- users ----------
 
@@ -437,10 +568,22 @@ def _fmt_size(n) -> str:
 
 @router.get("/files", response_class=HTMLResponse)
 async def files(request: Request, q: str = "", page_num: int = 1,
-                msg: str = ""):
+                msg: str = "", sort: str = "newest"):
     _need_auth(request)
     per = 20
     page_num = max(1, page_num)
+    # v10.8.10: sortable columns.
+    sorts = {
+        "newest": (File.created_at.desc(), "🕘 Newest"),
+        "oldest": (File.created_at.asc(), "🕘 Oldest"),
+        "name_az": (File.file_name.asc(), "🔤 Name A–Z"),
+        "name_za": (File.file_name.desc(), "🔤 Name Z–A"),
+        "size_desc": (File.file_size.desc().nullslast(), "💾 Biggest"),
+        "size_asc": (File.file_size.asc().nullslast(), "💾 Smallest"),
+        "dl_desc": (File.downloads.desc(), "📥 Most downloaded"),
+    }
+    order, _label = sorts.get(sort, sorts["newest"])
+    sort = sort if sort in sorts else "newest"
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
         base = select(File)
@@ -451,7 +594,7 @@ async def files(request: Request, q: str = "", page_num: int = 1,
         total = (await s.execute(
             select(func.count()).select_from(base.subquery()))).scalar() or 0
         rows = (await s.execute(
-            base.order_by(File.created_at.desc())
+            base.order_by(order)
             .offset((page_num - 1) * per).limit(per))).scalars().all()
 
     banner = f'<div class="okmsg">{esc(msg)}</div>' if msg else ""
@@ -472,14 +615,19 @@ async def files(request: Request, q: str = "", page_num: int = 1,
     pager = (f"<div class='pager'><span class='mut'>Page {page_num}/{pages} "
              f"· {total:,} files</span>")
     if page_num > 1:
-        pager += f" <a class='btn sm grey' href='/admin/files?q={esc(q)}&page_num={page_num - 1}'>← Prev</a>"
+        pager += f" <a class='btn sm grey' href='/admin/files?q={esc(q)}&sort={sort}&page_num={page_num - 1}'>← Prev</a>"
     if page_num < pages:
-        pager += f" <a class='btn sm grey' href='/admin/files?q={esc(q)}&page_num={page_num + 1}'>Next →</a>"
+        pager += f" <a class='btn sm grey' href='/admin/files?q={esc(q)}&sort={sort}&page_num={page_num + 1}'>Next →</a>"
     pager += "</div>"
+    sort_opts = "".join(
+        f"<option value='{k}' {'selected' if k == sort else ''}>{v[1]}</option>"
+        for k, v in sorts.items())
     body = (f"<h2>📦 Files</h2>{banner}"
             "<form method='get'><div class='row'><div>"
             "<input type='text' name='q' placeholder='Search filename / caption…' "
-            f"value='{esc(q)}'></div><div style='flex:0'>"
+            f"value='{esc(q)}'></div><div>"
+            f"<select name='sort' onchange='this.form.submit()'>{sort_opts}</select>"
+            "</div><div style='flex:0'>"
             "<button class='btn' type='submit'>Search</button></div></div></form>"
             f"{pager}<table><tr><th>Name</th><th>Size</th><th>Quality</th>"
             "<th>Lang</th><th>Posted</th><th></th></tr>"

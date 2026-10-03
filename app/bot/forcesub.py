@@ -1,17 +1,30 @@
-"""Force-subscribe: users must join required channels before using the bot."""
+"""Force-subscribe: users must join required channels before using the bot.
+
+v10.8.10: request-to-join mode (like Tech VJ bot) — join buttons open a
+join *request* link; the bot auto-approves requests so the user lands in
+the channel with one tap. Falls back to plain invite links when the bot
+can't create request links (not admin), and the "I've joined" retry tries
+approving any pending request before re-checking membership.
+"""
 from __future__ import annotations
 
 import logging
 
+from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from app import runtime as rt
 from app.config import settings
 
 log = logging.getLogger(__name__)
 
 _LEFT = (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+
+# Cache of join-request invite links: creating one per check would
+# spam the channel's invite list. Links stay valid until revoked.
+_jr_link_cache: dict[str, str] = {}
 
 
 def _norm_ref(ref: str) -> int | str:
@@ -52,10 +65,22 @@ async def _group_force_sub(chat_id: int | None) -> list[str]:
     return []
 
 
+async def effective_channels() -> list[str]:
+    """Force-sub channels with the DB override winning over the env var."""
+    try:
+        raw = await rt.aget_setting("FORCE_SUB_CHANNELS")
+    except Exception:
+        raw = None
+    if raw is None:
+        raw = settings.FORCE_SUB_CHANNELS
+    return [x.strip() for x in str(raw).replace(";", ",").split(",")
+            if x.strip()]
+
+
 async def missing_channels(client, user_id: int,
                            chat_id: int | None = None) -> list[str]:
     """Return the required channels the user has NOT joined."""
-    refs = list(settings.force_sub_channels)
+    refs = await effective_channels()
     for ref in await _group_force_sub(chat_id):
         if ref not in refs:
             refs.append(ref)
@@ -75,36 +100,60 @@ async def missing_channels(client, user_id: int,
     return missing
 
 
-async def _invite_url(client, ref: int | str, raw: str) -> str:
+async def _invite_url(client, ref: int | str, raw: str) -> tuple[str, bool]:
     """v10.2.1: build a *working* join URL for a force-sub channel.
 
-    The old code made ``https://t.me/-1001680629032`` for numeric IDs —
-    a dead link. Now: public username → clean t.me link; private channel
-    → bot-exported invite link (needs admin); last resort → t.me/c/ link.
+    Returns ``(url, is_join_request)``.
+
+    v10.8.10: when FSUB_JOIN_REQUEST is on, prefer a join-*request* link
+    (bot must be admin with invite rights). Automatic fallback chain:
+    request link -> plain invite link -> t.me/c/ link.
     """
+    join_request_mode = False
+    try:
+        join_request_mode = bool(await rt.aget_setting("FSUB_JOIN_REQUEST"))
+    except Exception:
+        pass
+    if join_request_mode:
+        cached = _jr_link_cache.get(raw)
+        if cached:
+            return cached, True
+        try:
+            link = await client.create_chat_invite_link(
+                ref, creates_join_request=True)
+            url = getattr(link, "invite_link", None) or str(link)
+            if url:
+                _jr_link_cache[raw] = url
+                return url, True
+        except Exception:
+            log.debug("forcesub join-request link failed for %s "
+                      "(bot needs admin + invite rights)", raw,
+                      exc_info=True)
     try:
         chat = await client.get_chat(ref)
         if getattr(chat, "username", None):
-            return f"https://t.me/{chat.username}"
+            return f"https://t.me/{chat.username}", False
     except Exception:
         log.debug("forcesub get_chat failed for %s", raw, exc_info=True)
     try:
         link = await client.export_chat_invite_link(ref)
         if link:
-            return link
+            return link, False
     except Exception:
         log.debug("forcesub export invite failed for %s (bot needs admin)",
                   raw, exc_info=True)
     if isinstance(ref, int):
-        return f"https://t.me/c/{str(ref).removeprefix('-100')}"
-    return f"https://t.me/{str(raw).lstrip('@')}"
+        return f"https://t.me/c/{str(ref).removeprefix('-100')}", False
+    return f"https://t.me/{str(raw).lstrip('@')}", False
 
 
 async def join_kb(client, channels: list[str]) -> InlineKeyboardMarkup:
     rows = []
     for ch in channels:
-        url = await _invite_url(client, _norm_ref(ch), ch)
-        rows.append([InlineKeyboardButton(f"📢 Join {ch}", url=url)])
+        url, is_jr = await _invite_url(client, _norm_ref(ch), ch)
+        label = (f"📩 Request to Join {ch}" if is_jr
+                 else f"📢 Join {ch}")
+        rows.append([InlineKeyboardButton(label, url=url)])
     rows.append([InlineKeyboardButton("✅ I've joined — continue",
                                      callback_data="fsub_retry")])
     return InlineKeyboardMarkup(rows)
@@ -115,3 +164,45 @@ async def ensure_joined(client, user_id: int,
     """None if the user joined everything, else a join keyboard."""
     missing = await missing_channels(client, user_id, chat_id)
     return await join_kb(client, missing) if missing else None
+
+
+async def approve_pending(client, user_id: int,
+                          channels: list[str]) -> int:
+    """Try approving the user's pending join requests (retry fallback).
+
+    Returns how many were approved. A user tapping "I've joined" while
+    their request is still pending gets approved on the spot instead of
+    an error — no approve = error is swallowed per channel.
+    """
+    approved = 0
+    for ch in channels:
+        try:
+            await client.approve_chat_join_request(_norm_ref(ch), user_id)
+            approved += 1
+            log.info("forcesub: approved pending join request of %d for %s",
+                     user_id, ch)
+        except Exception:
+            pass
+    return approved
+
+
+async def _on_join_request(client: Client, request) -> None:
+    """Auto-approve channel join requests (Tech VJ style)."""
+    try:
+        auto = bool(await rt.aget_setting("FSUB_AUTO_APPROVE"))
+    except Exception:
+        auto = True
+    if not auto:
+        return
+    try:
+        await client.approve_chat_join_request(request.chat.id,
+                                              request.from_user.id)
+        log.info("forcesub: auto-approved join request of %d for chat %d",
+                 request.from_user.id, request.chat.id)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("forcesub auto-approve failed: %s", exc)
+
+
+def register(bot: Client) -> None:
+    bot.on_chat_join_request()(  # type: ignore[arg-type]
+        _on_join_request)

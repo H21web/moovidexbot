@@ -442,6 +442,13 @@ async def ai_extract_titles(user_id: int | None, q: str,
         return []
     await quota_use(user_id)
     _titles_cache_put(q, titles)
+    # v10.8.10: AI usage goes to the activity log (dashboard + log channel).
+    try:
+        from app.analytics import log_event
+        asyncio.create_task(log_event("ai", user_id=user_id,
+                                      detail=q[:120]))
+    except Exception:
+        pass
     log.info("[s:%s] grok titles %r -> %r", sid or "-", q[:60],
              [(t["title"][:40], t["type"], t["year"]) for t in titles])
     return titles
