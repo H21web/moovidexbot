@@ -179,6 +179,19 @@ def _best_score(merged: dict[int, dict]) -> float:
                default=0.0)
 
 
+def _with_original_filters(new_parsed: dict, orig_parsed: dict) -> dict:
+    """Keep the user's own filters when a correction replaces the title.
+
+    v10.7.1: "avangerrs endgame 1080p" corrected to "Avengers: Endgame"
+    must still search 1080p — the AI prompt strips technical words, so
+    re-attach quality/language/year/season/episode from the original.
+    """
+    for k in ("quality", "language", "year", "season", "episode"):
+        if orig_parsed.get(k) and not new_parsed.get(k):
+            new_parsed[k] = orig_parsed[k]
+    return new_parsed
+
+
 async def smart_search(user_id: int | None, raw: str) -> dict:
     """Run the v10.2 search pipeline.
 
@@ -218,23 +231,30 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                 parsed["title"] = fixed
                 title = fixed
 
-    # --- recovery: 2nd logic — title parsed from web-search results -----
-    if not merged or score < UNCERTAIN_SCORE:
+    # --- recovery: 2nd logic: Search API title candidates ----------------
+    # v10.7 rework: ONLY when the DB found zero files. Candidates are
+    # scored against the query (junk/franchise pages rejected); the
+    # first candidate with real DB files wins. A weak-but-real result
+    # set is never hijacked by a web guess anymore.
+    if not merged:
         try:
-            web_title = await enrich_mod.parse_title_from_web(raw)
+            candidates = await enrich_mod.web_title_candidates(raw)
         except Exception as exc:  # noqa: BLE001
             log.debug("web title parse failed: %s", exc)
-            web_title = None
-        if web_title:
+            candidates = []
+        for web_title in candidates[:3]:
+            new_parsed = _with_original_filters(parse_query(web_title),
+                                                parsed)
             retry = await _hot_sweeps(user_id, web_title,
-                                      parse_query(web_title), log_q=False)
-            if _best_score(retry) > score:
+                                      new_parsed, log_q=False)
+            if retry:
                 merged, score = retry, _best_score(retry)
-                corrected = web_title
-                corrected_via = "web"
-                parsed = parse_query(web_title)
+                parsed = new_parsed
                 parsed["title"] = web_title
                 title = web_title
+                corrected = web_title
+                corrected_via = "web"
+                break
 
     # --- recovery: 3rd logic — Grok AI title (v10.6, flow diagram) -----
     # Runs only when the Search API found no usable title. The original
@@ -247,11 +267,13 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
             log.debug("AI title extract failed: %s", exc)
             ai_title = None
         if ai_title:
+            new_parsed = _with_original_filters(parse_query(ai_title),
+                                                parsed)
             retry = await _hot_sweeps(user_id, ai_title,
-                                      parse_query(ai_title), log_q=False)
+                                      new_parsed, log_q=False)
             if retry:
                 merged, score = retry, _best_score(retry)
-                parsed = parse_query(ai_title)
+                parsed = new_parsed
                 parsed["title"] = ai_title
                 title = ai_title
                 corrected = ai_title

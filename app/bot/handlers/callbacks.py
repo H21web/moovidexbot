@@ -367,8 +367,9 @@ async def _dym(client: Client, query):
         return
     try:
         await query.message.edit_text(
-            f"✅ <b>Request submitted!</b>\n"
-            f"We'll try to add <b>{ui.esc(original[:80])}</b> soon. 🎬",
+            f"✅ <b>Request submitted!</b>\n\n"
+            f"🎬 <b>{ui.esc(original[:80])}</b>\n"
+            f"<i>We'll try to add it soon.</i>",
             parse_mode=ParseMode.HTML)
     except Exception:  # noqa: BLE001
         pass

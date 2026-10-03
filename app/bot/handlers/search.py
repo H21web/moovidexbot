@@ -95,7 +95,8 @@ async def _no_results_pm(client: Client, message: Message, q: str,
     inside _v9_search_flow. ``suggestions`` lets the caller pass
     pre-computed spell suggestions so they aren't looked up twice.
     """
-    text = "❌ <b>No results found.</b>"
+    text = (f"📭 <b>No results found</b>\n\n"
+            f"I looked everywhere for \"<b>{ui.esc(q[:80])}</b>\".")
     if suggestions is None:
         # Never send raw user text to TMDB: resolve a clean title first
         # (local extraction -> TMDB -> web-search fallback).
@@ -103,10 +104,8 @@ async def _no_results_pm(client: Client, message: Message, q: str,
         if tm and tm.get("title"):
             year = f" ({tm['year']})" if tm.get("year") else ""
             text = (
-                f"🤔 Did you mean <b>{ui.esc(tm['title'])}</b>{year}?\n"
-                "📭 That file is not in the database."
-                + ("\n🎞 Use /request to ask for it!"
-                   if settings.REQUEST_CHANNEL else "")
+                f"🤔 <b>Did you mean {ui.esc(tm['title'])}</b>{year}?\n\n"
+                "📭 It's not in the database yet."
             )
             await message.reply_text(
                 text, reply_markup=_no_results_kb(uid=uid, query=q),
@@ -119,43 +118,42 @@ async def _no_results_pm(client: Client, message: Message, q: str,
         except Exception:  # noqa: BLE001
             suggestions = []
     if suggestions:
-        text += "\nDid you mean:"
+        text += "\n\n<b>Did you mean:</b>"
         kb = _no_results_kb(ui.spell_kb(suggestions), uid=uid, query=q)
     else:
-        text += ("\n🎞 Tap Request Movie and we'll try to add it!"
+        text += ("\n\nTap 🎞 <b>Request Movie</b> — we'll try to add it."
                  if settings.REQUEST_CHANNEL
-                 else "\nTry a different spelling.")
+                 else "\n\nTry a different spelling.")
         kb = _no_results_kb(uid=uid, query=q)
     await message.reply_text(text, reply_markup=kb,
                              parse_mode=ParseMode.HTML)
 
 
 async def _did_you_mean(client: Client, wait: Message, uid: int,
-                       original_q: str, corrected_title: str,
-                       via: str) -> bool:
+                       original_q: str, corrected_title: str) -> bool:
     """Flow diagram: a Search-API / Grok corrected title found files —
     confirm with the user before showing results.
 
     ✅ Yes -> normal AutoFilter search with the corrected title.
-    ❌ No  -> save the ORIGINAL search as a movie request.
+    🎞 Request movie -> save the ORIGINAL search as a movie request.
     """
     token = secrets.token_hex(8)
     state.dym_tokens[token] = {"uid": uid, "original": original_q,
                                "corrected": corrected_title}
-    source = "web search" if via == "web" else "AI"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes", callback_data=f"dym:{token}:yes"),
-         InlineKeyboardButton("❌ No", callback_data=f"dym:{token}:no")],
+        [InlineKeyboardButton("✅ Yes, show files",
+                              callback_data=f"dym:{token}:yes")],
+        [InlineKeyboardButton("🎞 Request movie",
+                              callback_data=f"dym:{token}:no")],
     ])
     try:
         await wait.delete()
     except Exception:
         pass
     await wait.reply_text(
-        f"🤔 <b>Did you mean:</b> {ui.esc(corrected_title)}?\n"
-        f"<i>({source} suggestion)</i>\n\n"
-        "Tap ✅ to see its files, or ❌ and I'll save "
-        f"<b>{ui.esc(original_q[:60])}</b> as a movie request.",
+        f"🔍 <b>Did you mean</b>\n"
+        f"🎬 <b>{ui.esc(corrected_title)}</b>\n\n"
+        f"<i>Nothing found for \"{ui.esc(original_q[:60])}\".</i>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
     return True
 
@@ -270,8 +268,7 @@ async def _v9_search_flow(client: Client, message: Message,
     # files — confirm before showing results.
     if not _confirmed and res.get("corrected_via") in ("web", "ai"):
         return await _did_you_mean(client, wait, uid, q,
-                                   res["title"] or q,
-                                   res["corrected_via"])
+                                   res["title"] or q)
 
     ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]

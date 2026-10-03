@@ -70,7 +70,15 @@ async def _request(client: Client, message: Message):
                                message.chat.id, text,
                                mention=message.from_user.mention)
     await message.reply_text(
-        f"✅ <b>Request #{rid} noted!</b>\nWe'll add it soon. 🎬")
+        f"✅ <b>Request submitted!</b>\n\n"
+        f"🎬 <b>{text[:80]}</b>\n"
+        f"<i>We'll try to add it soon.</i>",
+        parse_mode=ParseMode.HTML)
+
+
+def ui_esc(s: str) -> str:
+    from app.bot.ui import esc
+    return esc(s)
 
 
 async def _request_cb(client: Client, query):
@@ -101,8 +109,9 @@ async def _request_cb(client: Client, query):
         return
     try:
         await query.message.edit_text(
-            f"✅ <b>Request submitted!</b>\n"
-            f"We'll try to add <b>{q[:80]}</b> soon. 🎬",
+            f"✅ <b>Request submitted!</b>\n\n"
+            f"🎬 <b>{ui_esc(q[:80])}</b>\n"
+            f"<i>We'll try to add it soon.</i>",
             parse_mode=ParseMode.HTML)
     except Exception:  # noqa: BLE001
         pass

@@ -134,6 +134,19 @@ _SITE_SUFFIX_RE = re.compile(
     r"\s*[-|–—:]\s*(IMDb|Wikipedia|Rotten Tomatoes|IMDB|Letterboxd).*$",
     re.IGNORECASE,
 )
+# v10.7: bing_html results carry many site names — strip " | Site",
+# " - Site" for the common ones, then a trailing year / "Movie".
+_PIPE_SUFFIX_RE = re.compile(r"\s*\|\s*[^|]+$")
+_DASH_SITE_RE = re.compile(
+    r"\s+[-–—]\s+(wikipedia|imdb|rotten tomatoes|letterboxd|allocin\u00e9|"
+    r"moviefone|netflix|youtube|senscritique|roger ?ebert|mubi|"
+    r"prime video|disney|hotstar|jio|eros ?now|zee5|sonyliv|voot|"
+    r"convertworld|dictionnaire|film).*$",
+    re.IGNORECASE,
+)
+_TRAIL_MOVIE_RE = re.compile(
+    r"\s+(movie|film|full(\s+hd)?|hd|extended(\s+edition)?|"
+    r"director'?s\s+cut|unrated)\s*$", re.IGNORECASE)
 _YEAR_PAREN_RE = re.compile(r"\s*\((?:19|20)\d{2}[^)]*\)\s*$")
 _FILM_SUFFIX_RE = re.compile(r"\s*\(\s*film\s*\)\s*$", re.IGNORECASE)
 
@@ -143,7 +156,11 @@ def _clean_web_title(raw: str) -> str | None:
     t = (raw or "").strip()
     if not t:
         return None
+    t = _PIPE_SUFFIX_RE.sub("", t)
+    t = _DASH_SITE_RE.sub("", t)
     t = _SITE_SUFFIX_RE.sub("", t)
+    t = _TRAIL_MOVIE_RE.sub("", t)
+    t = _TRAIL_MOVIE_RE.sub("", t)
     t = _YEAR_PAREN_RE.sub("", t)
     t = _FILM_SUFFIX_RE.sub("", t)
     t = re.sub(r"\s+", " ", t).strip(" -–—:|")
@@ -156,27 +173,85 @@ def _clean_web_title(raw: str) -> str | None:
     return t
 
 
-async def parse_title_from_web(query: str) -> str | None:
-    """Parse the canonical movie/series title from web-search results.
+# --- smart title candidates (v10.7 rework) --------------------------------
+# The old code took the FIRST Wikipedia/IMDb hit blindly — for
+# "avengers endgame" Bing returns the franchise page first, so the bot
+# "corrected" to "Avengers (Marvel Cinematic Universe)" and searched
+# the DB for the wrong title. Now every result title is scored against
+# the user's query and junk pages are rejected outright.
+_TITLE_JUNK_RE = re.compile(
+    r"\((film series|film franchise|franchise|disambiguation|saga)\)",
+    re.IGNORECASE)
+_QUERY_STOP = {"movie", "film", "full", "hd", "watch", "online",
+              "download", "new", "latest", "tamil", "hindi", "telugu",
+              "malayalam", "english"}
+_CANDIDATE_MIN_SCORE = 0.35
 
-    Returns the cleaned title or ``None``. Never raises.
+
+def _word_set(text: str) -> set[str]:
+    # "K.G.F" -> "kgf" so acronym titles match plain queries
+    t = re.sub(r"(?<=[a-z0-9])\.(?=[a-z0-9])", "", (text or "").lower())
+    return set(re.findall(r"[a-z0-9]+", t))
+
+
+def _candidate_score(query: str, title: str, url: str) -> float:
+    """How well does this result title match the user's query?
+
+    Word overlap drives the score; extra junk words in the title
+    penalize it; IMDb title pages (specific movies) get a bonus.
+    """
+    qw = _word_set(query) - _QUERY_STOP
+    tw = _word_set(title) - {"movie", "film", "full"}
+    if not qw or not tw:
+        return 0.0
+    overlap = len(qw & tw) / len(qw)
+    extra = len(tw - qw) / len(tw)
+    score = overlap - 0.15 * extra
+    if "imdb.com/title/tt" in (url or ""):
+        score += 0.25  # an IMDb title page is a specific movie
+    return score
+
+
+async def web_title_candidates(query: str, limit: int = 5) -> list[str]:
+    """Best-guess movie/series titles from web-search results.
+
+    Returns cleaned titles ordered best-first, each verified to
+    actually resemble the user's query. Empty list when nothing
+    usable. Never raises.
     """
     q = (query or "").strip()
     if len(q) < 2:
-        return None
-    results = await _websearch_raw(f"{q} movie", num=6)
+        return []
+    results = await _websearch_raw(f"{q} movie", num=8)
     if not results:
-        return None
-    # Prefer IMDb / Wikipedia hits — their titles are the most canonical.
-    ordered = sorted(
-        results,
-        key=lambda it: 0 if ("imdb.com/title" in (it.get("url") or "")
-                             or "wikipedia.org" in (it.get("url") or ""))
-        else 1,
-    )
-    for item in ordered:
+        return []
+    scored: list[tuple[float, str]] = []
+    for item in results:
         title = _clean_web_title(item.get("title") or "")
-        if title:
-            log.info("web title parse %r -> %r", q[:60], title[:60])
-            return title
-    return None
+        if not title:
+            continue
+        if _TITLE_JUNK_RE.search(title):
+            continue  # franchise / series / disambiguation page
+        s = _candidate_score(q, title, item.get("url") or "")
+        if s >= _CANDIDATE_MIN_SCORE:
+            scored.append((s, title))
+    scored.sort(key=lambda x: -x[0])
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, t in scored:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+        if len(out) >= limit:
+            break
+    if out:
+        log.info("web title candidates %r -> %r", q[:60],
+                 [t[:40] for t in out])
+    return out
+
+
+async def parse_title_from_web(query: str) -> str | None:
+    """Legacy single-title wrapper — first candidate or ``None``."""
+    cands = await web_title_candidates(query, limit=1)
+    return cands[0] if cands else None
