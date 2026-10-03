@@ -198,11 +198,11 @@ def ix_setup_kb(pending: dict) -> InlineKeyboardMarkup:
 
 
 def start_kb() -> InlineKeyboardMarkup:
+    """v10.9.0: clean home — trending, help, my account (no inline)."""
     rows = [
-        [InlineKeyboardButton("🔍 Search movies",
-                             switch_inline_query_current_chat="")],
         [InlineKeyboardButton("📊 Trending", callback_data="trending"),
          InlineKeyboardButton("❓ Help", callback_data="help")],
+        [InlineKeyboardButton("👤 My Account", callback_data="acc")],
     ]
     if settings.REQUEST_CHANNEL:
         rows.append([InlineKeyboardButton("🎞 Request a movie",

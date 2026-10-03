@@ -84,7 +84,7 @@ def extract_signals(f: dict) -> dict[str, list[str]]:
 
 
 def _blank_prefs() -> dict:
-    return {"enabled": True, "downloads": 0, "counters": {}}
+    return {"enabled": True, "downloads": 0, "counters": {}, "manual": {}}
 
 
 async def get_prefs(user_id: int) -> dict:
@@ -103,11 +103,59 @@ async def get_prefs(user_id: int) -> dict:
                     "enabled": bool(row.enabled),
                     "downloads": row.downloads or 0,
                     "counters": dict(row.counters or {}),
+                    # v10.9.0: manual overrides (missing on rows written
+                    # before migration 0009 ran).
+                    "manual": dict(getattr(row, "manual", None) or {}),
                 }
     except Exception as exc:  # noqa: BLE001 - personalization never breaks search
         log.debug("get_prefs failed: %s", exc)
     _prefs_cache[user_id] = (now, prefs)
     return prefs
+
+
+async def set_manual_pref(user_id: int, key: str,
+                          value: str | None) -> None:
+    """Set/clear a manual taste override ('language' / 'quality').
+
+    ``value=None`` clears the override -> learn from downloads again.
+    """
+    _prefs_cache.pop(user_id, None)
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as session:
+            row = await session.get(UserPref, user_id)
+            if row is None:
+                row = UserPref(user_id=user_id, enabled=True, downloads=0,
+                               counters={}, manual={})
+                session.add(row)
+            manual = dict(getattr(row, "manual", None) or {})
+            if value is None:
+                manual.pop(key, None)
+            else:
+                manual[key] = value
+            row.manual = manual
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("set_manual_pref failed: %s", exc)
+
+
+def _manual_boost(item: dict, manual: dict) -> float:
+    """Strong fixed boost for manually chosen language/quality."""
+    if not manual:
+        return 0.0
+    sig = extract_signals(item)
+    boost = 0.0
+    lang = (manual.get("language") or "").strip().lower()
+    if lang:
+        langs = [str(x).lower() for x in sig.get("language", [])]
+        if lang in langs:
+            boost += 0.45
+    qual = (manual.get("quality") or "").strip().lower()
+    if qual:
+        quals = [str(x).lower() for x in sig.get("quality", [])]
+        if qual in quals:
+            boost += 0.45
+    return boost
 
 
 def _bump(counters: dict, cat: str, value: str) -> None:
@@ -174,18 +222,26 @@ async def rerank(items: list[dict], user_id: int | None) -> list[dict]:
     if not items or not user_id:
         return items
     prefs = await get_prefs(user_id)
-    if not prefs["enabled"] or prefs["downloads"] < MIN_DOWNLOADS:
+    if not prefs["enabled"]:
         return items
+    # v10.9.0: manual overrides apply even before enough downloads
+    # exist for learned taste.
+    manual = prefs.get("manual") or {}
     counters = prefs["counters"]
-    if not counters:
+    learned_ok = prefs["downloads"] >= MIN_DOWNLOADS and bool(counters)
+    if not learned_ok and not manual:
         return items
     # P1#9: copy before mutating — items may come from a shared cache,
     # and compounding boost on cache hits would skew scores permanently.
     out = [dict(it) for it in items]
     for it in out:
         base = it.get("score") or 0.0
-        it["score"] = base * (1.0 + _boost_for(it, counters))
-        it["personalized"] = True
+        boost = _manual_boost(it, manual)
+        if learned_ok:
+            boost += _boost_for(it, counters)
+        if boost:
+            it["score"] = base * (1.0 + min(boost, MAX_BOOST))
+            it["personalized"] = True
     out.sort(key=lambda i: i.get("score", 0), reverse=True)
     return out
 
@@ -275,10 +331,14 @@ async def choose_best(files: list[dict], parsed: dict,
         except Exception:  # noqa: BLE001
             prefs = {}
     counters = (prefs or {}).get("counters") or {}
+    # v10.9.0: manual overrides win over learned taste.
+    manual = (prefs or {}).get("manual") or {}
     q_lang = (parsed.get("language") or "").lower() or None
     q_qual = (parsed.get("quality") or "").lower() or None
-    pref_lang = (_top_of(counters, "language") or "").lower() or None
-    pref_qual = (_top_of(counters, "quality") or "").lower() or None
+    pref_lang = ((manual.get("language") or _top_of(counters, "language")
+                  or "").lower() or None)
+    pref_qual = ((manual.get("quality") or _top_of(counters, "quality")
+                  or "").lower() or None)
     qwords = [w for w in re.split(r"\s+", (parsed.get("query") or "").lower())
               if len(w) >= 3]
 

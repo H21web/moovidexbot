@@ -6,9 +6,9 @@ import logging
 import math
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatType, ParseMode
+from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.errors import FloodWait, PeerIdInvalid
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
 from app import personalize, state
@@ -192,8 +192,9 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
         reply_markup=v8_ui.v8_file_kb(f.id, uid),
         protect_content=settings.PROTECT_CONTENT,
     )
-    asyncio.create_task(log_event("download", user_id=uid,
-                                  chat_id=sent.chat.id))
+    asyncio.create_task(log_event(
+        "download", user_id=uid, chat_id=sent.chat.id,
+        detail=f"file:{f.id} | {(f.file_name or '')[:100]}"))
     # v8.1: per-file download counter (drives "most downloaded = best pick").
     asyncio.create_task(bump_file_downloads(f.id))
     # v10.2: the user's own /deltimer wins; otherwise the group/global
@@ -232,14 +233,12 @@ async def _deliver(client: Client, query):
         return
     kb = await forcesub.ensure_joined(client, uid, chat_id=src.id)
     if kb:
-        # v10.2.1: remember which file they wanted — "✅ I've joined"
-        # auto-delivers it instead of making them tap download again.
+        # v10.2.1: remember which file they wanted — auto-detect delivers
+        # it after joining instead of making them tap download again.
         state.pending_dl[uid] = file_db_id
         # Reuse the card message: swap its content for the join prompt.
-        await _safe_edit(
-            query.message,
-            "📢 <b>Join our channels to download</b>",
-            reply_markup=kb)
+        await send_join_prompt(client, query.message, uid, kb,
+                               chat_id=src.id, edit=True)
         return
     f = await _get_file(file_db_id)
     if not f:
@@ -414,7 +413,60 @@ async def _ais(client: Client, query):
         pass
 
 
+async def _do_post_join(client: Client, uid: int, message: Message) -> None:
+    """Continue whatever the user was doing before the join prompt.
+
+    Extracted from _fsub_retry (v10.9.0): now driven by auto-detect
+    (chat_member update + poll watcher) instead of a button tap.
+    """
+    # v10.2.1: auto-deliver the waiting file (download / deep-link).
+    # v10.3: auto-continue the waiting search — no retyping.
+    dl_id = state.pending_dl.pop(uid, None)
+    q = state.pending_search.pop(uid, None)
+    if q:
+        # Turn the join prompt into a status line (photo-safe), then
+        # run the normal search flow against it.
+        await _safe_edit(
+            message,
+            "✅ <i>All joined — continuing your search…</i>")
+        try:
+            from app.bot.handlers import search as search_handlers
+            await search_handlers._handle_text_query(
+                client, message, uid, q)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("post-join search failed for user %d: %s",
+                        uid, exc)
+    else:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    if dl_id:
+        f = await _get_file(dl_id)
+        if f:
+            try:
+                await _send_file(client, uid, f, uid)
+            except Exception as exc:
+                log.warning("retry deliver failed for file %d: %s",
+                            dl_id, exc)
+                try:
+                    await client.send_message(
+                        uid, "❌ Couldn't send the file. "
+                             "Try again later.")
+                except Exception:
+                    pass
+    if not dl_id and not q:
+        # The join prompt is gone and this callback carries no
+        # results token — point the user back to search.
+        try:
+            await client.send_message(
+                uid, "✅ All joined! Search again to get your results 🔍")
+        except Exception:
+            pass
+
+
 async def _fsub_retry(client: Client, query):
+    """Kept for old join prompts that still carry the button."""
     uid = query.from_user.id
     missing = await forcesub.missing_channels(client, uid,
                                               chat_id=query.message.chat.id)
@@ -437,50 +489,114 @@ async def _fsub_retry(client: Client, query):
         return
     else:
         await query.answer("✅ All joined!", show_alert=True)
-        # v10.2.1: auto-deliver the waiting file (download / deep-link).
-        # v10.3: auto-continue the waiting search — no retyping.
-        dl_id = state.pending_dl.pop(uid, None)
-        q = state.pending_search.pop(uid, None)
-        if q:
-            # Turn the join prompt into a status line (photo-safe), then
-            # run the normal search flow against it.
+        _cancel_watch(uid)
+        await _do_post_join(client, uid, query.message)
+
+
+# --- v10.9.0: auto-detect channel joins (no button needed) ---
+
+# uid -> (watcher task, prompt message), so a fresh prompt replaces a
+# stale watcher and the member-update fast path can reuse the prompt.
+_watchers: dict[int, tuple[asyncio.Task, Message]] = {}
+
+_WATCH_INTERVAL = 5.0    # seconds between membership re-checks
+_WATCH_TIMEOUT = 180.0   # give up after 3 minutes
+
+
+def _cancel_watch(uid: int) -> tuple[asyncio.Task, Message] | None:
+    item = _watchers.pop(uid, None)
+    if item:
+        task, _msg = item
+        if not task.done():
+            task.cancel()
+    return item
+
+
+async def _watch_join(client: Client, uid: int, message: Message,
+                      chat_id: int | None) -> None:
+    """Poll membership until the user joins, then auto-continue.
+
+    Safety net for when Telegram doesn't deliver the chat_member update
+    (bot not admin in the channel, etc.).
+    """
+    try:
+        waited = 0.0
+        while waited < _WATCH_TIMEOUT:
+            await asyncio.sleep(_WATCH_INTERVAL)
+            waited += _WATCH_INTERVAL
+            try:
+                missing = await forcesub.missing_channels(
+                    client, uid, chat_id=chat_id)
+            except Exception:
+                continue
+            if not missing:
+                log.info("join watcher: user %d joined, continuing", uid)
+                await _do_post_join(client, uid, message)
+                return
+        log.info("join watcher: timed out for user %d", uid)
+        try:
             await _safe_edit(
-                query.message,
-                "✅ <i>All joined — continuing your search…</i>")
-            try:
-                from app.bot.handlers import search as search_handlers
-                await search_handlers._handle_text_query(
-                    client, query.message, uid, q)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("post-join search failed for user %d: %s",
-                            uid, exc)
+                message,
+                "⌛ <i>Couldn't detect your join — please search again.</i>")
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _watchers.pop(uid, None)
+
+
+async def send_join_prompt(client: Client, message: Message, uid: int,
+                           kb: InlineKeyboardMarkup,
+                           chat_id: int | None = None,
+                           edit: bool = False) -> Message | None:
+    """Send (or edit into) the join prompt and start the join watcher."""
+    _cancel_watch(uid)
+    try:
+        if edit:
+            await _safe_edit(message, forcesub.join_prompt_text(),
+                             reply_markup=kb)
+            sent = message
         else:
+            sent = await message.reply_text(
+                forcesub.join_prompt_text(),
+                reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        return None
+    if sent is not None:
+        _watchers[uid] = (asyncio.create_task(
+            _watch_join(client, uid, sent, chat_id)), sent)
+    return sent
+
+
+async def _on_member_update(client: Client, update) -> None:
+    """Instant path: user joined a channel -> continue immediately."""
+    try:
+        user = update.new_chat_member.user
+        uid = user.id if user else None
+        status = update.new_chat_member.status
+    except AttributeError:
+        return
+    if not uid or uid not in _watchers:
+        return
+    if status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                      ChatMemberStatus.OWNER):
+        return
+    # Re-verify against the force-sub list (the update may be for some
+    # other chat), then continue on the original prompt message.
+    try:
+        missing = await forcesub.missing_channels(client, uid)
+    except Exception:
+        return
+    if not missing:
+        log.info("member update: user %d joined, continuing", uid)
+        item = _cancel_watch(uid)
+        msg = item[1] if item else None
+        if msg is not None:
             try:
-                await query.message.delete()
-            except Exception:
-                pass
-        if dl_id:
-            f = await _get_file(dl_id)
-            if f:
-                try:
-                    await _send_file(client, uid, f, uid)
-                except Exception as exc:
-                    log.warning("retry deliver failed for file %d: %s",
-                                dl_id, exc)
-                    try:
-                        await client.send_message(
-                            uid, "❌ Couldn't send the file. "
-                                 "Try again later.")
-                    except Exception:
-                        pass
-        if not dl_id and not q:
-            # The join prompt is gone and this callback carries no
-            # results token — point the user back to search.
-            try:
-                await client.send_message(
-                    uid, "✅ All joined! Search again to get your results 🔍")
-            except Exception:
-                pass
+                await _do_post_join(client, uid, msg)
+            except Exception:  # noqa: BLE001
+                log.debug("member-update continue failed", exc_info=True)
 
 
 async def _ixstop(client: Client, query):
@@ -611,3 +727,5 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^pset:"))(_pset)
     bot.on_callback_query(filters.regex(r"^v8:"))(_v8page)
     bot.on_callback_query(filters.regex(r"^rf:"))(_rfilter)
+    # v10.9.0: instant join detection (the poll watcher is the backup).
+    bot.on_chat_member_updated()(_on_member_update)

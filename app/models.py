@@ -246,6 +246,10 @@ class UserPref(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     downloads: Mapped[int] = mapped_column(Integer, default=0)
     counters: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # v10.9.0: manual taste overrides set from My Account > Preference,
+    # e.g. {"language": "Malayalam", "quality": "1080p"}. Absent key or
+    # "auto" = learn from downloads.
+    manual: Mapped[dict] = mapped_column(JSONB, default=dict)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

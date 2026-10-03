@@ -104,7 +104,8 @@ async def _saved_rows(uid: int):
 
 
 async def _render_saved(message, uid: int, page: int = 0,
-                        edit: bool = False) -> None:
+                        edit: bool = False,
+                        back_cb: str | None = None) -> None:
     try:
         rows = await _saved_rows(uid)
     except Exception:  # noqa: BLE001
@@ -122,7 +123,9 @@ async def _render_saved(message, uid: int, page: int = 0,
     if not rows:
         text = ("⭐ <b>Your watchlist is empty.</b>\n"
                 "Tap ⭐ Save on any file to keep it here.")
-        kb = None
+        kb = (InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data=back_cb)]])
+            if back_cb else None)
     else:
         pages = max(1, (len(rows) + _PAGE_SIZE - 1) // _PAGE_SIZE)
         page = max(0, min(page, pages - 1))
@@ -138,17 +141,24 @@ async def _render_saved(message, uid: int, page: int = 0,
             ])
         if pages > 1:
             nav = []
+            pg_cb = (f"savedpg:{page - 1}:{back_cb}" if back_cb
+                     else f"savedpg:{page - 1}")
             if page > 0:
                 nav.append(InlineKeyboardButton(
-                    "⬅️", callback_data=f"savedpg:{page - 1}"))
+                    "⬅️", callback_data=pg_cb))
             nav.append(InlineKeyboardButton(f"{page + 1}/{pages}",
                                             callback_data="noop"))
+            pg_cb2 = (f"savedpg:{page + 1}:{back_cb}" if back_cb
+                      else f"savedpg:{page + 1}")
             if page < pages - 1:
                 nav.append(InlineKeyboardButton(
-                    "➡️", callback_data=f"savedpg:{page + 1}"))
+                    "➡️", callback_data=pg_cb2))
             kb_rows.append(nav)
         text = ("⭐ <b>Your watchlist</b> "
                 f"({len(rows)} saved)\n\n" + "\n\n".join(lines))
+        if back_cb:
+            kb_rows.append([InlineKeyboardButton("⬅️ Back",
+                                                 callback_data=back_cb)])
         kb = InlineKeyboardMarkup(kb_rows) if kb_rows else None
     try:
         if edit:
@@ -183,13 +193,15 @@ async def _saved_cmd(client: Client, message) -> None:
 
 
 async def _saved_pg(client: Client, query) -> None:
+    parts = (query.data or "").split(":")
     try:
-        page = int(query.data.split(":")[1])
+        page = int(parts[1])
     except (ValueError, IndexError):
         return
+    back_cb = parts[2] if len(parts) > 2 else None
     await query.answer()
     await _render_saved(query.message, query.from_user.id, page=page,
-                        edit=True)
+                        edit=True, back_cb=back_cb)
 
 
 async def _noop(client: Client, query) -> None:
@@ -239,5 +251,5 @@ def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.command("mystats"))(_mystats)
     bot.on_callback_query(filters.regex(r"^save:\d+$"))(_save_cb)
     bot.on_callback_query(filters.regex(r"^unsave:\d+$"))(_unsave_cb)
-    bot.on_callback_query(filters.regex(r"^savedpg:\d+$"))(_saved_pg)
+    bot.on_callback_query(filters.regex(r"^savedpg:\d+"))(_saved_pg)
     bot.on_callback_query(filters.regex(r"^noop$"))(_noop)

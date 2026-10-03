@@ -458,12 +458,12 @@ async def _on_text(client: Client, message: Message):
     uid = message.from_user.id
     kb = await forcesub.ensure_joined(client, uid, chat_id=message.chat.id)
     if kb:
-        # v10.3: remember the query — "✅ I've joined" auto-runs it so
-        # the user never has to retype their search.
+        # v10.3: remember the query — auto-detect continues it after
+        # joining, so the user never retypes their search.
         state.pending_search[uid] = message.text.strip()
-        await message.reply_text(
-            "📢 <b>Join our channels to use the bot</b>",
-            reply_markup=kb)
+        from app.bot.handlers.callbacks import send_join_prompt
+        await send_join_prompt(client, message, uid, kb,
+                               chat_id=message.chat.id)
         return
     q = message.text.strip()
     if len(q) < 2:

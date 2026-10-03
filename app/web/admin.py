@@ -112,6 +112,8 @@ def layout(title: str, body: str, active: str = "") -> str:
 <body><nav><span class="brand">🎛 Moovidex Admin</span>
 {nav("/", "📊 Dashboard", "dash")}
 {nav("/activity", "📝 Activity", "act")}
+{nav("/groups", "👪 Groups", "groups")}
+{nav("/database", "🗄 Database", "db")}
 {nav("/users", "👥 Users", "users")}
 {nav("/broadcast", "📢 Broadcast", "bcast")}
 {nav("/files", "📦 Files", "files")}
@@ -296,6 +298,37 @@ ACT_KINDS = ("search_pm", "search_group", "ai", "request", "download",
              "start")
 ACT_ICONS = {"search_pm": "🔍", "search_group": "👪", "ai": "🤖",
              "request": "🎞", "download": "📥", "start": "▶️"}
+ACT_COLORS = {"search_pm": "#7ab8ff", "search_group": "#b48cff",
+              "ai": "#5eead4", "request": "#fbbf24", "download": "#34d399",
+              "start": "#94a3b8"}
+
+_LOG_CSS = """
+.logpage{background:#0a0e16;border:1px solid #2a3550;border-radius:12px;
+padding:6px 0;font-family:ui-monospace,Menlo,Consolas,monospace;
+font-size:12.5px;overflow-x:auto}
+.logline{display:flex;gap:10px;padding:7px 14px;border-bottom:1px solid #141b2d;
+align-items:baseline;white-space:nowrap}
+.logline:hover{background:#111827}
+.logline .ts{color:#5b6b8c;flex:0 0 auto}
+.logline .kind{flex:0 0 auto;font-weight:700}
+.logline .usr{color:#8fa0bd;flex:0 0 auto}
+.logline .det{color:#d5ddec;overflow:hidden;text-overflow:ellipsis}
+.logline .det a{color:#7ab8ff}
+"""
+
+
+def _render_detail(kind: str, detail: str) -> str:
+    """Link file references (``file:<id>``) to the file details page."""
+    import re as _re
+    text = esc(detail or "")
+    if kind == "download":
+        m = _re.search(r"file:(\d+)", detail or "")
+        if m:
+            fid = m.group(1)
+            rest = esc(_re.sub(r"file:\d+\s*\|\s*", "", detail or ""))
+            return (f"<a href='/admin/files/{fid}'>📦 file #{fid}</a> "
+                    f"{rest}")
+    return text or "<span class='mut'>—</span>"
 
 
 @router.get("/activity", response_class=HTMLResponse)
@@ -305,7 +338,7 @@ async def activity(request: Request, kind: str = "", q: str = "",
     # v10.8.10: lazy retention — prune on every view (the daily worker
     # is the backstop). Log channel keeps the permanent copy.
     asyncio.create_task(analytics.prune_activity_logs())
-    per = 30
+    per = 40
     page_num = max(1, page_num)
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
@@ -326,14 +359,21 @@ async def activity(request: Request, kind: str = "", q: str = "",
         f"<a class='btn sm {'green' if kind == k else 'grey'}' "
         f"href='/admin/activity?kind={k}'>{ACT_ICONS.get(k, '')} {k}</a>"
         for k in ACT_KINDS)
-    trs = ""
+    lines = ""
     for r in rows:
-        trs += ("<tr><td class='mut'>" +
-                esc(str(r.created_at)[:19] if r.created_at else "—") +
-                "</td><td>" + ACT_ICONS.get(r.kind, "📝") + " " +
-                esc(r.kind) + "</td>"
-                f"<td><code>{r.user_id or '—'}</code></td>"
-                f"<td>{esc((r.detail or '')[:120])}</td></tr>")
+        ts = esc(str(r.created_at)[:19] if r.created_at else "—")
+        color = ACT_COLORS.get(r.kind, "#8fa0bd")
+        icon = ACT_ICONS.get(r.kind, "📝")
+        lines += (
+            "<div class='logline'>"
+            f"<span class='ts'>{ts}</span>"
+            f"<span class='kind' style='color:{color}'>{icon} {esc(r.kind)}</span>"
+            f"<span class='usr'><code>{r.user_id or '—'}</code></span>"
+            f"<span class='det'>{_render_detail(r.kind, r.detail or '')}</span>"
+            "</div>")
+    if not lines:
+        lines = ("<div class='logline'><span class='mut'>"
+                 "No events yet.</span></div>")
     pages = max(1, (total + per - 1) // per)
     pager = (f"<div class='pager'><span class='mut'>Page {page_num}/{pages} "
              f"· {total:,} events (30-day retention)</span>")
@@ -344,7 +384,8 @@ async def activity(request: Request, kind: str = "", q: str = "",
         pager += (f" <a class='btn sm grey' href='/admin/activity?kind={esc(kind)}"
                   f"&q={esc(q)}&page_num={page_num + 1}'>Next →</a>")
     pager += "</div>"
-    body = (f"<h2>📝 Activity log</h2><div class='pager'>{tabs}</div>"
+    body = (f"<h2>📝 Activity log</h2><style>{_LOG_CSS}</style>"
+            f"<div class='pager'>{tabs}</div>"
             "<form method='get'><div class='row'><div>"
             "<input type='text' name='q' placeholder='Filter by user id…' "
             f"value='{esc(q)}'>"
@@ -352,11 +393,216 @@ async def activity(request: Request, kind: str = "", q: str = "",
                if kind else "") +
             "</div><div style='flex:0'>"
             "<button class='btn' type='submit'>Filter</button></div></div></form>"
-            f"{pager}<table><tr><th>Time</th><th>Event</th><th>User</th>"
-            "<th>Detail</th></tr>"
-            + (trs or "<tr><td colspan=4 class='mut'>No events yet.</td></tr>")
-            + "</table>" + pager)
+            f"{pager}<div class='logpage'>{lines}</div>{pager}")
     return page("Activity", body, "act")
+
+# ---------- groups & channels ----------
+
+@router.get("/groups", response_class=HTMLResponse)
+async def groups_page(request: Request, msg: str = ""):
+    _need_auth(request)
+    from sqlalchemy import text as sa_text
+
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        groups = (await s.execute(
+            select(Group).order_by(Group.joined_at.desc())
+        )).scalars().all()
+        # indexed channels: distinct channel_id + file counts from files
+        indexed = (await s.execute(
+            select(File.channel_id, func.count(File.id),
+                   func.coalesce(func.sum(File.file_size), 0))
+            .where(File.channel_id.isnot(None))
+            .group_by(File.channel_id)
+            .order_by(func.count(File.id).desc())
+        )).all()
+
+    banner = f'<div class="okmsg">{esc(msg)}</div>' if msg else ""
+    trs = ""
+    for g in groups:
+        st = g.settings or {}
+        ad = int(st.get("autodelete_seconds") or 0)
+        fsub = st.get("force_sub") or []
+        trs += (
+            "<tr><td><b>" + esc(g.title or "—") + "</b><br><code>" +
+            str(g.id) + "</code></td>"
+            f"<td>{'off' if not ad else f'{ad // 60}m'}</td>"
+            f"<td>{esc(', '.join(fsub) if fsub else '—')}</td>"
+            f"<td>{'✅' if st.get('welcome') else '—'}</td>"
+            f"<td class='mut'>{esc(str(g.joined_at)[:10] if g.joined_at else '—')}</td>"
+            "<td>"
+            f"<a class='btn sm' href='/admin/groups/{g.id}'>⚙️ Manage</a> "
+            f"<form class='inline' method='post' action='/admin/groups/{g.id}/leave' "
+            "onsubmit=\"return confirm('Bot leaves this group?')\">"
+            "<button class='btn sm red' type='submit'>Leave</button></form>"
+            "</td></tr>")
+
+    ch_rows = ""
+    for cid, nfiles, nbytes in indexed:
+        ch_rows += (
+            "<tr><td><code>" + str(cid) + "</code></td>"
+            f"<td>{nfiles:,}</td><td>{_fmt_size(nbytes)}</td></tr>")
+    body = (
+        f"<h2>👪 Groups</h2>{banner}"
+        "<table><tr><th>Group</th><th>Auto-delete</th><th>Force-sub</th>"
+        "<th>Welcome</th><th>Since</th><th></th></tr>"
+        + (trs or "<tr><td colspan=6 class='mut'>No groups yet.</td></tr>")
+        + "</table>"
+        "<h2>📢 Indexed channels</h2>"
+        "<table><tr><th>Channel ID</th><th>Files</th><th>Size</th></tr>"
+        + (ch_rows or "<tr><td colspan=3 class='mut'>Nothing indexed.</td></tr>")
+        + "</table>"
+        "<div class='note'>Force-sub channels are managed from the "
+        "🤖 bot <code>/admin</code> → 📢 Force-sub panel.</div>")
+    return page("Groups", body, "groups")
+
+
+@router.get("/groups/{gid}", response_class=HTMLResponse)
+async def group_detail(request: Request, gid: int, msg: str = ""):
+    _need_auth(request)
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        g = (await s.execute(
+            select(Group).where(Group.id == gid))).scalar_one_or_none()
+    if not g:
+        return page("Group", "<div class='alert'>Group not found.</div>",
+                    "groups")
+    st = g.settings or {}
+    banner = f'<div class="okmsg">{esc(msg)}</div>' if msg else ""
+    body = (
+        f"<h2>👪 {esc(g.title or gid)}</h2>{banner}"
+        f"<div class='note'><code>{gid}</code></div>"
+        f"<form method='post' action='/admin/groups/{gid}/settings'>"
+        "<label>Auto-delete bot messages (seconds, 0 = off)</label>"
+        f"<input type='number' name='autodelete_seconds' value='{int(st.get('autodelete_seconds') or 0)}'>"
+        "<label>Extra force-sub channels (comma separated @usernames/ids)</label>"
+        f"<input type='text' name='force_sub' value='{esc(', '.join(st.get('force_sub') or []))}'>"
+        "<label>Welcome text (empty = off, HTML allowed)</label>"
+        f"<textarea name='welcome'>{esc(st.get('welcome') or '')}</textarea>"
+        "<div style='margin-top:14px'>"
+        "<button class='btn' type='submit'>💾 Save</button> "
+        f"<a class='btn grey' href='/admin/groups'>⬅️ Back</a></div>"
+        "</form>")
+    return page("Group settings", body, "groups")
+
+
+@router.post("/groups/{gid}/settings")
+async def group_settings_save(request: Request, gid: int,
+                              autodelete_seconds: str = Form("0"),
+                              force_sub: str = Form(""),
+                              welcome: str = Form("")):
+    _need_auth(request)
+    try:
+        ad = max(0, int(autodelete_seconds or 0))
+    except ValueError:
+        ad = 0
+    fsub = [x.strip() for x in force_sub.replace(";", ",").split(",")
+            if x.strip()]
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        g = (await s.execute(
+            select(Group).where(Group.id == gid))).scalar_one_or_none()
+        if not g:
+            return RedirectResponse("/admin/groups?msg=Not found",
+                                    status_code=303)
+        st = dict(g.settings or {})
+        st["autodelete_seconds"] = ad
+        st["force_sub"] = fsub
+        st["welcome"] = welcome.strip()
+        g.settings = st
+        await s.commit()
+    return RedirectResponse(f"/admin/groups/{gid}?msg=Saved",
+                            status_code=303)
+
+
+@router.post("/groups/{gid}/leave")
+async def group_leave(request: Request, gid: int):
+    _need_auth(request)
+    client = bot_app.bot
+    note = ""
+    if client:
+        try:
+            await client.leave_chat(gid)
+            note = "Left the group. "
+        except Exception as exc:
+            note = f"Leave failed: {exc} "
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        g = (await s.execute(
+            select(Group).where(Group.id == gid))).scalar_one_or_none()
+        if g:
+            await s.delete(g)
+            await s.commit()
+            note += "Record removed."
+    return RedirectResponse(f"/admin/groups?msg={note}", status_code=303)
+
+
+# ---------- database ----------
+
+@router.get("/database", response_class=HTMLResponse)
+async def database_page(request: Request):
+    _need_auth(request)
+    import shutil
+    from sqlalchemy import text as sa_text
+
+    factory = get_session_factory(settings.DATABASE_URL)
+    info: dict = {"tables": []}
+    try:
+        async with factory() as s:
+            db_size = (await s.execute(sa_text(
+                "SELECT pg_database_size(current_database())"
+            ))).scalar() or 0
+            info["db_size"] = db_size
+            info["db_name"] = (await s.execute(sa_text(
+                "SELECT current_database()"))).scalar()
+            info["pg_version"] = (await s.execute(sa_text(
+                "SHOW server_version"))).scalar()
+            for tbl in ("files", "users", "groups", "movie_requests",
+                        "search_logs", "event_logs", "activity_logs",
+                        "saved_files", "user_prefs", "tmdb_cache"):
+                try:
+                    size = (await s.execute(sa_text(
+                        "SELECT pg_total_relation_size(:t)"),
+                        {"t": tbl})).scalar() or 0
+                    n = (await s.execute(sa_text(
+                        f"SELECT count(*) FROM {tbl}"))).scalar() or 0
+                    info["tables"].append((tbl, n, size))
+                except Exception:
+                    continue
+    except Exception as exc:
+        return page("Database",
+                    f"<div class='alert'>DB info failed: {esc(exc)}</div>",
+                    "db")
+    try:
+        du = shutil.disk_usage("/")
+        disk = (du.total, du.used, du.free)
+    except Exception:
+        disk = None
+
+    cards = "".join([
+        f'<div class="card"><div class="n">{_fmt_size(info["db_size"])}</div>'
+        f"<div class='l'>🗄 Database size</div></div>",
+        f'<div class="card"><div class="n">{esc(str(info.get("pg_version", "—"))[:12])}</div>'
+        f"<div class='l'>🐘 PostgreSQL</div></div>",
+        f'<div class="card"><div class="n">{esc(info.get("db_name", "—"))}</div>'
+        f"<div class='l'>📛 Database</div></div>",
+    ])
+    if disk:
+        cards += (
+            f'<div class="card"><div class="n">{_fmt_size(disk[2])}</div>'
+            f"<div class='l'>💽 Container disk free</div></div>")
+    trs = ""
+    for tbl, n, size in sorted(info["tables"], key=lambda x: -x[2]):
+        trs += (f"<tr><td><code>{tbl}</code></td><td>{n:,}</td>"
+                f"<td>{_fmt_size(size)}</td></tr>")
+    body = (
+        f"<h2>🗄 Database</h2><div class='cards'>{cards}</div>"
+        "<h3>Tables</h3><table><tr><th>Table</th><th>Rows</th>"
+        "<th>Total size</th></tr>" + trs + "</table>"
+        "<div class='note'>Sizes include indexes. Container disk is the "
+        "app host disk — the managed Postgres lives separately; watch "
+        "the 🗄 Database size card against your plan quota.</div>")
+    return page("Database", body, "db")
 
 # ---------- users ----------
 
@@ -652,6 +898,7 @@ async def file_detail(request: Request, fid: int):
             ("Language", f.language),
             ("Channel ID", f.channel_id), ("Message ID", f.message_id),
             ("Views", f.views), ("Forwards", f.forwards),
+            ("Downloads", f.downloads or 0),
             ("Posted at", f.posted_at), ("Indexed at", f.created_at),
             ("Caption", (f.caption or "")[:500]),
         ])

@@ -59,8 +59,9 @@ async def _request(client: Client, message: Message):
     kb = await forcesub.ensure_joined(client, message.from_user.id,
                                       chat_id=message.chat.id)
     if kb:
-        await message.reply_text("📢 <b>Join our channels first</b>",
-                                 reply_markup=kb)
+        from app.bot.handlers.callbacks import send_join_prompt
+        await send_join_prompt(client, message, message.from_user.id, kb,
+                               chat_id=message.chat.id)
         return
     text = message.text.partition(" ")[2].strip()
     if not text:

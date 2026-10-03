@@ -148,15 +148,26 @@ async def _invite_url(client, ref: int | str, raw: str) -> tuple[str, bool]:
 
 
 async def join_kb(client, channels: list[str]) -> InlineKeyboardMarkup:
+    """v10.9.0: no channel ids in button text — just "Join Channel".
+    No "I've joined" button either: the bot auto-detects the join
+    (chat_member update + a poll watcher) and continues by itself."""
     rows = []
     for ch in channels:
         url, is_jr = await _invite_url(client, _norm_ref(ch), ch)
-        label = (f"📩 Request to Join {ch}" if is_jr
-                 else f"📢 Join {ch}")
+        label = ("📩 Request to Join Channel" if is_jr
+                 else "📢 Join Channel")
         rows.append([InlineKeyboardButton(label, url=url)])
-    rows.append([InlineKeyboardButton("✅ I've joined — continue",
-                                     callback_data="fsub_retry")])
     return InlineKeyboardMarkup(rows)
+
+
+def join_prompt_text() -> str:
+    """v10.9.0: cleaner join prompt."""
+    return (
+        "👋 <b>One quick step!</b>\n\n"
+        "Join our channel below to use the bot — "
+        "it takes 2 seconds.\n\n"
+        "✅ <i>I'll detect it automatically and continue.</i>"
+    )
 
 
 async def ensure_joined(client, user_id: int,
