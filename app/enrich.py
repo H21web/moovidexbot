@@ -124,3 +124,130 @@ async def enrich_title(keywords: str, year: int | None = None,
     return meta
 
 
+
+
+# --- web title candidates (v10.8.4) -------------------------------------------
+# When the DB has nothing for a query, the free web-search API is asked
+# for "<query> movie" BEFORE Groq AI is consulted — this saves Groq
+# tokens (the free tier is only 200K/day). Each result title is cleaned
+# (site suffixes, year, trailing junk) and scored against the query;
+# junk pages (franchise / disambiguation) are rejected outright.
+_SITE_SUFFIX_RE = re.compile(
+    r"\s*[-|–—:]\s*(IMDb|Wikipedia|Rotten Tomatoes|IMDB|Letterboxd).*$",
+    re.IGNORECASE,
+)
+_PIPE_SUFFIX_RE = re.compile(r"\s*\|\s*[^|]+$")
+_DASH_SITE_RE = re.compile(
+    r"\s+[-–—]\s+(wikipedia|imdb|rotten tomatoes|letterboxd|"
+    r"moviefone|netflix|youtube|prime video|disney|hotstar|jio|"
+    r"eros ?now|zee5|sonyliv|voot|mubi|film).*",
+    re.IGNORECASE,
+)
+_TRAIL_MOVIE_RE = re.compile(
+    r"\s+(movie|film|full(\s+hd)?|hd|extended(\s+edition)?|"
+    r"director'?s\s+cut|unrated)\s*$", re.IGNORECASE)
+_YEAR_PAREN_RE = re.compile(r"\s*\((?:19|20)\d{2}[^)]*\)\s*$")
+_FILM_SUFFIX_RE = re.compile(r"\s*\(\s*film\s*\)\s*$", re.IGNORECASE)
+
+
+def _clean_web_title(raw: str) -> str | None:
+    """Turn a search-result title into a plain movie/series title."""
+    t = (raw or "").strip()
+    if not t:
+        return None
+    t = _PIPE_SUFFIX_RE.sub("", t)
+    t = _DASH_SITE_RE.sub("", t)
+    t = _SITE_SUFFIX_RE.sub("", t)
+    t = _TRAIL_MOVIE_RE.sub("", t)
+    t = _TRAIL_MOVIE_RE.sub("", t)
+    t = _YEAR_PAREN_RE.sub("", t)
+    t = _FILM_SUFFIX_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip(" -–—:|")
+    if len(t) < 2 or len(t) > 120:
+        return None
+    low = t.lower()
+    if low in {"imdb", "wikipedia"} or low.startswith(("watch ",
+                                                       "download ")):
+        return None
+    return t
+
+
+_TITLE_JUNK_RE = re.compile(
+    r"\((film series|film franchise|franchise|disambiguation|saga)\)",
+    re.IGNORECASE)
+_QUERY_STOP = {"movie", "film", "full", "hd", "watch", "online",
+               "download", "new", "latest", "tamil", "hindi", "telugu",
+               "malayalam", "english"}
+_CANDIDATE_MIN_SCORE = 0.35
+
+
+def _word_set(text: str) -> set[str]:
+    # "K.G.F" -> "kgf" so acronym titles match plain queries
+    t = re.sub(r"(?<=[a-z0-9])\.(?=[a-z0-9])", "", (text or "").lower())
+    return set(re.findall(r"[a-z0-9]+", t))
+
+
+def _candidate_score(query: str, title: str, url: str) -> float:
+    """How well does this result title match the user's query?
+
+    Word overlap drives the score; extra junk words in the title
+    penalize it; IMDb title pages (specific movies) get a bonus.
+    Fallback: character-level similarity so pure-typo queries
+    ("kerma" -> "Karma") aren't rejected when the search engine
+    already fuzzy-matched them.
+    """
+    qw = _word_set(query) - _QUERY_STOP
+    tw = _word_set(title) - {"movie", "film", "full"}
+    if not qw or not tw:
+        return 0.0
+    overlap = len(qw & tw) / len(qw)
+    extra = len(tw - qw) / len(tw)
+    score = overlap - 0.15 * extra
+    if "imdb.com/title/tt" in (url or ""):
+        score += 0.25  # an IMDb title page is a specific movie
+    if score < _CANDIDATE_MIN_SCORE and len(query.strip()) >= 4:
+        import difflib
+        seq = difflib.SequenceMatcher(None, query.lower(),
+                                      title.lower()).ratio()
+        if seq >= 0.65:
+            score = max(score, seq * 0.8)
+    return score
+
+
+async def web_title_candidates(query: str, limit: int = 3) -> list[str]:
+    """Best-guess movie/series titles from the web-search API.
+
+    Returns cleaned titles ordered best-first, each verified to
+    actually resemble the user's query. Empty list when nothing
+    usable. Never raises.
+    """
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+    results = await _websearch_raw(f"{q} movie", num=8)
+    if not results:
+        return []
+    scored: list[tuple[float, str]] = []
+    for item in results:
+        title = _clean_web_title(item.get("title") or "")
+        if not title:
+            continue
+        if _TITLE_JUNK_RE.search(title):
+            continue  # franchise / series / disambiguation page
+        s = _candidate_score(q, title, item.get("url") or "")
+        if s >= _CANDIDATE_MIN_SCORE:
+            scored.append((s, title))
+    scored.sort(key=lambda x: -x[0])
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, t in scored:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+        if len(out) >= limit:
+            break
+    if out:
+        log.info("web title candidates %r -> %r", q[:60],
+                 [t[:40] for t in out])
+    return out

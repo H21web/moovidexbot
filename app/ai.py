@@ -15,6 +15,7 @@ import datetime
 import json
 import logging
 import re
+import time
 
 import httpx
 
@@ -23,6 +24,41 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Per-key cooldowns: {api_key: unix_ts_until}. Set when Groq answers
+# rate_limit_exceeded for that key; the key is skipped until then.
+_KEY_COOLDOWN: dict[str, float] = {}
+
+
+def _groq_keys() -> list[str]:
+    """All configured Groq keys: GROQ_API_KEY first, then GROQ_API_KEYS."""
+    keys: list[str] = []
+    primary = (getattr(settings, "GROQ_API_KEY", "") or "").strip()
+    if primary:
+        keys.append(primary)
+    extra = (getattr(settings, "GROQ_API_KEYS", "") or "").strip()
+    for k in extra.split(","):
+        k = k.strip()
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def _live_keys() -> list[str]:
+    """Keys not currently in rate-limit cooldown."""
+    now = time.time()
+    return [k for k in _groq_keys() if _KEY_COOLDOWN.get(k, 0) <= now]
+
+
+def _parse_retry_after(body: str) -> float:
+    """Parse Groq's 'Please try again in 4m43.824s' hint; default 300s."""
+    m = re.search(r"try again in (\d+)m([\d.]+)s", body)
+    if m:
+        return float(m.group(1)) * 60 + float(m.group(2))
+    m = re.search(r"try again in ([\d.]+)s", body)
+    if m:
+        return float(m.group(1))
+    return 300.0
 
 TITLE_LIST_SYSTEM = """You are a movie-title correction module for a Telegram AutoFilter bot.
 
@@ -70,7 +106,7 @@ async def close_client() -> None:
 
 
 def is_configured() -> bool:
-    return bool(settings.GROQ_API_KEY)
+    return bool(_groq_keys())
 
 
 # --- quota: 50 Grok uses / user / day ---------------------------------------
@@ -118,50 +154,94 @@ async def groq_complete(messages: list[dict],
     combine them.
     v10.8.3: prompt + user query go as ONE user message (better output
     from gpt-oss-20b than split system/user).
+    v10.8.4: fallback cascade — if the full payload (tools +
+    reasoning) is rejected with 400, retry without reasoning_effort,
+    then plain. The real Groq error body is logged at warning level so
+    the cause is visible in Render logs.
+    v10.8.5: tool_choice="auto" (NOT "required") — gpt-oss-20b answers
+    simple queries from knowledge without calling the tool, and
+    "required" 400s with tool_use_failed in that case. With "auto"
+    the model browses when the prompt tells it to (ambiguous /
+    actor / new titles) and skips it otherwise — also saves tokens.
+    Rate-limit (TPD) responses now set a short cooldown so we don't
+    hammer Groq while the daily token budget is exhausted.
+    v10.8.6: multi-key rotation — GROQ_API_KEYS (comma-separated) are
+    tried in order when a key is rate-limited; each key has its own
+    cooldown. Keys from different Groq accounts get separate daily
+    token budgets (Groq TPD is per-organization).
     """
-    if not is_configured():
+    keys = _live_keys()
+    if not keys:
+        if _groq_keys():
+            log.debug("groq: all %d key(s) in rate-limit cooldown, "
+                      "skipping", len(_groq_keys()))
         return None
-    payload = {
+    base: dict = {
         "model": settings.AI_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.2,
     }
+    full = dict(base)
     if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = tool_choice or "auto"
+        full["tools"] = tools
+        full["tool_choice"] = tool_choice or "auto"
     if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    headers = {"Authorization": f"Bearer {settings.GROQ_API_KEY}"}
-    try:
-        r = await _get_client().post(GROQ_URL, json=payload,
-                                     headers=headers)
-        r.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        body = ""
+        full["reasoning_effort"] = reasoning_effort
+    attempts: list[tuple[str, dict]] = [("full", full)]
+    if reasoning_effort and tools:
+        no_reason = dict(base)
+        no_reason["tools"] = tools
+        no_reason["tool_choice"] = tool_choice or "auto"
+        attempts.append(("no-reasoning", no_reason))
+    elif reasoning_effort:
+        attempts.append(("no-reasoning", dict(base)))
+    if tools:
+        attempts.append(("plain", dict(base)))
+
+    def _content(resp) -> str | None:
         try:
-            body = exc.response.text or ""
+            return (resp.json()["choices"][0]["message"]["content"]
+                    or "").strip()
         except Exception:  # noqa: BLE001
-            pass
-        if "json_validate_failed" in body:
-            log.info("groq json_validate_failed — retrying once")
+            return None
+
+    def _key_tag(key: str) -> str:
+        return f"key…{key[-4:]}" if len(key) > 4 else "key"
+
+    for name, payload in attempts:
+        for key in _live_keys():
+            headers = {"Authorization": f"Bearer {key}"}
+            tag = _key_tag(key)
             try:
                 r = await _get_client().post(GROQ_URL, json=payload,
                                              headers=headers)
                 r.raise_for_status()
-            except Exception as exc2:  # noqa: BLE001
-                log.warning("groq retry failed: %s", exc2)
+            except httpx.HTTPStatusError as exc:
+                body = ""
+                try:
+                    body = exc.response.text or ""
+                except Exception:  # noqa: BLE001
+                    pass
+                if "rate_limit_exceeded" in body or "rate_limit" in body:
+                    wait = _parse_retry_after(body)
+                    _KEY_COOLDOWN[key] = time.time() + wait + 5
+                    log.warning("groq %s rate-limited — cooling down "
+                                "~%ds, trying next key", tag, int(wait))
+                    continue  # next key, same payload
+                log.warning("groq 400 (%s, %s): %s", name, tag,
+                            body[:400])
+                break  # payload problem — try the simpler payload
+            except Exception as exc:  # noqa: BLE001
+                log.warning("groq failed (%s): %s", tag, exc)
                 return None
-        else:
-            log.warning("groq failed: %s", exc)
-            return None
-    except Exception as exc:  # noqa: BLE001
-        log.warning("groq failed: %s", exc)
-        return None
-    try:
-        return (r.json()["choices"][0]["message"]["content"] or "").strip()
-    except Exception:  # noqa: BLE001
-        return None
+            content = _content(r)
+            if content:
+                if name != "full":
+                    log.info("groq ok via fallback '%s' (%s)", name, tag)
+                return content
+            log.warning("groq empty content (%s, %s)", name, tag)
+    return None
 
 
 # --- the one AI feature: title correction ------------------------------------
@@ -293,9 +373,11 @@ async def ai_extract_titles(user_id: int | None, q: str,
     # v10.8.3: prompt + query as ONE user message.
     content = f"{TITLE_LIST_SYSTEM}\n\nUser search:\n\"{q[:200]}\""
     messages = [{"role": "user", "content": content}]
+    # v10.8.5: tool_choice="auto" — "required" 400s (tool_use_failed)
+    # when gpt-oss-20b answers from knowledge without browsing.
     raw = await groq_complete(messages, max_tokens=800,
                               tools=[{"type": "browser_search"}],
-                              tool_choice="required",
+                              tool_choice="auto",
                               reasoning_effort="low")
     if raw is None:
         log.info("[s:%s] grok: no response (API failed)", sid or "-")

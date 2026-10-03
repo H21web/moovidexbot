@@ -186,9 +186,11 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
 
     1. Clean the message, instant DB search (parallel sweeps + fuzzy
        retry inside ``_hot_sweeps``).
-    2. No files -> Grok AI title extraction (original query only),
-       1-5 titles; each verified against the DB.
-    3. Exactly one verified title -> use it directly.
+    2. No files -> free web-search API title lookup (``<query> movie``),
+       candidates verified against the DB.
+    3. Still no files -> Grok AI title extraction (original query
+       only), 1-5 titles; each verified against the DB.
+    4. Exactly one verified title -> use it directly.
        Several verified titles -> ``status="choose"`` (user picks).
        None -> ``no_results``.
 
@@ -196,7 +198,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     "parsed", "confidence", "corrected", "corrected_via", "sid",
     "choices", "raw"}``; status is
     ``"ok" | "uncertain" | "no_results" | "choose"``.
-    ``corrected_via`` is ``"ai" | None``; ``sid`` is the per-search
+    ``corrected_via`` is ``"web" | "ai" | None``; ``sid`` is the per-search
     trace id used in the log lines.
     """
     t0 = _time.time()
@@ -217,34 +219,58 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     log.info("[s:%s] hot: %d files best=%.2f (%dms)", sid, len(merged),
              score, el())
 
-    # --- 2. Grok AI title extraction (only on zero files) ---------------
+    # --- 2. web-search API title lookup (free, before Groq) --------------
+    # --- 3. Grok AI title extraction (only if web found nothing) --------
     choices: list[dict] = []
     if not merged:
-        log.info("[s:%s] grok: asking (original query only) (%dms)",
-                 sid, el())
         try:
-            from app import ai as ai_mod
-            ai_titles = await ai_mod.ai_extract_titles(user_id, raw,
-                                                       sid=sid)
+            from app import enrich as enrich_mod
+            web_titles = await enrich_mod.web_title_candidates(raw,
+                                                               limit=3)
         except Exception as exc:  # noqa: BLE001
-            log.debug("AI title extract failed: %s", exc)
-            ai_titles = []
-        # Verify every AI title against the DB — only titles with real
-        # files survive. Year is applied for movies only, never series.
-        for t in ai_titles:
-            t_parsed = _with_original_filters(parse_query(t["title"]),
+            log.debug("web title candidates failed: %s", exc)
+            web_titles = []
+        for wt in web_titles:
+            t_parsed = _with_original_filters(parse_query(wt),
                                               orig_parsed)
-            if t.get("type") == "movie" and t.get("year"):
-                t_parsed["year"] = t["year"]
-            retry = await _hot_sweeps(user_id, t["title"], t_parsed,
+            retry = await _hot_sweeps(user_id, wt, t_parsed,
                                       log_q=False)
-            log.info("[s:%s] grok: tried %r (%s) -> %d files (%dms)", sid,
-                     t["title"][:50], t.get("type"), len(retry), el())
+            log.info("[s:%s] web: tried %r -> %d files (%dms)", sid,
+                     wt[:50], len(retry), el())
             if retry:
-                choices.append({"title": t["title"], "year": t.get("year"),
-                                "type": t.get("type"),
-                                "reason": t.get("reason"),
+                choices.append({"title": wt, "year": None, "type": None,
+                                "reason": "web", "via": "web",
                                 "hits": retry, "parsed": t_parsed})
+        if not choices:
+            log.info("[s:%s] grok: asking (original query only) (%dms)",
+                     sid, el())
+            try:
+                from app import ai as ai_mod
+                ai_titles = await ai_mod.ai_extract_titles(user_id, raw,
+                                                           sid=sid)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("AI title extract failed: %s", exc)
+                ai_titles = []
+            # Verify every AI title against the DB — only titles with
+            # real files survive. Year is applied for movies only,
+            # never series.
+            for t in ai_titles:
+                t_parsed = _with_original_filters(parse_query(t["title"]),
+                                                  orig_parsed)
+                if t.get("type") == "movie" and t.get("year"):
+                    t_parsed["year"] = t["year"]
+                retry = await _hot_sweeps(user_id, t["title"], t_parsed,
+                                          log_q=False)
+                log.info("[s:%s] grok: tried %r (%s) -> %d files (%dms)",
+                         sid, t["title"][:50], t.get("type"),
+                         len(retry), el())
+                if retry:
+                    choices.append({"title": t["title"],
+                                    "year": t.get("year"),
+                                    "type": t.get("type"),
+                                    "reason": t.get("reason"),
+                                    "via": "ai",
+                                    "hits": retry, "parsed": t_parsed})
         if len(choices) == 1:
             c = choices[0]
             merged, score = c["hits"], _best_score(c["hits"])
@@ -252,12 +278,12 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
             parsed["title"] = c["title"]
             title = c["title"]
             corrected = c["title"]
-            corrected_via = "ai"
-            log.info("[s:%s] grok: single title %r -> using it (%dms)",
-                     sid, title[:50], el())
+            corrected_via = c["via"]
+            log.info("[s:%s] %s: single title %r -> using it (%dms)",
+                     sid, c["via"], title[:50], el())
         elif len(choices) > 1:
-            log.info("[s:%s] grok: %d titles -> asking user (%dms)", sid,
-                     len(choices), el())
+            log.info("[s:%s] %s: %d titles -> asking user (%dms)", sid,
+                     choices[0]["via"], len(choices), el())
             return {"status": "choose", "files": [], "best": None,
                     "best_reasons": [], "title": title, "parsed": parsed,
                     "confidence": 0.0, "corrected": None,

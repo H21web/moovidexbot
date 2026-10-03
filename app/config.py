@@ -43,6 +43,11 @@ class Settings(BaseSettings):
 
     # --- AI (Groq) — v6 super update ---
     GROQ_API_KEY: str = ""         # empty = AI features disabled gracefully
+    # v10.8.4: comma-separated extra keys — the bot rotates to the next
+    # key when one is rate-limited. Keys from DIFFERENT Groq accounts
+    # each get their own daily token budget; keys from the same account
+    # share one budget (Groq TPD is per-organization).
+    GROQ_API_KEYS: str = ""
     AI_MODEL: str = "openai/gpt-oss-20b"  # the one working model on our key
     AI_PARSE_MODEL: str = "openai/gpt-oss-20b"  # fast model for v7 query parsing
     # Dead llama models removed (Groq retired them — 404 even on fresh keys).
