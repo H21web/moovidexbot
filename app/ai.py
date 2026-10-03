@@ -205,6 +205,22 @@ def clean_ai_title(raw: str | None, original_q: str) -> str | None:
     return t
 
 
+def _extract_json_text(raw: str | None) -> str:
+    """Pull the JSON object out of a possibly chatty model reply.
+
+    Strips markdown fences and trims everything outside the outermost
+    ``{...}`` so ``json.loads`` sees only the object.
+    """
+    t = (raw or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```\s*$", "", t).strip()
+    s, e = t.find("{"), t.rfind("}")
+    if 0 <= s < e:
+        t = t[s:e + 1]
+    return t
+
+
 def _parse_title_list(raw: str | None, q: str) -> list[dict]:
     """Parse Grok's ``{"titles": [{title, year, type, reason}]}`` reply.
 
@@ -214,7 +230,7 @@ def _parse_title_list(raw: str | None, q: str) -> list[dict]:
     if not raw:
         return []
     try:
-        data = json.loads(raw)
+        data = json.loads(_extract_json_text(raw))
     except Exception:  # noqa: BLE001
         return []
     if not isinstance(data, dict):
@@ -265,7 +281,7 @@ async def ai_extract_titles(user_id: int | None, q: str,
         log.debug("ai_extract_titles: quota exhausted for %s", user_id)
         return []
     raw = await groq_complete(TITLE_LIST_SYSTEM, q[:200], max_tokens=400,
-                              json_mode=True)
+                              json_mode=False)
     titles = _parse_title_list(raw, q)
     if not titles:
         log.info("[s:%s] grok: no title identified for %r", sid or "-",
