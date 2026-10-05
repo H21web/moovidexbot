@@ -6,8 +6,9 @@ This is what powers the web player + /dl downloads for files of ANY size
 Technique (mirrors pyrogram's own download path):
   * decode the file_id -> DC + location
   * open a per-DC media session (auth exported from the main session)
-  * raw ``upload.GetFile`` with ``precise=True`` byte offsets, so HTTP
-    Range requests (video seeking) work exactly.
+  * raw ``upload.GetFile`` in 1 MiB chunks whose offsets are always
+    multiples of the chunk size (pyrogram's own downloader shape), so
+    HTTP Range requests (video seeking) work exactly.
   * if Telegram answers ``upload.FileCdnRedirect``, follow it: open a
     session on the CDN DC (no auth import needed — the file_token
     authorizes), fetch via ``upload.GetCdnFile``, AES-256-CTR decrypt
@@ -31,18 +32,18 @@ from pyrogram.session import Auth, Session
 
 log = logging.getLogger(__name__)
 
-# Telegram's upload.GetFile granularity rules (violating them raises
-# [400 LIMIT_INVALID]):
-#   * with precise=True: offset and limit must be multiples of 1 KiB,
-#     limit <= 1 MiB;
-#   * without precise: multiples of 4 KiB and (1 MiB % limit == 0).
-# 512 KiB satisfies BOTH regimes, so every request we build is valid by
-# construction. We always request the FULL chunk and let Telegram
-# short-read at EOF — trimming the final limit to the exact remainder
-# is what used to break the granularity rule.
-CHUNK_SIZE = 512 * 1024
-MAX_CHUNK = 512 * 1024
-_GRANULARITY = 1024  # precise=True -> 1 KiB alignment
+# upload.GetFile request shape — v10.11.2.
+# We tried 1 KiB-aligned precise requests and 4 KiB-aligned non-precise
+# requests; some DCs/files reject both with [400 LIMIT_INVALID]. The only
+# shape that works everywhere is pyrogram's own downloader shape, so we
+# now use exactly that:
+#   * 1 MiB chunks, offset ALWAYS a multiple of the chunk size,
+#   * no `precise` flag (arbitrary HTTP Range offsets are sliced locally).
+# We always request the FULL chunk and let Telegram short-read at EOF —
+# trimming the final limit to the exact remainder is what used to break
+# the granularity rule.
+CHUNK_SIZE = 1024 * 1024
+MAX_CHUNK = 1024 * 1024
 
 
 class StreamError(RuntimeError):
@@ -137,10 +138,10 @@ async def _stream_cdn(client, main_session: Session,
 
     pos = max(0, offset)
     remaining = length
-    # v10.3.1: align to the 1 KiB granularity (a multiple of 16, so the
-    # AES-CTR IV math below stays correct) and always request the FULL
-    # chunk — GetCdnFile has the same LIMIT_INVALID rules as GetFile.
-    req_pos = pos - (pos % _GRANULARITY)
+    # Same chunk-multiple alignment as the main path (a multiple of 16,
+    # so the AES-CTR IV math below stays correct). Always request the
+    # FULL chunk — GetCdnFile has the same LIMIT_INVALID rules as GetFile.
+    req_pos = (pos // chunk_size) * chunk_size
     skip = pos - req_pos
 
     while True:
@@ -222,64 +223,41 @@ async def stream_file(
     location = _location_for(fid)
     session = await _media_session(client, fid.dc_id)
 
-    # v10.3.1: round the chunk to the granularity — every limit we send
-    # is then a valid power-of-2 multiple (512 KiB) by construction.
-    chunk_size = max(_GRANULARITY, min(chunk_size, MAX_CHUNK))
-    chunk_size -= chunk_size % _GRANULARITY
+    # Fixed 1 MiB chunks (pyrogram's own size).
+    chunk_size = CHUNK_SIZE
     pos = max(0, offset)
     remaining = length
-    # v10.11.1: some DCs/files reject precise=True with [400 LIMIT_INVALID]
-    # even for 1 KiB-aligned requests. On the first rejection we fall back
-    # to classic 4 KiB-aligned non-precise requests (limit still divides
-    # 1 MiB) for the rest of the stream — same bytes, no seeking loss that
-    # matters (we slice locally anyway).
-    use_precise = True
 
     while True:
         if remaining is not None and remaining <= 0:
             break
-        # Re-derive the aligned request position from pos every iteration:
-        # a fallback request may consume a non-multiple of chunk_size, so
-        # a blind `+= chunk_size` would skip bytes.
-        req_pos = pos - (pos % _GRANULARITY)
+        # The offset is ALWAYS a multiple of the chunk size — exactly the
+        # request shape pyrogram's downloader uses. Arbitrary HTTP Range
+        # offsets are satisfied by slicing the leading bytes locally.
+        req_pos = (pos // chunk_size) * chunk_size
         skip = pos - req_pos
-        extra_skip = 0
-        if use_precise:
-            try:
-                result = await session.invoke(
-                    raw.functions.upload.GetFile(
-                        location=location,
-                        offset=req_pos,
-                        limit=chunk_size,
-                        precise=True,
-                        cdn_supported=True,
-                    ),
-                    sleep_threshold=30,
-                )
-            except LimitInvalid:
-                log.warning("precise GetFile rejected at offset %d; "
-                            "falling back to 4K-aligned requests", req_pos)
-                use_precise = False
-        if not use_precise:
+        try:
             # Always the FULL chunk — never trim the limit to the remainder.
-            aligned = req_pos - (req_pos % 4096)
-            extra_skip = req_pos - aligned
             result = await session.invoke(
                 raw.functions.upload.GetFile(
                     location=location,
-                    offset=aligned,
+                    offset=req_pos,
                     limit=chunk_size,
-                    precise=False,
                     cdn_supported=True,
                 ),
                 sleep_threshold=30,
             )
+        except LimitInvalid:
+            # Should not happen with the shape above; log everything so
+            # the next occurrence is diagnosable instead of a mystery.
+            log.error("GetFile LIMIT_INVALID: offset=%d limit=%d dc=%d "
+                      "file_id=%.16s...", req_pos, chunk_size,
+                      fid.dc_id, file_id)
+            raise
         if isinstance(result, raw.types.upload.File):
             data = result.bytes
             if not data:
                 break  # EOF
-            if extra_skip:
-                data = data[extra_skip:]
             if skip:
                 data = data[skip:]
             if remaining is not None:
