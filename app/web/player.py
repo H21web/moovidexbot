@@ -342,34 +342,77 @@ async def go_ext(token: str, player: str = "mx", request: Request = None):
     base = str(request.base_url).rstrip("/") if request else ""
     stream_url = f"{base}/dl/{token}"
     players = {
-        "mx": ("com.mxtech.videoplayer.ad", ""),
-        "vlc": ("org.videolan.vlc", ""),
-        "km": ("com.kmplayer", ""),
-        "playit": ("com.playit.videoplayer", ""),
+        "mx": ("com.mxtech.videoplayer.ad", "", "MX Player"),
+        "vlc": ("org.videolan.vlc", "", "VLC"),
+        "km": ("com.kmplayer", "", "KMPlayer"),
+        "playit": ("com.playit.videoplayer", "", "PLAYit"),
         "s": ("com.young.simple.player",
-              "com.young.simple.player.playback_online"),
-        "u": ("uplayer.video.player", ""),
+              "com.young.simple.player.playback_online", "S Player"),
+        "u": ("uplayer.video.player", "", "U Player"),
     }
-    pkg, action = players.get((player or "mx").lower(), players["mx"])
+    pkg, action, pname = players.get((player or "mx").lower(), players["mx"])
     intent = (f"intent:{stream_url}#Intent;"
               + (f"action={action};" if action else "")
               + f"package={pkg};type=video/*;"
               + f"S.browser_fallback_url={quote(stream_url, safe='')};end")
+    store_url = f"https://play.google.com/store/apps/details?id={pkg}"
     name = escape((f.file_name or "Video").rsplit("/", 1)[-1])
+    pname_e = escape(pname)
     return HTMLResponse(
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>Opening player…</title></head>"
+        f"<title>Opening {pname_e}…</title></head>"
         "<body style='background:#0b0b10;color:#fff;font-family:sans-serif;"
         "text-align:center;padding:48px 24px'>"
         f"<h3 style='margin:0 0 8px'>{name}</h3>"
-        "<p style='color:#aaa'>Opening in player…</p>"
+        f"<p style='color:#aaa' id='st'>Opening in {pname_e}…</p>"
         f"<p><a href='{intent}' style='color:#a06bff;font-size:18px'>"
         "Tap here if the player didn't open</a></p>"
         f"<p><a href='{stream_url}?dl=1' style='color:#888'>"
         "Download instead</a></p>"
-        f"<script>window.location.href={json.dumps(intent)};</script>"
+        # If the app isn't installed the intent goes nowhere and this
+        # page stays visible — after 2s offer the Play Store install.
+        "<div id='noapp' style='display:none;margin-top:24px;"
+        "border:1px solid #333;border-radius:12px;padding:16px'>"
+        f"<p style='margin:0 0 8px'>Couldn't open {pname_e} — "
+        "is it installed?</p>"
+        f"<a href='{store_url}' style='display:inline-block;background:#a06bff;"
+        "color:#fff;padding:10px 22px;border-radius:10px;text-decoration:none;"
+        f"font-weight:700'>Install {pname_e}</a></div>"
+        "<script>"
+        f"window.location.href={json.dumps(intent)};"
+        "setTimeout(function(){"
+        "if(document.visibilityState==='visible'){"
+        "document.getElementById('noapp').style.display='block';"
+        f"document.getElementById('st').textContent={json.dumps(pname)}"
+        "+' did not open.';}},2000);"
+        "</script>"
         "</body></html>")
+
+
+@router.get("/subs/search")
+async def subs_search(title: str, langs: str = "eng"):
+    """Search subtitles (keyless OpenSubtitles). JSON list."""
+    from app import subs
+    langs = re.sub(r"[^a-z,]", "", (langs or "eng").lower()) or "eng"
+    results = await subs.search_subtitles(title, langs, limit=12)
+    return {"results": results}
+
+
+@router.get("/subs/file/{sub_id}")
+async def subs_file(sub_id: str):
+    """Proxy one .srt so the web player can load it (same-origin)."""
+    from app import subs
+    got = await subs.download_subtitle(sub_id)
+    if not got:
+        raise HTTPException(404, "subtitle not found")
+    data, name = got
+    return Response(
+        content=data,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition":
+                 f"attachment; filename*=UTF-8''{quote(name)}"},
+    )
 
 
 @router.api_route("/dl/{token}", methods=["GET", "HEAD"])

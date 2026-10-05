@@ -109,7 +109,9 @@ def v8_file_kb(file_db_id: int, user_id: int):
                                          callback_data=f"dl:{file_db_id}")])
     # v10: watchlist — save for later.
     rows.append([InlineKeyboardButton("⭐ Save",
-                                     callback_data=f"save:{file_db_id}")])
+                                     callback_data=f"save:{file_db_id}"),
+                 InlineKeyboardButton("📝 Subtitles",
+                                      callback_data=f"sub:{file_db_id}")])
     return InlineKeyboardMarkup(rows)
 
 

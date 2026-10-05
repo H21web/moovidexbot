@@ -68,6 +68,14 @@
         <div class="img-fluid nft-img">
           <div id="oplayer" class="oplayer-con" style="aspect-ratio: 16 / 9; background: #000;"></div>
           <div id="playerErr"><div style="font-size:34px">📡</div><p id="playerErrMsg">The stream couldn't be loaded.</p><button class="retry-btn" id="retryBtn">↻ Retry</button></div>
+          <div id="codecOverlay" style="display:none;position:absolute;inset:0;background:rgba(5,5,10,.92);z-index:30;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:24px;text-align:center">
+            <div style="font-size:40px">🎬</div>
+            <p style="margin:0;font-size:15px;color:#fff">This file can't play in the browser.<br><span style="color:#999;font-size:13px">Usually HEVC/x265 — MX Player or VLC play it fine.</span></p>
+            <div style="display:flex;gap:10px;margin-top:6px">
+              <button onclick="mx_player()" style="background:#a06bff;border:0;color:#fff;font-weight:700;padding:12px 20px;border-radius:10px;font-size:15px">Open in MX Player</button>
+              <button onclick="vlc_player()" style="background:#23232e;border:1px solid #444;color:#fff;font-weight:700;padding:12px 20px;border-radius:10px;font-size:15px">Open in VLC</button>
+            </div>
+          </div>
           <div class="prog" id="prog"><i id="progBar"></i></div>
           <div class="prog-label" id="progLabel"></div>
         </div>
@@ -147,6 +155,23 @@
   </section>
   <!-- play on section end -->
 
+  <!-- subtitles section -->
+  <section class="section-lg-b-space">
+    <div class="custom-container">
+      <ul class="setting-list">
+        <li>
+          <div class="setting-details" style="cursor:default">
+            <div class="setting-icon" style="font-size:22px">📝</div>
+            <h4>Subtitles</h4>
+            <div class="setting-arrow"><button id="subSearchBtn" class="retry-btn" style="margin:0">🔍 Find</button></div>
+          </div>
+          <div id="subResults" style="padding:0 16px 12px;display:flex;flex-direction:column;gap:8px"></div>
+        </li>
+      </ul>
+    </div>
+  </section>
+  <!-- subtitles section end -->
+
   <!-- panel-space start -->
   <section class="panel-space"></section>
   <!-- panel-space end -->
@@ -207,7 +232,7 @@
     document.getElementById("playerErr").classList.remove("show");
     try {
       if (!window.OPlayer) throw new Error("oplayer missing");
-      OPlayer.make("#oplayer", {
+      window._opl = OPlayer.make("#oplayer", {
         source: { src: downloadlink, poster: posterUrl }
       }).use([
         OUI({
@@ -215,6 +240,7 @@
           autoFocus: true, forceLandscapeOnFullscreen: true,
           screenshot: false, pictureInPicture: true, showControls: "always",
           keyboard: { focused: true, global: false }, settings: ["loop"],
+          subtitle: { source: [] },
           theme: {
             primaryColor: "#6A00BE",
             watermark: {
@@ -246,14 +272,12 @@
               vids[i].addEventListener("playing", hideCover);
               /* Codec UX: if the browser can't decode this file
                  (e.g. HEVC/x265 MKV — Chrome's demuxer rejects it),
-                 say so plainly and point at the external players. */
+                 show the can't-play overlay with direct player
+                 buttons instead of a cryptic warning. */
               vids[i].addEventListener("error", function(){
                 try {
                   if (this.error && this.error.code === 4) {
-                    document.getElementById("playerErrMsg").textContent =
-                      "This file's format can't play in the browser (often HEVC/x265 MKV). " +
-                      "Use MX Player or VLC below — they play everything.";
-                    document.getElementById("playerErr").classList.add("show");
+                    document.getElementById("codecOverlay").style.display = "flex";
                   }
                 } catch(e){}
               });
@@ -300,6 +324,49 @@
   window.playit_player = function(){ openIntent("com.playit.videoplayer"); };
   window.s_player      = function(){ openIntent("com.young.simple.player", "com.young.simple.player.playback_online"); };
   window.u_player      = function(){ openIntent("uplayer.video.player"); };
+
+  /* ---------- subtitles ---------- */
+  function loadSubtitle(s){
+    try {
+      var url = "/subs/file/" + encodeURIComponent(s.id);
+      var ui = window._opl && window._opl.context && window._opl.context.ui;
+      if (ui && ui.subtitle && ui.subtitle.changeSource) {
+        ui.subtitle.changeSource([{ name: (s.lang || "sub") + " subtitle",
+                                    src: url, default: true }]);
+        toast("Subtitle loaded");
+      } else {
+        toast("Player not ready");
+      }
+    } catch(e){ toast("Couldn't load subtitle"); }
+  }
+  document.getElementById("subSearchBtn").onclick = async function(){
+    haptic();
+    var box = document.getElementById("subResults");
+    var title = "";
+    try { title = document.getElementById("checktxt").textContent || ""; } catch(e){}
+    box.innerHTML = "<p style='color:#888;font-size:13px'>Searching subtitles…</p>";
+    try {
+      var r = await fetch("/subs/search?title=" + encodeURIComponent(title) +
+                          "&langs=eng,mal,hin,tam");
+      var j = await r.json();
+      var list = (j && j.results) || [];
+      if (!list.length) { box.innerHTML = "<p style='color:#888;font-size:13px'>No subtitles found.</p>"; return; }
+      box.innerHTML = "";
+      list.forEach(function(s){
+        var b = document.createElement("button");
+        b.className = "retry-btn";
+        b.style.cssText = "text-align:left;font-size:13px";
+        var lbl = (s.lang ? s.lang.toUpperCase() + " • " : "") +
+                  ((s.name || ("sub " + s.id)).slice(0, 42));
+        if (s.downloads) lbl += " (" + s.downloads + "⬇)";
+        b.textContent = lbl;
+        b.onclick = function(){ loadSubtitle(s); };
+        box.appendChild(b);
+      });
+    } catch(e){
+      box.innerHTML = "<p style='color:#888;font-size:13px'>Search failed. Try again.</p>";
+    }
+  };
 
   /* ---------- download with progress ---------- */
   function fmt(n){
