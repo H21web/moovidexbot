@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from hashlib import sha256
 from typing import AsyncGenerator
 
@@ -41,8 +43,14 @@ log = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 * 1024
 MAX_CHUNK = 1024 * 1024
 # In-flight GetFile requests per stream — hides Telegram round-trip
-# latency; chunks are still yielded in strict order.
-_PARALLEL = 4
+# latency; chunks are still yielded in strict order. Tunable via
+# STREAM_PARALLEL (1..8) if a DC throttles aggressively.
+def _parallel():
+    try:
+        return max(1, min(8, int(os.environ.get("STREAM_PARALLEL", "4") or 4)))
+    except ValueError:
+        return 4
+_PARALLEL = _parallel()
 
 
 class StreamError(RuntimeError):
@@ -268,56 +276,68 @@ async def stream_file(
     remaining = length
     eof = False
     first = True
-
-    while True:
-        if remaining is not None and remaining <= 0:
-            break
-        # Top up the pipeline (never fetch past the last needed chunk).
-        while (not eof and len(pending) < _PARALLEL
-               and (last_index is None or next_fetch <= last_index)):
-            pending[next_fetch] = asyncio.create_task(
-                _fetch_chunk(session, location, next_fetch, chunk_size))
-            next_fetch += 1
-        if yield_index not in pending:
-            break  # drained
-        _, ok, res = await pending.pop(yield_index)
-        yield_index += 1
-        if not ok:
-            pending.clear()  # siblings finish alone; results discarded
-            raise res
-        if isinstance(res, raw.types.upload.File):
-            data = res.bytes
-            if not data:
-                eof = True
-                pending.clear()
-                break  # EOF
-            if first:
-                if skip_first:
-                    data = data[skip_first:]
-                first = False
-            if remaining is not None:
-                data = data[:remaining]
-                remaining -= len(data)
-            if not data:
-                pending.clear()
-                break
-            yield data
-            stream_pos += len(data)
-            if len(res.bytes) < chunk_size:  # short read = EOF
-                eof = True
-                pending.clear()
-                break
+    # Throughput telemetry (Render logs): proves whether a slow stream is
+    # Telegram-side or something else. One line per stream.
+    _t0 = time.monotonic()
+    _sent = 0
+    try:
+        while True:
             if remaining is not None and remaining <= 0:
-                pending.clear()
                 break
-        elif isinstance(res, raw.types.upload.FileCdnRedirect):
-            log.info("CDN redirect for file (dc %d), following",
-                     res.dc_id)
-            pending.clear()
-            async for chunk in _stream_cdn(client, session, res,
-                                           stream_pos, remaining, chunk_size):
-                yield chunk
-            return
-        else:
-            pending.clear()
-            raise StreamError(f"unexpected GetFile response: {type(res).__name__}")
+            # Top up the pipeline (never fetch past the last needed chunk).
+            while (not eof and len(pending) < _PARALLEL
+                   and (last_index is None or next_fetch <= last_index)):
+                pending[next_fetch] = asyncio.create_task(
+                    _fetch_chunk(session, location, next_fetch, chunk_size))
+                next_fetch += 1
+            if yield_index not in pending:
+                break  # drained
+            _, ok, res = await pending.pop(yield_index)
+            yield_index += 1
+            if not ok:
+                pending.clear()  # siblings finish alone; results discarded
+                raise res
+            if isinstance(res, raw.types.upload.File):
+                data = res.bytes
+                if not data:
+                    eof = True
+                    pending.clear()
+                    break  # EOF
+                if first:
+                    if skip_first:
+                        data = data[skip_first:]
+                    first = False
+                if remaining is not None:
+                    data = data[:remaining]
+                    remaining -= len(data)
+                if not data:
+                    pending.clear()
+                    break
+                yield data
+                stream_pos += len(data)
+                _sent += len(data)
+                if len(res.bytes) < chunk_size:  # short read = EOF
+                    eof = True
+                    pending.clear()
+                    break
+                if remaining is not None and remaining <= 0:
+                    pending.clear()
+                    break
+            elif isinstance(res, raw.types.upload.FileCdnRedirect):
+                log.info("CDN redirect for file (dc %d), following",
+                         res.dc_id)
+                pending.clear()
+                async for chunk in _stream_cdn(client, session, res,
+                                               stream_pos, remaining, chunk_size):
+                    _sent += len(chunk)
+                    yield chunk
+                return
+            else:
+                pending.clear()
+                raise StreamError(f"unexpected GetFile response: {type(res).__name__}")
+    finally:
+        dt = time.monotonic() - _t0
+        if _sent:
+            log.info("streamed %.1f MB in %.1fs (%.2f MB/s, parallel=%d)",
+                     _sent / 1048576, dt, _sent / 1048576 / max(dt, 0.01),
+                     _PARALLEL)

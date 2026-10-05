@@ -192,6 +192,7 @@
   /* ---------- server-provided data ---------- */
   var downloadlink = "__DL_URL__";
   var downloadlinkDl = "__DL_DL_URL__";
+  var goUrl = "__GO_URL__";
   var posterUrl = "__POSTER__" || "https://h21web.github.io/host/assets/images/folder.png";
   var FILE_NAME = __FILENAME_JSON__;
   var FILE_SIZE = __SIZE__ || 0;
@@ -260,11 +261,16 @@
   /* ---------- external players ---------- */
   function openIntent(pkg, action){
     haptic();
+    var key = { "com.mxtech.videoplayer.ad": "mx",
+                "org.videolan.vlc": "vlc",
+                "com.kmplayer": "km",
+                "com.playit.videoplayer": "playit",
+                "com.young.simple.player": "s",
+                "uplayer.video.player": "u" }[pkg] || "mx";
     if (inTg) {
-      /* Telegram's WebView can't fire intent:// — open this page in the
-         system browser, where external players work. */
-      toast("Opening in browser for external player…");
-      tg.openLink(window.location.href);
+      /* Telegram's WebView can't fire intent:// — open the redirector in
+         the system browser; it fires the intent into the player app. */
+      tg.openLink(goUrl + "&player=" + key);
       return;
     }
     var intent = "intent:" + downloadlink + "#Intent;" +

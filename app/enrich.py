@@ -203,7 +203,7 @@ async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
         out.append({"title": title, "year": year, "type": typ,
                     "reason": "justwatch",
                     "imdb_id": (item.get("imdbId") or "").strip() or None,
-                    "backdrop": drops[0] if drops else None,
+                    "backdrop": drops[-1] if drops else None,
                     "poster": photos[0] if photos else None})
         if len(out) >= limit:
             break

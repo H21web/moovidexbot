@@ -52,7 +52,10 @@ _MAX_RESUMES = 3
 _WATCH_HTML = os.path.join(os.path.dirname(__file__), "watch.html")
 _watch_template: str | None = None
 
-_LOGO_URL = "https://h21web.github.io/cdn/assets/moovidex-logo.png"
+_LOGO_URL = (os.environ.get("LOGO_URL") or
+             "https://h21web.github.io/cdn/assets/moovidex-logo.png").strip()
+# BOT_USERNAME env overrides get_me() (e.g. after a bot rename).
+_BOT_USERNAME_ENV = (os.environ.get("BOT_USERNAME") or "").strip().lstrip("@")
 
 _bot_username: str | None = None
 _bot_username_failed = False
@@ -224,15 +227,21 @@ async def watch(token: str, request: Request):
     playable = mime.startswith(("video/", "audio/")) or \
         name.lower().endswith((".mp4", ".webm", ".mov", ".m4v",
                                ".mp3", ".ogg", ".wav", ".m4a"))
-    # TMDB enrichment for the poster (best-effort, cached 30 days).
-    meta: dict | None = None
+    # Poster: JustWatch last backdrop (cinematic), TMDB poster as fallback.
+    # Best-effort, cached by the enrich layer.
+    poster = ""
     try:
         guess = _title_guess(name)
         if guess:
-            meta = await tmdb.get_movie(guess)
+            from app.enrich import justwatch_titles
+            jw = await justwatch_titles(guess, limit=3)
+            if jw and jw[0].get("backdrop"):
+                poster = jw[0]["backdrop"]
+            else:
+                meta = await tmdb.get_movie(guess)
+                poster = (meta or {}).get("poster_url") or ""
     except Exception:  # noqa: BLE001
-        meta = None
-    poster = (meta or {}).get("poster_url") or ""
+        poster = ""
 
     # File details — DB values first, filename detection as fallback.
     from app.textutil import detect_quality_language, extract_year
@@ -243,7 +252,7 @@ async def watch(token: str, request: Request):
     year_s = str(year) if year else "—"
     fmt = ("." + ext) if ext else "—"
 
-    username = await _bot_username()
+    username = _BOT_USERNAME_ENV or await _bot_username()
     bot_url = f"https://telegram.me/{username}" if username else "#"
 
     html_page = _template().replace("__TITLE__", escape(name))
@@ -254,6 +263,7 @@ async def watch(token: str, request: Request):
                  .replace("__BOT_URL__", bot_url)
                  .replace("__DL_URL__", dl_url)
                  .replace("__DL_DL_URL__", dl_url + "?dl=1")
+                 .replace("__GO_URL__", f"{base}/go/ext?token={token}")
                  .replace("__PLAYABLE__", "true" if playable else "false")
                  .replace("__SIZE__", str(f.file_size or 0))
                  .replace("__SIZE_H__", _fmt_size(f.file_size))
@@ -270,15 +280,32 @@ async def watch(token: str, request: Request):
 
 
 def _title_guess(name: str) -> str:
-    """'KGF.Chapter.2.2022.1080p.mkv' -> 'KGF Chapter 2'."""
+    """Extract a clean title from a release filename.
+
+    'KGF.Chapter.2.2022.1080p.WEB-DL.mkv' -> 'KGF Chapter 2 2022'
+    'Show.Name.S01E02.720p.mkv' -> 'Show Name' (series: episode cut)
+    """
     base = name.rsplit(".", 1)[0] if "." in name else name
+    # Series: cut from the episode marker, keep the show name.
+    base = re.split(r"\bS\d{1,2}E\d{1,3}\b", base, flags=re.IGNORECASE)[0]
+    base = re.split(r"\bSeason\s*\d+\b", base, flags=re.IGNORECASE)[0]
+    # Grab the year before stripping parentheticals like (2022).
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", base)
+    year = m.group(1) if m else ""
     base = re.sub(r"[\[\(].*?[\]\)]", " ", base)
-    base = re.sub(r"\b(480p|720p|1080p|2160p|4k|hdrip|webrip|web-dl|bluray|"
-                  r"hdtv|x264|x265|hevc|aac|ac3|dd5\.1|esub|subs)\b",
-                  " ", base, flags=re.IGNORECASE)
+    base = re.sub(
+        r"\b(480p|720p|1080p|1080i|2160p|4k|uhd|hdrip|webrip|web-dl|webdl|"
+        r"bluray|brrip|bdrip|hdts|hdtv|dvdrip|dvdscr|x264|x265|hevc|h264|"
+        r"h265|10bit|8bit|aac|ac3|ddp\d?\.?\d?|dd5\.1|dts|esub|esubs|subs|"
+        r"hindi|tamil|telugu|malayalam|kannada)\b",
+        " ", base, flags=re.IGNORECASE)
+    base = re.sub(r"\b\d+(\.\d+)?\s*(gb|mb)\b", " ", base, flags=re.IGNORECASE)
     base = re.sub(r"[._]+", " ", base)
     base = re.sub(r"\s+", " ", base).strip(" -")
-    return base[:80]
+    guess = base[:80].strip()
+    if year and year not in guess:
+        guess = f"{guess} {year}".strip()
+    return guess
 
 
 def _fmt_size(n) -> str:
@@ -293,6 +320,56 @@ def _fmt_size(n) -> str:
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
         n /= 1024
     return ""
+
+
+@router.get("/go/ext", response_class=HTMLResponse)
+async def go_ext(token: str, player: str = "mx", request: Request = None):
+    """External-player redirector.
+
+    Telegram's in-app browser cannot fire ``intent://`` URLs, so the
+    watch page opens this URL via ``Telegram.WebApp.openLink()`` in the
+    system browser — which then fires the intent into the player app.
+    Includes manual fallback links if the intent is swallowed.
+    """
+    try:
+        f = await _get_file(token)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            return _error_page(403, "Link expired",
+                               "This link is invalid or has expired.")
+        return _error_page(404, "File not found",
+                           "This file is no longer indexed.")
+    base = str(request.base_url).rstrip("/") if request else ""
+    stream_url = f"{base}/dl/{token}"
+    players = {
+        "mx": ("com.mxtech.videoplayer.ad", ""),
+        "vlc": ("org.videolan.vlc", ""),
+        "km": ("com.kmplayer", ""),
+        "playit": ("com.playit.videoplayer", ""),
+        "s": ("com.young.simple.player",
+              "com.young.simple.player.playback_online"),
+        "u": ("uplayer.video.player", ""),
+    }
+    pkg, action = players.get((player or "mx").lower(), players["mx"])
+    intent = (f"intent:{stream_url}#Intent;"
+              + (f"action={action};" if action else "")
+              + f"package={pkg};type=video/*;"
+              + f"S.browser_fallback_url={quote(stream_url, safe='')};end")
+    name = escape((f.file_name or "Video").rsplit("/", 1)[-1])
+    return HTMLResponse(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>Opening player…</title></head>"
+        "<body style='background:#0b0b10;color:#fff;font-family:sans-serif;"
+        "text-align:center;padding:48px 24px'>"
+        f"<h3 style='margin:0 0 8px'>{name}</h3>"
+        "<p style='color:#aaa'>Opening in player…</p>"
+        f"<p><a href='{intent}' style='color:#a06bff;font-size:18px'>"
+        "Tap here if the player didn't open</a></p>"
+        f"<p><a href='{stream_url}?dl=1' style='color:#888'>"
+        "Download instead</a></p>"
+        f"<script>window.location.href={json.dumps(intent)};</script>"
+        "</body></html>")
 
 
 @router.api_route("/dl/{token}", methods=["GET", "HEAD"])
