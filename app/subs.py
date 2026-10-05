@@ -1,177 +1,146 @@
-"""Subtitle search + download via the keyless OpenSubtitles REST API.
+"""Subtitle search + download via SubDL (subdl.com).
 
-Uses ``rest.opensubtitles.org`` (no API key needed — just an
-``X-User-Agent`` header) for search and ``dl.opensubtitles.org`` for the
-actual .srt download. Shared by the web player's subtitle picker and the
-Telegram "Get Subtitle" button.
+Requires SUBDL_API_KEY env var (free from subdl.com).
+Search: GET api.subdl.com/api/v1/subtitles
+Download: dl.subdl.com + url -> .zip -> extract .srt
 """
 from __future__ import annotations
 
+import io
 import logging
+import os
 import re
 import urllib.parse
+import zipfile
 
 import httpx
 
-import os
-
 log = logging.getLogger(__name__)
 
-_SEARCH_BASE = "https://rest.opensubtitles.org/search"
-_DL_BASE = "https://dl.opensubtitles.org/en/download/filead"
-_UA = {"X-User-Agent": "MoovidexBot/1.0"}
+_API_BASE = "https://api.subdl.com/api/v1/subtitles"
+_DL_BASE = "https://dl.subdl.com"
+_UA = {"User-Agent": "MoovidexBot/1.0"}
 
-# Official API (fallback when OPENSUBTITLES_API_KEY is set — reliable,
-# the keyless endpoint is Cloudflare-flaky from datacenter IPs).
-_OS_API = "https://api.opensubtitles.com/api/v1"
-
-# In-memory cache: sub_id -> file name (for Telegram sends).
+# sub_id -> download url (in-memory; bot is long-running).
+_url_cache: dict[str, str] = {}
 _name_cache: dict[str, str] = {}
 
+_LANG_MAP = {"eng": "EN", "mal": "ML", "hin": "HI", "tam": "TA",
+             "tel": "TE", "kan": "KN"}
 
-def _clean_query(file_name: str) -> str:
-    """Reduce a release file name to a searchable title.
 
-    Keeps it deliberately simple — the API does fulltext matching.
-    """
-    s = re.sub(r"[._]+", " ", file_name or "")
+def _api_key() -> str:
+    return (os.environ.get("SUBDL_API_KEY") or "").strip()
+
+
+def _clean_query(file_name: str) -> tuple[str, str]:
+    """Reduce a release file name to (title, year)."""
+    s = (file_name or "").rsplit(".", 1)[0]  # drop extension
+    s = re.sub(r"[._]+", " ", s)
+    s = re.sub(r"[()\[\]]", " ", s)
     s = re.sub(r"(?i)\b(s\d{1,2}e\d{1,2}|season\s*\d+|episode\s*\d+)\b.*$", "", s)
+    year = ""
+    m = re.search(r"(19\d{2}|20\d{2})", s)
+    if m:
+        year = m.group(1)
     s = re.sub(r"(?i)\b(2160p|1080p|720p|480p|4k|uhd|hd|web-?dl|webrip|"
                r"bluray|brrip|bdrip|dvdrip|hdtv|x264|x265|hevc|10bit|"
                r"ddp?\d?\.?\d?|aac|ac3|dts|hindi|tamil|telugu|malayalam|"
-               r"english|dual|multi|esub|subs?)\b", " ", s)
+               r"english|dual|multi|esub|subs?|19\d{2}|20\d{2})\b", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # Keep at most "Title Year".
-    m = re.search(r"(19\d{2}|20\d{2})", s)
-    if m:
-        s = s[:m.end()].strip()
-    return s[:80]
-
-
-async def _search_keyless(q: str, languages: str) -> list[dict]:
-    """Keyless rest.opensubtitles.org search. May 403 from datacenters."""
-    # NB: spaces must be "+" (quote_plus) — "%20" gets a broken redirect.
-    url = (f"{_SEARCH_BASE}/query-{urllib.parse.quote_plus(q)}"
-           f"/sublanguageid-{languages}")
-    async with httpx.AsyncClient(timeout=20) as hc:
-        r = await hc.get(url, headers=_UA)
-        if r.status_code != 200:
-            log.warning("subtitle search HTTP %d for %r", r.status_code, q)
-            return []
-        data = r.json()
-    out = []
-    for row in data or []:
-        if (row.get("SubFormat") or "").lower() != "srt":
-            continue
-        sid = str(row.get("IDSubtitleFile") or "")
-        if not sid or sid == "0":
-            continue
-        name = row.get("SubFileName") or ""
-        _name_cache[sid] = name
-        try:
-            dl_count = int(row.get("SubDownloadsCnt") or 0)
-        except (TypeError, ValueError):
-            dl_count = 0
-        out.append({
-            "id": sid,
-            "lang": row.get("SubLanguageID") or "",
-            "name": name,
-            "movie": row.get("MovieName") or "",
-            "year": row.get("MovieYear") or "",
-            "downloads": dl_count,
-            "rating": row.get("SubRating") or "",
-        })
-    return out
-
-
-async def _search_official(q: str, languages: str) -> list[dict]:
-    """Official api.opensubtitles.com search (needs OPENSUBTITLES_API_KEY)."""
-    api_key = (os.environ.get("OPENSUBTITLES_API_KEY") or "").strip()
-    if not api_key:
-        return []
-    langs = ",".join(languages.split(","))  # eng -> eng (ISO 639-2)
-    url = f"{_OS_API}/subtitles"
-    headers = {"Api-Key": api_key, "User-Agent": "MoovidexBot/1.0",
-               "Accept": "application/json"}
-    params = {"query": q, "languages": langs}
-    async with httpx.AsyncClient(timeout=20) as hc:
-        r = await hc.get(url, headers=headers, params=params)
-        if r.status_code != 200:
-            log.warning("official subtitle search HTTP %d for %r",
-                        r.status_code, q)
-            return []
-        data = r.json()
-    out = []
-    for item in (data.get("data") or []):
-        attr = item.get("attributes") or {}
-        files = attr.get("files") or []
-        if not files:
-            continue
-        f0 = files[0]
-        sid = str(f0.get("file_id") or "")
-        if not sid:
-            continue
-        name = f0.get("file_name") or ""
-        _name_cache[sid] = name
-        # Official downloads need a user token; stash the file_id so
-        # download_subtitle can use the official flow when configured.
-        _official_ids[sid] = sid
-        out.append({
-            "id": sid,
-            "lang": attr.get("language") or "",
-            "name": name,
-            "movie": (attr.get("feature_details") or {}).get("title") or "",
-            "year": str((attr.get("feature_details") or {}).get("year") or ""),
-            "downloads": attr.get("download_count") or 0,
-            "rating": "",
-        })
-    return out
-
-
-# sub_ids that came from the official API (download flow differs).
-_official_ids: set[str] = set()
+    return s[:80], year
 
 
 async def search_subtitles(title: str, languages: str = "eng",
                            limit: int = 10) -> list[dict]:
-    """Search subtitles. Returns [{id, lang, name, downloads, rating}]."""
-    q = _clean_query(title)
+    """Search subtitles. Returns [{id, lang, name, downloads}]."""
+    api_key = _api_key()
+    if not api_key:
+        log.warning("SUBDL_API_KEY not set — subtitle search disabled")
+        return []
+    q, year = _clean_query(title)
     if not q:
         return []
+    langs = ",".join(_LANG_MAP.get(l.strip().lower(), l.strip().upper())
+                     for l in languages.split(",") if l.strip())
+    params = {"api_key": api_key, "film_name": q, "languages": langs,
+              "type": "movie"}
+    if year:
+        params["year"] = year
+    url = f"{_API_BASE}?{urllib.parse.urlencode(params)}"
     try:
-        out = await _search_keyless(q, languages)
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.get(url, headers=_UA)
+            if r.status_code != 200:
+                log.warning("subdl search HTTP %d for %r", r.status_code, q)
+                return []
+            data = r.json()
     except Exception as exc:  # noqa: BLE001
-        log.warning("subtitle search failed for %r: %s", q, exc)
-        out = []
-    if not out:
-        # Fall back to the official API when a key is configured.
-        try:
-            out = await _search_official(q, languages)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("official subtitle search failed for %r: %s", q, exc)
-    out.sort(key=lambda x: -x["downloads"])
-    return out[:limit]
+        log.warning("subdl search failed for %r: %s", q, exc)
+        return []
+    if not data or data.get("status") is False:
+        log.warning("subdl search status=false for %r", q)
+        return []
+    out = []
+    for i, hit in enumerate(data.get("subtitles") or []):
+        dl_url = hit.get("url") or ""
+        if not dl_url:
+            continue
+        sid = f"subdl{i}"
+        full_url = _DL_BASE + dl_url if dl_url.startswith("/") else dl_url
+        _url_cache[sid] = full_url
+        name = hit.get("name") or hit.get("file_name") or ""
+        _name_cache[sid] = name
+        out.append({
+            "id": sid,
+            "lang": (hit.get("language") or "").lower(),
+            "name": name,
+            "movie": q,
+            "year": year,
+            "downloads": hit.get("downloads") or 0,
+            "rating": "",
+        })
+        if len(out) >= limit:
+            break
+    return out
 
 
 async def download_subtitle(sub_id: str) -> tuple[bytes, str] | None:
-    """Download one subtitle file. Returns (bytes, file_name) or None."""
+    """Download one subtitle (zip -> extract .srt). Returns (bytes, name)."""
     sid = str(sub_id)
-    url = f"{_DL_BASE}/{urllib.parse.quote(sid)}"
+    url = _url_cache.get(sid)
+    if not url:
+        log.warning("subdl: unknown sub_id %s", sid)
+        return None
     try:
         async with httpx.AsyncClient(timeout=30) as hc:
             r = await hc.get(url, headers=_UA)
             if r.status_code != 200:
-                log.warning("subtitle download HTTP %d for %s",
+                log.warning("subdl download HTTP %d for %s",
                             r.status_code, sid)
                 return None
-            data = r.content
+            zdata = r.content
     except Exception as exc:  # noqa: BLE001
-        log.warning("subtitle download failed for %s: %s", sid, exc)
+        log.warning("subdl download failed for %s: %s", sid, exc)
+        return None
+    # Extract the .srt from the zip.
+    try:
+        with zipfile.ZipFile(io.BytesIO(zdata)) as zf:
+            srt_names = [n for n in zf.namelist()
+                         if n.lower().endswith(".srt")]
+            if not srt_names:
+                log.warning("subdl zip for %s has no .srt", sid)
+                return None
+            # Prefer English-named, else first.
+            srt_name = srt_names[0]
+            data = zf.read(srt_name)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("subdl zip extract failed for %s: %s", sid, exc)
         return None
     if not data or b"-->" not in data[:2000]:
-        log.warning("subtitle download for %s didn't look like SRT", sid)
+        log.warning("subdl extracted file for %s didn't look like SRT", sid)
         return None
-    name = _name_cache.get(sid) or f"subtitle_{sid}.srt"
+    name = _name_cache.get(sid) or "subtitle.srt"
     if not name.lower().endswith(".srt"):
-        name += ".srt"
+        name = name.rsplit(".", 1)[0] + ".srt" if "." in name else name + ".srt"
     return data, name
