@@ -2,167 +2,195 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>__TITLE__</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0d0716">
+<meta name="description" content="Watch and download on MooviDex">
+<meta property="og:title" content="__TITLE__">
+<title>__TITLE__ — MooviDex</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css">
 <style>
   :root{
-    --bg:#0b0e14; --bg2:#11151f; --card:#161b28; --line:#232a3d;
-    --txt:#f2f5fa; --mut:#9aa4b8; --acc:#e50914; --acc2:#ff6b6b;
-    --ok:#22c55e; --warn:#f59e0b;
+    --bg:#0d0716; --bg2:#140b22; --card:#1a1029; --card2:#201335;
+    --line:#2c1d47; --txt:#f4f1fa; --mut:#a89cc4;
+    --acc:#8b2ff7; --acc2:#c26bff; --ok:#22c55e; --warn:#f59e0b; --danger:#ef4444;
   }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0; padding:0;}
   body{
-    margin:0; background:var(--bg); color:var(--txt);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial,sans-serif;
-    min-height:100vh; padding-bottom:calc(28px + env(safe-area-inset-bottom));
+    background:var(--bg); color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,"Helvetica Neue",Arial,sans-serif;
+    min-height:100vh;
+    padding-bottom:calc(96px + env(safe-area-inset-bottom));
   }
-  .backdrop{
-    position:fixed; inset:0; z-index:-1;
-    background:__BACKDROP_CSS__;
-    filter:blur(60px) brightness(.5); transform:scale(1.2);
-  }
+  /* ---------- header ---------- */
   header{
-    position:sticky; top:0; z-index:10;
-    display:flex; align-items:center; gap:12px;
+    position:sticky; top:0; z-index:20;
+    display:flex; align-items:center; justify-content:space-between;
     padding:calc(10px + env(safe-area-inset-top)) 14px 10px;
-    background:rgba(11,14,20,.82); backdrop-filter:blur(14px);
+    background:rgba(13,7,22,.86); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
     border-bottom:1px solid var(--line);
   }
-  header .back{
-    width:36px; height:36px; border-radius:12px; border:1px solid var(--line);
-    background:var(--card); color:var(--txt); font-size:18px; cursor:pointer;
-    display:flex; align-items:center; justify-content:center; flex:none;
-  }
-  header h1{
-    font-size:15px; font-weight:700; margin:0; white-space:nowrap;
-    overflow:hidden; text-overflow:ellipsis;
-  }
-  header .sub{font-size:11px; color:var(--mut); font-weight:500;}
-  .wrap{max-width:640px; margin:0 auto; padding:14px 14px 0;}
-  .hero{
-    display:flex; gap:14px; background:var(--card);
-    border:1px solid var(--line); border-radius:18px; padding:14px;
-    box-shadow:0 12px 40px rgba(0,0,0,.45);
-  }
-  .poster{
-    width:96px; height:144px; border-radius:12px; flex:none;
-    object-fit:cover; background:#1c2233;
-    border:1px solid var(--line);
-  }
-  .poster-fallback{
+  .brand{display:flex; align-items:center; gap:10px; min-width:0;}
+  .brand img{width:38px; height:38px; border-radius:11px; background:#000; object-fit:cover;}
+  .brand .t{font-weight:800; font-size:16px; letter-spacing:.4px;}
+  .brand .t span{color:var(--acc2);}
+  .icon-btn{
+    width:38px; height:38px; border-radius:12px; border:1px solid var(--line);
+    background:var(--card); color:var(--txt); font-size:17px; cursor:pointer;
     display:flex; align-items:center; justify-content:center;
-    font-size:38px; color:var(--mut);
+  }
+  .icon-btn:active{transform:scale(.93);}
+  /* ---------- layout ---------- */
+  .wrap{max-width:680px; margin:0 auto; padding:14px 14px 0;}
+  .card{
+    background:var(--card); border:1px solid var(--line); border-radius:18px;
+    box-shadow:0 14px 44px rgba(0,0,0,.45); overflow:hidden;
+  }
+  /* ---------- player ---------- */
+  .player-wrap{position:relative; background:#000; aspect-ratio:16/9;}
+  .player-wrap audio{width:100%; height:100%;}
+  .plyr{--plyr-color-main:var(--acc);}
+  .plyr video{max-height:56vh;}
+  .player-err{
+    position:absolute; inset:0; display:none; flex-direction:column;
+    align-items:center; justify-content:center; gap:10px; text-align:center;
+    background:rgba(10,5,18,.92); padding:20px; z-index:5;
+  }
+  .player-err.show{display:flex;}
+  .player-err .big{font-size:40px;}
+  .player-err p{color:var(--mut); font-size:13px; margin:0 0 6px; line-height:1.5;}
+  .retry-btn{
+    border:none; border-radius:12px; padding:11px 22px; font-weight:800; font-size:14px;
+    color:#fff; cursor:pointer; background:linear-gradient(135deg,var(--acc),#5b1bc4);
+  }
+  /* ---------- hero ---------- */
+  .hero{display:flex; gap:13px; padding:14px;}
+  .poster{width:92px; height:138px; border-radius:12px; flex:none; object-fit:cover; background:#241a3d; border:1px solid var(--line);}
+  .poster-fallback{
+    width:92px; height:138px; border-radius:12px; flex:none;
+    display:flex; align-items:center; justify-content:center;
+    font-size:36px; background:#241a3d; border:1px solid var(--line);
   }
   .meta{flex:1; min-width:0;}
-  .meta h2{font-size:16px; margin:2px 0 8px; line-height:1.3;}
+  .meta h2{font-size:15.5px; margin:1px 0 8px; line-height:1.35; word-break:break-word;}
   .chips{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;}
   .chip{
-    font-size:11px; font-weight:700; padding:4px 9px; border-radius:999px;
-    background:#1e2536; border:1px solid var(--line); color:var(--mut);
-    letter-spacing:.3px;
+    font-size:11px; font-weight:700; padding:4px 10px; border-radius:999px;
+    background:#241a3d; border:1px solid var(--line); color:var(--mut); letter-spacing:.3px;
   }
-  .chip.hot{background:rgba(229,9,20,.15); border-color:rgba(229,9,20,.5); color:#ff8a8a;}
+  .chip.hot{background:rgba(139,47,247,.16); border-color:rgba(139,47,247,.55); color:#d9b8ff;}
   .chip.ok{background:rgba(34,197,94,.12); border-color:rgba(34,197,94,.4); color:#7ee2a8;}
   .plot{font-size:12.5px; color:var(--mut); line-height:1.55; margin:0;
     display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;}
-  .player-card{
-    margin-top:14px; background:var(--card); border:1px solid var(--line);
-    border-radius:18px; overflow:hidden; box-shadow:0 12px 40px rgba(0,0,0,.45);
-  }
-  .plyr{--plyr-color-main:var(--acc); border-radius:18px; overflow:hidden;}
-  .plyr video{max-height:52vh;}
-  .codec-note{padding:26px 20px; text-align:center;}
-  .codec-note .big{font-size:44px; margin-bottom:10px;}
-  .codec-note h3{margin:0 0 6px; font-size:16px;}
-  .codec-note p{color:var(--mut); font-size:13px; line-height:1.6; margin:0 0 4px;}
-  .codec-note code{background:#1e2536; padding:2px 8px; border-radius:6px; font-size:12px;}
-  .actions{display:flex; gap:10px; padding:14px;}
-  .btn{
-    flex:1; border:none; border-radius:14px; padding:14px 10px;
-    font-size:14px; font-weight:800; cursor:pointer; color:#fff;
-    display:flex; align-items:center; justify-content:center; gap:8px;
-    transition:transform .08s ease;
-  }
-  .btn:active{transform:scale(.97);}
-  .btn-dl{background:linear-gradient(135deg,var(--acc),#b00610); box-shadow:0 8px 24px rgba(229,9,20,.35);}
-  .btn:disabled{opacity:.55;}
-  .prog{height:6px; background:#1e2536; border-radius:99px; margin:0 14px; overflow:hidden; display:none;}
-  .prog i{display:block; height:100%; width:0%; background:linear-gradient(90deg,var(--acc),var(--acc2)); border-radius:99px; transition:width .2s;}
-  .prog-label{font-size:11px; color:var(--mut); text-align:center; padding:6px 0 0; display:none;}
+  /* ---------- details ---------- */
   .section{margin-top:16px;}
-  .section h3{font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--mut); margin:0 0 10px 2px;}
-  .ext-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:10px;}
-  .ext{
-    background:var(--card); border:1px solid var(--line); border-radius:16px;
-    padding:14px 6px; text-align:center; cursor:pointer; color:var(--txt);
-    transition:transform .08s ease;
-  }
-  .ext:active{transform:scale(.95);}
-  .ext .ic{
-    width:44px; height:44px; border-radius:13px; margin:0 auto 8px;
-    display:flex; align-items:center; justify-content:center;
-    font-size:22px; font-weight:900; color:#fff;
-  }
-  .ext .nm{font-size:11.5px; font-weight:700;}
-  .ext .tp{font-size:10px; color:var(--mut); margin-top:2px;}
-  .details{background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px 16px;}
-  .drow{display:flex; justify-content:space-between; gap:12px; padding:7px 0; font-size:13px; border-bottom:1px solid #1b2132;}
+  .section h3{font-size:12px; text-transform:uppercase; letter-spacing:1.2px; color:var(--mut); margin:0 0 10px 2px;}
+  .details{padding:6px 16px;}
+  .drow{display:flex; justify-content:space-between; gap:12px; padding:9px 0; font-size:13px; border-bottom:1px solid #241a3d;}
   .drow:last-child{border-bottom:none;}
   .drow .k{color:var(--mut); flex:none;}
-  .drow .v{text-align:right; word-break:break-all;}
-  .foot{text-align:center; color:var(--mut); font-size:11px; margin:22px 0 8px; opacity:.7;}
+  .drow .v{text-align:right; word-break:break-all; font-weight:600;}
+  /* ---------- external players ---------- */
+  .plist{list-style:none; margin:0; padding:6px; display:flex; flex-direction:column; gap:2px;}
+  .plist button{
+    display:flex; align-items:center; gap:13px; width:100%;
+    background:none; border:none; color:var(--txt); cursor:pointer;
+    padding:11px 10px; border-radius:13px; text-align:left; font-size:14px;
+  }
+  .plist button:active{background:#241a3d;}
+  .pic{position:relative; width:42px; height:42px; flex:none;}
+  .pic .glyph{
+    position:absolute; inset:0; border-radius:12px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:19px; font-weight:900; color:#fff;
+  }
+  .pic img{position:absolute; inset:0; width:100%; height:100%; border-radius:12px; object-fit:cover; background:#000;}
+  .plist .nm{font-weight:700;}
+  .plist .tp{font-size:11px; color:var(--mut); margin-top:1px;}
+  .plist .arr{margin-left:auto; color:var(--mut); font-size:18px;}
+  /* ---------- bottom bar ---------- */
+  .bottombar{
+    position:fixed; left:0; right:0; bottom:0; z-index:30;
+    background:rgba(13,7,22,.92); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    border-top:1px solid var(--line);
+    padding:12px 14px calc(12px + env(safe-area-inset-bottom));
+  }
+  .bottombar .row{max-width:680px; margin:0 auto; display:flex; gap:10px;}
+  .btn{
+    flex:1; border:none; border-radius:14px; padding:15px 10px;
+    font-size:14.5px; font-weight:800; cursor:pointer; color:#fff;
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    transition:transform .08s ease; text-decoration:none;
+  }
+  .btn:active{transform:scale(.97);}
+  .btn-dl{background:linear-gradient(135deg,var(--acc),#5b1bc4); box-shadow:0 8px 26px rgba(139,47,247,.4);}
+  .btn-tg{background:#1d2b4a; border:1px solid #2c3f66;}
+  .btn:disabled{opacity:.55;}
+  .prog{height:6px; background:#241a3d; border-radius:99px; margin:0 0 10px; overflow:hidden; display:none;}
+  .prog i{display:block; height:100%; width:0%; background:linear-gradient(90deg,var(--acc),var(--acc2)); border-radius:99px; transition:width .2s;}
+  .prog-label{font-size:11px; color:var(--mut); text-align:center; padding:0 0 8px; display:none;}
+  /* ---------- misc ---------- */
+  .foot{text-align:center; color:var(--mut); font-size:11px; margin:22px 0 8px; opacity:.75;}
   #toast{
-    position:fixed; left:50%; bottom:32px; transform:translateX(-50%) translateY(20px);
-    background:#1e2536; border:1px solid var(--line); color:var(--txt);
+    position:fixed; left:50%; bottom:120px; transform:translateX(-50%) translateY(16px);
+    background:#241a3d; border:1px solid var(--line); color:var(--txt);
     padding:11px 18px; border-radius:12px; font-size:13px; font-weight:600;
-    opacity:0; pointer-events:none; transition:all .25s; z-index:50; max-width:90vw;
+    opacity:0; pointer-events:none; transition:all .25s; z-index:60; max-width:92vw; text-align:center;
   }
   #toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
 </style>
 </head>
 <body>
-<div class="backdrop"></div>
 
 <header>
-  <button class="back" id="backBtn" aria-label="Back">‹</button>
-  <div style="min-width:0">
-    <h1>__TITLE__</h1>
-    <div class="sub">Moovidex Player</div>
+  <div class="brand">
+    <img src="__LOGO_URL__" alt="MooviDex" onerror="this.style.visibility='hidden'">
+    <div class="t">MOOVI<span>DEX</span></div>
   </div>
+  <button class="icon-btn" id="shareBtn" aria-label="Share">⤴</button>
 </header>
 
 <div class="wrap">
-  <div class="hero">
-    __POSTER_HTML__
-    <div class="meta">
-      <h2>__TITLE__</h2>
-      <div class="chips">__CHIPS_HTML__</div>
-      <p class="plot">__PLOT__</p>
+  <div class="card">
+    <div class="player-wrap" id="playerWrap">
+      <div id="playerSlot"></div>
+      <div class="player-err" id="playerErr">
+        <div class="big">📡</div>
+        <p id="playerErrMsg">The stream couldn't be loaded.<br>Check your connection and try again.</p>
+        <button class="retry-btn" id="retryBtn">↻ Retry</button>
+      </div>
     </div>
-  </div>
-
-  <div class="player-card">
-    <div id="playerSlot"></div>
     <div class="prog" id="prog"><i id="progBar"></i></div>
     <div class="prog-label" id="progLabel"></div>
-    <div class="actions">
-      <button class="btn btn-dl" id="dlBtn">⬇ Download</button>
+    <div class="hero">
+      __POSTER_HTML__
+      <div class="meta">
+        <h2>__TITLE__</h2>
+        <div class="chips">__CHIPS_HTML__</div>
+        <p class="plot">__PLOT__</p>
+      </div>
     </div>
-  </div>
-
-  <div class="section">
-    <h3>Open in external player</h3>
-    <div class="ext-grid" id="extGrid"></div>
   </div>
 
   <div class="section">
     <h3>File details</h3>
-    <div class="details">__DETAILS_HTML__</div>
+    <div class="card details">__DETAILS_HTML__</div>
   </div>
 
-  <div class="foot">Streamed securely from Moovidex · seek &amp; resume supported</div>
+  <div class="section">
+    <h3>Play on external player</h3>
+    <div class="card"><ul class="plist" id="extList"></ul></div>
+  </div>
+
+  <div class="foot">Streamed securely from MooviDex · seek &amp; resume supported</div>
+</div>
+
+<div class="bottombar">
+  <div class="row">
+    <button class="btn btn-dl" id="dlBtn">⬇ Download</button>
+    <a class="btn btn-tg" id="tgBtn" href="__BOT_URL__">Go To Bot ✈</a>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -171,106 +199,126 @@
 <script>
 (function(){
   "use strict";
+  /* ---------- safe Telegram WebApp ---------- */
   var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
-  if (tg) {
-    tg.ready(); tg.expand();
-    try { tg.setHeaderColor("#0b0e14"); tg.setBackgroundColor("#0b0e14"); } catch(e){}
-    tg.BackButton.show();
-    tg.BackButton.onClick(function(){ tg.close(); });
-    try { tg.HapticFeedback.impactOccurred("light"); } catch(e){}
+  function haptic(kind){
+    if (!tg || !tg.HapticFeedback) return;
+    try {
+      if (kind === "ok") tg.HapticFeedback.notificationOccurred("success");
+      else tg.HapticFeedback.impactOccurred("medium");
+    } catch(e){}
   }
-  document.getElementById("backBtn").onclick = function(){
-    if (tg) tg.close(); else history.back();
-  };
+  if (tg) {
+    try {
+      tg.ready(); tg.expand();
+      tg.setHeaderColor("#0d0716"); tg.setBackgroundColor("#0d0716");
+      if (tg.BackButton) { tg.BackButton.show(); tg.BackButton.onClick(function(){ tg.close(); }); }
+      haptic();
+    } catch(e){}
+  }
 
-  var DL_URL = "__DL_URL__";
-  /* v10.1: the explicit ⬇ Download button uses ?dl=1 — it counts toward
-     the file's download counter and the server answers `attachment`,
-     so the browser downloads instead of trying to play it inline. */
-  var DL_DL_URL = DL_URL + "?dl=1";
-  var FILE_NAME = "__FILENAME__";
+  /* ---------- server-provided data ---------- */
+  var DL_URL    = "__DL_URL__";
+  var DL_DL_URL = "__DL_DL_URL__";
+  var FILE_NAME = __FILENAME_JSON__;
   var FILE_SIZE = __SIZE__ || 0;
-  var MIME = "__MIME__";
-  var PLAYABLE = "__PLAYABLE__" === "true";
-  var EXT = "__EXT__".toLowerCase();
-  var POSTER = "__POSTER__";
+  var MIME      = "__MIME__";
+  var PLAYABLE  = "__PLAYABLE__" === "true";
+  var IS_AUDIO  = "__IS_AUDIO__" === "true";
+  var POSTER    = "__POSTER__";
 
   function toast(msg){
     var el = document.getElementById("toast");
     el.textContent = msg; el.classList.add("show");
     clearTimeout(el._t); el._t = setTimeout(function(){ el.classList.remove("show"); }, 2600);
   }
-  function haptic(kind){
-    if (!tg) return;
-    try {
-      if (kind === "ok") tg.HapticFeedback.notificationOccurred("success");
-      else tg.HapticFeedback.impactOccurred("medium");
-    } catch(e){}
-  }
 
-  /* ---------------- player ---------------- */
+  /* ---------- player ---------- */
   var slot = document.getElementById("playerSlot");
-  if (PLAYABLE) {
-    var isAudio = MIME.indexOf("audio/") === 0 || /\.(mp3|ogg|wav|m4a|flac)$/i.test(FILE_NAME);
-    var media = document.createElement(isAudio ? "audio" : "video");
+  var errBox = document.getElementById("playerErr");
+  function showErr(msg){
+    if (msg) document.getElementById("playerErrMsg").innerHTML = msg;
+    errBox.classList.add("show");
+  }
+  function buildPlayer(){
+    errBox.classList.remove("show");
+    slot.innerHTML = "";
+    if (!PLAYABLE) {
+      showErr("This file type can't be played in the browser.<br>Use an external player below or download it.");
+      return;
+    }
+    var media = document.createElement(IS_AUDIO ? "audio" : "video");
     media.setAttribute("playsinline", "");
     media.setAttribute("controls", "");
     media.setAttribute("preload", "metadata");
-    if (!isAudio && POSTER) media.setAttribute("poster", POSTER);
+    media.setAttribute("crossorigin", "anonymous");
+    if (!IS_AUDIO && POSTER) media.setAttribute("poster", POSTER);
     var src = document.createElement("source");
     src.src = DL_URL;
-    src.type = MIME || (isAudio ? "audio/mpeg" : "video/mp4");
+    src.type = MIME || (IS_AUDIO ? "audio/mpeg" : "video/mp4");
     media.appendChild(src);
+    media.addEventListener("error", function(){
+      var code = media.error ? media.error.code : 0;
+      showErr("The stream couldn't be loaded (error " + code + ").<br>Try again, or use an external player below.");
+    }, true);
     slot.appendChild(media);
     try {
-      new Plyr(media, {
-        controls: ["play-large","play","progress","current-time","duration","mute","volume","captions","settings","pip","airplay","fullscreen"],
-        seekTime: 10,
-        keyboard: { focused: true, global: true },
-        tooltips: { controls: true, seek: true }
-      });
+      if (window.Plyr) {
+        new Plyr(media, {
+          controls: ["play-large","play","progress","current-time","duration","mute","volume","captions","settings","pip","airplay","fullscreen"],
+          seekTime: 10,
+          keyboard: { focused: true, global: true },
+          tooltips: { controls: true, seek: true }
+        });
+      }
     } catch(e){ /* native controls remain */ }
-  } else {
-    slot.innerHTML =
-      '<div class="codec-note"><div class="big">🎞️</div>' +
-      "<h3>Browser can't play ." + (EXT || "this") + " files</h3>" +
-      "<p>Your browser doesn't support the <code>" + (EXT || "?") + "</code> codec. " +
-      "No quality is lost — open it in an external player below, or download it.</p></div>";
   }
+  document.getElementById("retryBtn").onclick = function(){ haptic(); buildPlayer(); };
+  buildPlayer();
 
-  /* ---------------- external players ---------------- */
+  /* ---------- external players ---------- */
   var PLAYERS = [
-    { name:"MX Player",    sub:"Free · all codecs", pkg:"com.mxtech.videoplayer.ad",
-      bg:"linear-gradient(135deg,#ff7a00,#ff3d00)", glyph:"▶" },
-    { name:"MX Player Pro",sub:"Pro · no ads",      pkg:"com.mxtech.videoplayer.pro",
-      bg:"linear-gradient(135deg,#ffb300,#ff7a00)", glyph:"▶" },
-    { name:"VLC",          sub:"Open source",       pkg:"org.videolan.vlc",
-      bg:"linear-gradient(135deg,#f5a623,#e08300)", glyph:"◉" },
-    { name:"PlayIt",       sub:"Floating player",   pkg:"com.playit.videoplayer",
-      bg:"linear-gradient(135deg,#7c4dff,#4a1fd6)", glyph:"✦" },
-    { name:"KMPlayer",     sub:"Classic player",    pkg:"com.kmplayer",
-      bg:"linear-gradient(135deg,#00bcd4,#00838f)", glyph:"K" },
-    { name:"XPlayer",      sub:"Light & fast",      pkg:"video.player.videoplayer",
-      bg:"linear-gradient(135deg,#26c6da,#0097a7)", glyph:"X" }
+    { name:"VLC Player",   sub:"Open source · all codecs", pkg:"org.videolan.vlc",
+      img:"https://kuttudb.github.io/hostingly21/img/VLC_icon.png",
+      bg:"linear-gradient(135deg,#f5a623,#e08300)", glyph:"V" },
+    { name:"MX Player",    sub:"Popular · HW decoding",    pkg:"com.mxtech.videoplayer.ad",
+      img:"https://kuttudb.github.io/hostingly21/img/mx-player-icon.png",
+      bg:"linear-gradient(135deg,#ff7a00,#ff3d00)", glyph:"M" },
+    { name:"PLAYit",       sub:"Floating player",          pkg:"com.playit.videoplayer",
+      img:"https://kuttudb.github.io/hostingly21/img/float_logo.43e9c34d.png",
+      bg:"linear-gradient(135deg,#7c4dff,#4a1fd6)", glyph:"P" },
+    { name:"S Player",     sub:"Online playback",          pkg:"com.young.simple.player", action:"com.young.simple.player.playback_online",
+      img:"https://kuttudb.github.io/hostingly21/img/images.jpeg",
+      bg:"linear-gradient(135deg,#00bcd4,#00838f)", glyph:"S" },
+    { name:"KMPlayer",     sub:"Classic · 4K support",     pkg:"com.kmplayer",
+      img:"https://kuttudb.github.io/hostingly21/img/The_KMPlayer_icon_%28since_v3.2%29%20%281%29.png",
+      bg:"linear-gradient(135deg,#3f51b5,#1a237e)", glyph:"K" },
+    { name:"U Player",     sub:"Light & fast",             pkg:"uplayer.video.player",
+      img:"https://kuttudb.github.io/hostingly21/img/icon.avif",
+      bg:"linear-gradient(135deg,#26c6da,#0097a7)", glyph:"U" }
   ];
-  var grid = document.getElementById("extGrid");
+  var list = document.getElementById("extList");
   PLAYERS.forEach(function(p){
+    var li = document.createElement("li");
     var b = document.createElement("button");
-    b.className = "ext";
-    b.innerHTML = '<div class="ic" style="background:' + p.bg + '">' + p.glyph + "</div>" +
-                  '<div class="nm">' + p.name + '</div><div class="tp">' + p.sub + "</div>";
+    b.innerHTML =
+      '<span class="pic"><span class="glyph" style="background:' + p.bg + '">' + p.glyph + "</span>" +
+      '<img loading="lazy" alt="" src="' + p.img + '" onerror="this.remove()"></span>' +
+      '<span><span class="nm">' + p.name + '</span><br><span class="tp">' + p.sub + "</span></span>" +
+      '<span class="arr">›</span>';
     b.onclick = function(){
       haptic();
-      var intent = "intent:" + DL_URL +
-        "#Intent;package=" + p.pkg + ";type=video/*;" +
+      var intent = "intent:" + DL_URL + "#Intent;" +
+        (p.action ? "action=" + p.action + ";" : "") +
+        "package=" + p.pkg + ";type=video/*;" +
         "S.browser_fallback_url=" + encodeURIComponent(DL_URL) + ";end";
       window.location.href = intent;
-      setTimeout(function(){ toast("Opening in " + p.name + "…"); }, 600);
+      setTimeout(function(){ toast("Opening in " + p.name + "…"); }, 700);
     };
-    grid.appendChild(b);
+    li.appendChild(b); list.appendChild(li);
   });
 
-  /* ---------------- download with progress ---------------- */
+  /* ---------- download with progress ---------- */
   function fmt(n){
     if (!n) return "";
     var u = ["B","KB","MB","GB"], i = 0;
@@ -284,16 +332,19 @@
     document.getElementById("progBar").style.width = pct.toFixed(1) + "%";
     lbl.textContent = fmt(done) + (total ? " / " + fmt(total) + " · " + pct.toFixed(0) + "%" : "");
   }
+  function hideProg(){
+    document.getElementById("prog").style.display = "none";
+    document.getElementById("progLabel").style.display = "none";
+  }
   document.getElementById("dlBtn").onclick = async function(){
     var btn = this;
-    btn.disabled = true; haptic();
+    btn.disabled = true; haptic(); hideProg();
     toast("Starting download…");
     try {
       var res = await fetch(DL_DL_URL);
-      if (!res.ok || !res.body) throw new Error("fetch failed");
+      if (!res.ok || !res.body) throw new Error("fetch failed: " + res.status);
       var total = parseInt(res.headers.get("content-length") || "0", 10) || FILE_SIZE;
       if (window.showSaveFilePicker) {
-        // Stream straight to disk (Chrome/Edge/Android) — no RAM blowup
         var handle = await window.showSaveFilePicker({ suggestedName: FILE_NAME });
         var w = await handle.createWritable();
         var reader = res.body.getReader(), done = 0;
@@ -306,27 +357,54 @@
         await w.close();
         toast("Saved ✓"); haptic("ok");
       } else {
-        // Blob fallback with progress
-        var reader2 = res.body.getReader(), done2 = 0, parts = [];
-        for (;;) {
-          var c2 = await reader2.read();
-          if (c2.done) break;
-          parts.push(c2.value); done2 += c2.value.length; setProg(done2, total);
+        var reader2 = res.body.getReader(), done2 = 0, parts = [], approx = 0;
+        var tooBig = total > 1073741824; // >1 GB: skip blob, open link
+        if (!tooBig) {
+          for (;;) {
+            var c2 = await reader2.read();
+            if (c2.done) break;
+            parts.push(c2.value); done2 += c2.value.length; approx += c2.value.length;
+            setProg(done2, total);
+            if (approx > 1073741824) { tooBig = true; break; }
+          }
         }
-        var blob = new Blob(parts, { type: MIME || "application/octet-stream" });
-        var a = document.createElement("a");
-        a.href = URL.createObjectURL(blob); a.download = FILE_NAME;
-        document.body.appendChild(a); a.click();
-        setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 4000);
-        toast("Downloaded ✓"); haptic("ok");
+        if (tooBig) { try { reader2.cancel(); } catch(e){} window.open(DL_DL_URL, "_blank"); }
+        else {
+          var blob = new Blob(parts, { type: MIME || "application/octet-stream" });
+          var a = document.createElement("a");
+          a.href = URL.createObjectURL(blob); a.download = FILE_NAME;
+          document.body.appendChild(a); a.click();
+          setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+          toast("Downloaded ✓"); haptic("ok");
+        }
       }
     } catch(e) {
       window.open(DL_DL_URL, "_blank");
       toast("Opened download link");
     } finally {
       btn.disabled = false;
+      setTimeout(hideProg, 2500);
     }
   };
+
+  /* ---------- share ---------- */
+  document.getElementById("shareBtn").onclick = function(){
+    haptic();
+    var data = { title: FILE_NAME, text: "Watch on MooviDex", url: window.location.href };
+    if (navigator.share) {
+      navigator.share(data).catch(function(){});
+    } else if (navigator.clipboard) {
+      navigator.clipboard.writeText(window.location.href).then(
+        function(){ toast("Link copied ✓"); },
+        function(){ toast("Copy this link: " + window.location.href); });
+    } else {
+      toast("Copy this link: " + window.location.href);
+    }
+  };
+
+  /* hide Go-To-Bot if no username configured */
+  var tgBtn = document.getElementById("tgBtn");
+  if (!tgBtn.getAttribute("href") || tgBtn.getAttribute("href") === "#") tgBtn.style.display = "none";
 })();
 </script>
 </body>

@@ -25,7 +25,7 @@ import time as _time
 from sqlalchemy import func, select
 
 from app import personalize
-from app.bot.v8_ui import sort_results
+from app.bot.v8_ui import sort_best_first
 from app.config import settings
 from app.db import get_session_factory
 from app.models import File
@@ -339,10 +339,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
         items = await personalize.rerank(items, user_id)
     except Exception as exc:  # noqa: BLE001
         log.debug("v10 personalize failed: %s", exc)
-    # v10.10.3: order the list for reading — user taste first, then
-    # season packs, newest season/episode/year first, relevance last.
-    pref_lang, pref_qual = await personalize.preferred_lang_qual(user_id)
-    items = sort_results(items, pref_lang, pref_qual)
+    items = sort_best_first(items)
     files = _query_season_episode(parsed, items)
 
     # --- best pick: the user's keywords + taste choose -----------------

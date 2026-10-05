@@ -3,6 +3,16 @@
 Unlike Bot API downloads (20 MB cap), MTProto ``upload.GetFile`` streams
 files of ANY size with precise byte offsets, so seeking works and 4 GB
 movies play fine.
+
+Robustness notes (v10.11):
+  * single ranges only (multipart -> 416), suffix ranges supported
+  * ETag + If-None-Match (304) + If-Range (stale range -> full 200)
+  * transient Telegram stalls resume mid-stream from the last byte sent
+    (up to 3 resumes; FileReferenceExpired refreshes the file_id first)
+  * FileReferenceExpired on the first chunk refreshes from the source
+    message and retries once, then 410
+  * /watch failures render a styled error page instead of a bare status
+  * X-Content-Type-Options: nosniff on every response
 """
 from __future__ import annotations
 
@@ -34,9 +44,19 @@ router = APIRouter()
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 _stream_sem = asyncio.Semaphore(20)
+# errors worth resuming mid-stream (transient network/Telegram stalls)
+_RESUMEABLE = (streamer.StreamError, asyncio.TimeoutError,
+               ConnectionError, OSError)
+_MAX_RESUMES = 3
+_PREFETCH_TIMEOUT = 45.0
 
 _WATCH_HTML = os.path.join(os.path.dirname(__file__), "watch.html")
 _watch_template: str | None = None
+
+_LOGO_URL = "https://h21web.github.io/cdn/assets/moovidex-logo.png"
+
+_bot_username: str | None = None
+_bot_username_failed = False
 
 
 def _template() -> str:
@@ -45,6 +65,39 @@ def _template() -> str:
         with open(_WATCH_HTML, encoding="utf-8") as fh:
             _watch_template = fh.read()
     return _watch_template
+
+
+async def _bot_username() -> str | None:
+    """Cached bot username for the 'Go To Bot' button (None = unknown)."""
+    global _bot_username, _bot_username_failed
+    if _bot_username or _bot_username_failed:
+        return _bot_username
+    client = bot_app.bot
+    if not client:
+        return None
+    try:
+        me = await client.get_me()
+        _bot_username = (getattr(me, "username", "") or "").strip() or None
+    except Exception as exc:  # noqa: BLE001
+        log.debug("get_me failed: %s", exc)
+        _bot_username_failed = True
+    return _bot_username
+
+
+def _error_page(status: int, title: str, message: str) -> HTMLResponse:
+    """Styled MooviDex error page (self-contained, no external assets)."""
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{status} — MooviDex</title>
+<style>
+body{{margin:0;background:#0d0716;color:#f4f1fa;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}}
+.card{{background:#1a1029;border:1px solid #2c1d47;border-radius:20px;padding:38px 30px;max-width:380px;box-shadow:0 14px 44px rgba(0,0,0,.45)}}
+.code{{font-size:52px;font-weight:900;color:#8b2ff7;margin-bottom:6px}}
+h1{{font-size:18px;margin:0 0 10px}}p{{font-size:13.5px;color:#a89cc4;line-height:1.6;margin:0}}
+</style></head><body><div class="card"><div class="code">{status}</div>
+<h1>{escape(title)}</h1><p>{escape(message)}</p></div></body></html>"""
+    return HTMLResponse(html, status_code=status)
 
 
 async def _get_file(token: str) -> File:
@@ -84,6 +137,11 @@ def _content_disposition(filename: str, attachment: bool = False) -> str:
     disp = "attachment" if attachment else "inline"
     return (f'{disp}; filename="{ascii_name}"; '
             f"filename*=UTF-8''{quote(safe)}")
+
+
+def _etag(f: File, size: int) -> str:
+    """Stable validator for a file (survives file_reference refreshes)."""
+    return f'"{f.id}-{size}"'
 
 
 def _parse_range(range_header: str | None, size: int) -> tuple[int, int | None]:
@@ -133,14 +191,42 @@ async def _refresh_file_id(f: File) -> str:
     return new_id
 
 
+async def _open_stream(client, file_id: str, offset: int, length: int):
+    """Create a stream with the first chunk pre-fetched (inside try).
+
+    The async generator body only runs once iterated, so pre-fetching
+    here lets the caller catch FileReferenceExpired / stalls before
+    the HTTP response starts.
+    """
+    stream = streamer.stream_file(client, file_id,
+                                  offset=offset, length=length)
+    try:
+        first = await asyncio.wait_for(stream.__anext__(),
+                                       timeout=_PREFETCH_TIMEOUT)
+    except StopAsyncIteration:
+        first = None
+    return stream, first
+
+
 @router.get("/watch/{token}", response_class=HTMLResponse)
 async def watch(token: str, request: Request):
-    f = await _get_file(token)
+    try:
+        f = await _get_file(token)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            return _error_page(403, "Link expired",
+                               "This watch link is invalid or has expired. "
+                               "Ask the bot for the file again to get a fresh link.")
+        return _error_page(404, "File not found",
+                           "This file is no longer indexed. "
+                           "It may have been removed from the channel.")
     base = str(request.base_url).rstrip("/")
     dl_url = f"{base}/dl/{token}"
     name = (f.file_name or "Video").rsplit("/", 1)[-1]
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     mime = _content_type(f)
+    is_audio = mime.startswith("audio/") or \
+        name.lower().endswith((".mp3", ".ogg", ".wav", ".m4a", ".flac"))
     playable = mime.startswith(("video/", "audio/")) or \
         name.lower().endswith((".mp4", ".webm", ".mov", ".m4v",
                                ".mp3", ".ogg", ".wav", ".m4a"))
@@ -158,14 +244,10 @@ async def watch(token: str, request: Request):
 
     if poster:
         poster_html = (f'<img class="poster" src="{escape(poster)}" '
-                       f'alt="poster" loading="lazy">')
-        # CSS context: HTML entities are NOT decoded inside <style>, so
-        # URL-quote instead of HTML-escaping (escape() would corrupt &).
-        css_url = quote(poster, safe=":/?#[]@!$&()*+,;=%")
-        backdrop = f"url('{css_url}') center/cover no-repeat"
+                       f'alt="poster" loading="lazy" '
+                       f'onerror="this.outerHTML=\'<div class=&quot;poster-fallback&quot;>🎬</div>\'">')
     else:
-        poster_html = '<div class="poster poster-fallback">🎬</div>'
-        backdrop = "linear-gradient(135deg,#1a2233,#0b0e14)"
+        poster_html = '<div class="poster-fallback">🎬</div>'
 
     chips = []
     if f.quality:
@@ -195,25 +277,30 @@ async def watch(token: str, request: Request):
         details += row("TMDB", f"{meta['title']}"
                              f" ({meta.get('year') or '—'})")
 
+    username = await _bot_username()
+    bot_url = f"https://telegram.me/{username}" if username else "#"
+
     html_page = _template().replace("__TITLE__", escape(name))
-    # JS-string-safe filename: a full JSON string literal is valid JS;
-    # </script> is neutralised and CR/LF stripped so the player survives.
+    # JS-string-safe filename: a full JSON string literal is valid JS.
     js_name = json.dumps(name.replace("\r", "").replace("\n", ""))
-    js_name = js_name.replace("<", "\\u003c")
     html_page = (html_page
+                 .replace("__LOGO_URL__", _LOGO_URL)
+                 .replace("__BOT_URL__", bot_url)
                  .replace("__DL_URL__", dl_url)
+                 .replace("__DL_DL_URL__", dl_url + "?dl=1")
                  .replace("__PLAYABLE__", "true" if playable else "false")
+                 .replace("__IS_AUDIO__", "true" if is_audio else "false")
                  .replace("__SIZE__", str(f.file_size or 0))
                  .replace("__MIME__", escape(mime))
-                 .replace("__EXT__", escape(ext))
                  .replace("__POSTER__", escape(poster))
                  .replace("__POSTER_HTML__", poster_html)
                  .replace("__CHIPS_HTML__", "".join(chips))
                  .replace("__PLOT__", escape(plot[:300]))
-                 .replace("__BACKDROP_CSS__", backdrop)
                  .replace("__DETAILS_HTML__", details)
-                 .replace('"__FILENAME__"', js_name))
-    return HTMLResponse(html_page)
+                 .replace("__FILENAME_JSON__", js_name))
+    return HTMLResponse(html_page,
+                        headers={"Cache-Control": "no-store",
+                                 "X-Content-Type-Options": "nosniff"})
 
 
 def _title_guess(name: str) -> str:
@@ -244,11 +331,15 @@ def _fmt_size(n) -> str:
 
 @router.api_route("/dl/{token}", methods=["GET", "HEAD"])
 async def download(token: str, request: Request):
-    f = await _get_file(token)
+    try:
+        f = await _get_file(token)
+    except HTTPException as exc:
+        # video players / download managers need real status codes
+        raise exc
     client = bot_app.bot
     if not client:
         raise HTTPException(503, "bot not ready")
-    # v8.1: explicit ⬇ Download hits (list link has ?dl=1) count toward the
+    # Explicit ⬇ Download hits (page button uses ?dl=1) count toward the
     # per-file download counter. Web-player streams carry no marker, so
     # plays are never counted as downloads. HEAD/range-resumes don't count.
     is_explicit_dl = (request.method == "GET"
@@ -260,8 +351,25 @@ async def download(token: str, request: Request):
     if size <= 0:
         raise HTTPException(404, "unknown file size")
 
+    etag = _etag(f, size)
+    range_header = request.headers.get("range")
+
+    # If-None-Match: full GET only.
+    if (request.method == "GET" and not range_header
+            and request.headers.get("if-none-match") == etag):
+        return Response(status_code=304, headers={"ETag": etag})
+
+    # If-Range with a stale validator -> ignore the Range, send all.
+    if (range_header and request.headers.get("if-range")
+            and request.headers.get("if-range") != etag):
+        range_header = None
+
+    # We serve single ranges only.
+    if range_header and "," in range_header:
+        return Response(status_code=416,
+                        headers={"Content-Range": f"bytes */{size}"})
     try:
-        offset, length = _parse_range(request.headers.get("range"), size)
+        offset, length = _parse_range(range_header, size)
     except HTTPException:
         return Response(status_code=416,
                         headers={"Content-Range": f"bytes */{size}"})
@@ -280,6 +388,9 @@ async def download(token: str, request: Request):
         "Content-Length": str(length),
         "Content-Disposition": _content_disposition(
             filename, attachment=is_explicit_dl),
+        "ETag": etag,
+        "Cache-Control": "private, no-transform",
+        "X-Content-Type-Options": "nosniff",
     }
     partial = offset != 0 or length != size
     if partial:
@@ -288,35 +399,66 @@ async def download(token: str, request: Request):
     if request.method == "HEAD":
         return Response(status_code=206 if partial else 200, headers=headers)
 
+    # Open the MTProto stream with the first chunk pre-fetched so
+    # FileReferenceExpired / stalls surface BEFORE the response starts.
     file_id = f.file_id
     stream = None
     first: bytes | None = None
-    for attempt in (0, 1):
-        try:
-            # Pre-flight the first GetFile INSIDE the try: the async
-            # generator body only runs once iterated, so without this
-            # the FileReferenceExpired handler below would be dead code.
-            async with _stream_sem:
-                stream = streamer.stream_file(
-                    client, file_id, offset=offset, length=length)
-                try:
-                    first = await stream.__anext__()
-                except StopAsyncIteration:
-                    first = None
-            break
-        except FileReferenceExpired:
-            if attempt == 1:
-                raise HTTPException(410, "file reference expired")
-            log.info("file_reference expired for %d, refreshing", f.id)
-            file_id = await _refresh_file_id(f)
+    try:
+        for attempt in (0, 1):
+            try:
+                async with _stream_sem:
+                    stream, first = await _open_stream(
+                        client, file_id, offset, length)
+                break
+            except FileReferenceExpired:
+                if attempt == 1:
+                    raise HTTPException(410, "file reference expired")
+                log.info("file_reference expired for %d, refreshing", f.id)
+                file_id = await _refresh_file_id(f)
+    except _RESUMEABLE as exc:
+        log.warning("telegram upstream stall on first chunk: %r", exc)
+        raise HTTPException(503, "upstream timeout, retry")
 
     async def gen():
-        if first is not None:
-            yield first
-        if stream is not None:
-            async with _stream_sem:
-                async for chunk in stream:
-                    yield chunk
+        nonlocal stream, first, file_id
+        sent = 0
+        resumes = 0
+        cur_first = first
+        while True:
+            try:
+                if cur_first is not None:
+                    yield cur_first
+                    sent += len(cur_first)
+                    cur_first = None
+                async with _stream_sem:
+                    async for chunk in stream:
+                        yield chunk
+                        sent += len(chunk)
+                return  # done
+            except FileReferenceExpired:
+                try:
+                    file_id = await _refresh_file_id(f)
+                except FileReferenceExpired:
+                    log.warning("cannot refresh file_reference, truncating")
+                    return
+            except _RESUMEABLE as exc:
+                log.warning("stream interrupted at %d/%d: %r",
+                            sent, length, exc)
+            if sent >= length:
+                return
+            resumes += 1
+            if resumes > _MAX_RESUMES:
+                log.warning("too many stream resumes, aborting")
+                return
+            # Resume from the last byte the client actually got.
+            try:
+                async with _stream_sem:
+                    stream, cur_first = await _open_stream(
+                        client, file_id, offset + sent, length - sent)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("stream resume failed: %r", exc)
+                return
 
     return StreamingResponse(gen(),
                              status_code=206 if partial else 200,
