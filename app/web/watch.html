@@ -172,6 +172,10 @@
   "use strict";
   /* ---------- safe Telegram WebApp ---------- */
   var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+  /* Telegram's in-app browser (WebView): can't download files and can't
+     fire intent:// to external players — hand those to the system browser
+     via openLink, which opens outside Telegram. */
+  var inTg = !!(tg && tg.openLink);
   function haptic(kind){
     if (!tg || !tg.HapticFeedback) return;
     try {
@@ -222,6 +226,28 @@
           slideToSeek: "long-touch", controlBar: false, topSetting: false
         })
       ]).create();
+      /* Poster-stuck fix: the cover can stay painted over playing video
+         on slow streams — force-hide it the moment playback starts. */
+      (function(){
+        var root = document.getElementById("oplayer");
+        function hideCover(){
+          try {
+            var vids = root.getElementsByTagName("video");
+            for (var i = 0; i < vids.length; i++) vids[i].removeAttribute("poster");
+            var cov = root.querySelectorAll(".oplayer-cover, .oplayer-poster, .oui-cover");
+            for (var j = 0; j < cov.length; j++) cov[j].style.display = "none";
+          } catch(e){}
+        }
+        setTimeout(function(){
+          try {
+            var vids = root.getElementsByTagName("video");
+            for (var i = 0; i < vids.length; i++) {
+              vids[i].addEventListener("playing", hideCover);
+              if (!vids[i].paused) hideCover();
+            }
+          } catch(e){}
+        }, 400);
+      })();
     } catch(e) {
       document.getElementById("playerErrMsg").textContent =
         "The stream couldn't be loaded. Try again, or use an external player below.";
@@ -234,6 +260,13 @@
   /* ---------- external players ---------- */
   function openIntent(pkg, action){
     haptic();
+    if (inTg) {
+      /* Telegram's WebView can't fire intent:// — open this page in the
+         system browser, where external players work. */
+      toast("Opening in browser for external player…");
+      tg.openLink(window.location.href);
+      return;
+    }
     var intent = "intent:" + downloadlink + "#Intent;" +
       (action ? "action=" + action + ";" : "") +
       "package=" + pkg + ";type=video/*;" +
@@ -264,7 +297,15 @@
     lbl.textContent = fmt(done) + (total ? " / " + fmt(total) + " · " + pct.toFixed(0) + "%" : "");
   }
   window.download = async function(){
-    haptic(); toast("Starting download…");
+    haptic();
+    if (inTg) {
+      /* Telegram's in-app browser can't download files — open the direct
+         link in the system browser, which downloads with native progress. */
+      toast("Opening in browser…");
+      tg.openLink(downloadlinkDl);
+      return;
+    }
+    toast("Starting download…");
     try {
       var res = await fetch(downloadlinkDl);
       if (!res.ok || !res.body) throw new Error("fetch failed: " + res.status);

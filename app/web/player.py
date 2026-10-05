@@ -48,7 +48,6 @@ _stream_sem = asyncio.Semaphore(20)
 _RESUMEABLE = (streamer.StreamError, asyncio.TimeoutError,
                ConnectionError, OSError)
 _MAX_RESUMES = 3
-_PREFETCH_TIMEOUT = 45.0
 
 _WATCH_HTML = os.path.join(os.path.dirname(__file__), "watch.html")
 _watch_template: str | None = None
@@ -191,21 +190,18 @@ async def _refresh_file_id(f: File) -> str:
     return new_id
 
 
-async def _open_stream(client, file_id: str, offset: int, length: int):
-    """Create a stream with the first chunk pre-fetched (inside try).
+def _check_file_id(file_id: str) -> None:
+    """Eager file_id sanity check (no network).
 
-    The async generator body only runs once iterated, so pre-fetching
-    here lets the caller catch FileReferenceExpired / stalls before
-    the HTTP response starts.
+    Catches corrupt file_ids before HTTP headers are sent — the stream
+    itself now starts immediately with no pre-flight fetch, so this is
+    the fail-fast gate. Raises 410 on garbage.
     """
-    stream = streamer.stream_file(client, file_id,
-                                  offset=offset, length=length)
+    from pyrogram.file_id import FileId
     try:
-        first = await asyncio.wait_for(stream.__anext__(),
-                                       timeout=_PREFETCH_TIMEOUT)
-    except StopAsyncIteration:
-        first = None
-    return stream, first
+        FileId.decode(file_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(410, f"bad file reference: {exc}")
 
 
 @router.get("/watch/{token}", response_class=HTMLResponse)
@@ -369,42 +365,27 @@ async def download(token: str, request: Request):
     if request.method == "HEAD":
         return Response(status_code=206 if partial else 200, headers=headers)
 
-    # Open the MTProto stream with the first chunk pre-fetched so
-    # FileReferenceExpired / stalls surface BEFORE the response starts.
+    # No pre-flight fetch: the stream starts immediately and headers go
+    # out at once (fast time-to-first-byte for seek/play). A corrupt
+    # file_id fails fast here; an expired file_reference is caught by the
+    # resume logic inside gen() and refreshed transparently.
     file_id = f.file_id
-    stream = None
-    first: bytes | None = None
-    try:
-        for attempt in (0, 1):
-            try:
-                async with _stream_sem:
-                    stream, first = await _open_stream(
-                        client, file_id, offset, length)
-                break
-            except FileReferenceExpired:
-                if attempt == 1:
-                    raise HTTPException(410, "file reference expired")
-                log.info("file_reference expired for %d, refreshing", f.id)
-                file_id = await _refresh_file_id(f)
-    except _RESUMEABLE as exc:
-        log.warning("telegram upstream stall on first chunk: %r", exc)
-        raise HTTPException(503, "upstream timeout, retry")
+    _check_file_id(file_id)
 
     async def gen():
-        nonlocal stream, first, file_id
-        sent = 0
+        nonlocal file_id
+        end_pos = offset + length
+        stream_pos = offset
         resumes = 0
-        cur_first = first
         while True:
             try:
-                if cur_first is not None:
-                    yield cur_first
-                    sent += len(cur_first)
-                    cur_first = None
                 async with _stream_sem:
+                    stream = streamer.stream_file(
+                        client, file_id,
+                        offset=stream_pos, length=end_pos - stream_pos)
                     async for chunk in stream:
                         yield chunk
-                        sent += len(chunk)
+                        stream_pos += len(chunk)
                 return  # done
             except FileReferenceExpired:
                 try:
@@ -414,21 +395,14 @@ async def download(token: str, request: Request):
                     return
             except _RESUMEABLE as exc:
                 log.warning("stream interrupted at %d/%d: %r",
-                            sent, length, exc)
-            if sent >= length:
+                            stream_pos - offset, length, exc)
+            if stream_pos >= end_pos:
                 return
             resumes += 1
             if resumes > _MAX_RESUMES:
                 log.warning("too many stream resumes, aborting")
                 return
             # Resume from the last byte the client actually got.
-            try:
-                async with _stream_sem:
-                    stream, cur_first = await _open_stream(
-                        client, file_id, offset + sent, length - sent)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("stream resume failed: %r", exc)
-                return
 
     return StreamingResponse(gen(),
                              status_code=206 if partial else 200,
