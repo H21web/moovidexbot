@@ -225,12 +225,10 @@ async def watch(token: str, request: Request):
     name = (f.file_name or "Video").rsplit("/", 1)[-1]
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     mime = _content_type(f)
-    is_audio = mime.startswith("audio/") or \
-        name.lower().endswith((".mp3", ".ogg", ".wav", ".m4a", ".flac"))
     playable = mime.startswith(("video/", "audio/")) or \
         name.lower().endswith((".mp4", ".webm", ".mov", ".m4v",
                                ".mp3", ".ogg", ".wav", ".m4a"))
-    # TMDB enrichment for poster/plot (best-effort, cached 30 days).
+    # TMDB enrichment for the poster (best-effort, cached 30 days).
     meta: dict | None = None
     try:
         guess = _title_guess(name)
@@ -239,43 +237,15 @@ async def watch(token: str, request: Request):
     except Exception:  # noqa: BLE001
         meta = None
     poster = (meta or {}).get("poster_url") or ""
-    plot = (meta or {}).get("plot") or ""
-    rating = (meta or {}).get("rating") or 0
 
-    if poster:
-        poster_html = (f'<img class="poster" src="{escape(poster)}" '
-                       f'alt="poster" loading="lazy" '
-                       f'onerror="this.outerHTML=\'<div class=&quot;poster-fallback&quot;>🎬</div>\'">')
-    else:
-        poster_html = '<div class="poster-fallback">🎬</div>'
-
-    chips = []
-    if f.quality:
-        chips.append(f'<span class="chip hot">{escape(f.quality)}</span>')
-    if f.language:
-        chips.append(f'<span class="chip">{escape(f.language)}</span>')
-    if rating:
-        chips.append(f'<span class="chip ok">⭐ {rating}</span>')
-    if ext:
-        chips.append(f'<span class="chip">.{escape(ext)}</span>')
-    if playable:
-        chips.append('<span class="chip ok">▶ playable</span>')
-
-    def row(k: str, v: str) -> str:
-        return (f'<div class="drow"><span class="k">{k}</span>'
-                f'<span class="v">{escape(v)}</span></div>')
-
-    details = "".join([
-        row("File name", name),
-        row("Size", _fmt_size(f.file_size)),
-        row("Format", ("." + ext) if ext else "—"),
-        row("Type", mime),
-        row("Quality", f.quality or "—"),
-        row("Language", f.language or "—"),
-    ])
-    if meta and meta.get("title"):
-        details += row("TMDB", f"{meta['title']}"
-                             f" ({meta.get('year') or '—'})")
+    # File details — DB values first, filename detection as fallback.
+    from app.textutil import detect_quality_language, extract_year
+    det_q, det_l = detect_quality_language(name)
+    quality = f.quality or det_q or "—"
+    language = f.language or det_l or "—"
+    year = extract_year(name)
+    year_s = str(year) if year else "—"
+    fmt = ("." + ext) if ext else "—"
 
     username = await _bot_username()
     bot_url = f"https://telegram.me/{username}" if username else "#"
@@ -289,14 +259,14 @@ async def watch(token: str, request: Request):
                  .replace("__DL_URL__", dl_url)
                  .replace("__DL_DL_URL__", dl_url + "?dl=1")
                  .replace("__PLAYABLE__", "true" if playable else "false")
-                 .replace("__IS_AUDIO__", "true" if is_audio else "false")
                  .replace("__SIZE__", str(f.file_size or 0))
+                 .replace("__SIZE_H__", _fmt_size(f.file_size))
                  .replace("__MIME__", escape(mime))
+                 .replace("__QUALITY__", escape(quality))
+                 .replace("__YEAR__", escape(year_s))
+                 .replace("__LANGUAGE__", escape(language))
+                 .replace("__FORMAT__", escape(fmt))
                  .replace("__POSTER__", escape(poster))
-                 .replace("__POSTER_HTML__", poster_html)
-                 .replace("__CHIPS_HTML__", "".join(chips))
-                 .replace("__PLOT__", escape(plot[:300]))
-                 .replace("__DETAILS_HTML__", details)
                  .replace("__FILENAME_JSON__", js_name))
     return HTMLResponse(html_page,
                         headers={"Cache-Control": "no-store",

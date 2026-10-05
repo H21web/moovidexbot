@@ -25,6 +25,7 @@ from typing import AsyncGenerator
 from pyrogram import raw
 from pyrogram.crypto import aes
 from pyrogram.errors import VolumeLocNotFound
+from pyrogram.errors.exceptions.bad_request_400 import LimitInvalid
 from pyrogram.file_id import FileId, FileType
 from pyrogram.session import Auth, Session
 
@@ -227,33 +228,60 @@ async def stream_file(
     chunk_size -= chunk_size % _GRANULARITY
     pos = max(0, offset)
     remaining = length
-    # Align the first request down to the granularity; drop the leading
-    # bytes locally. HTTP Range offsets are arbitrary — sending them raw
-    # is what raised [400 LIMIT_INVALID].
-    req_pos = pos - (pos % _GRANULARITY)
-    skip = pos - req_pos
+    # v10.11.1: some DCs/files reject precise=True with [400 LIMIT_INVALID]
+    # even for 1 KiB-aligned requests. On the first rejection we fall back
+    # to classic 4 KiB-aligned non-precise requests (limit still divides
+    # 1 MiB) for the rest of the stream — same bytes, no seeking loss that
+    # matters (we slice locally anyway).
+    use_precise = True
 
     while True:
         if remaining is not None and remaining <= 0:
             break
-        # Always the FULL chunk — never trim the limit to the remainder.
-        result = await session.invoke(
-            raw.functions.upload.GetFile(
-                location=location,
-                offset=req_pos,
-                limit=chunk_size,
-                precise=True,
-                cdn_supported=True,
-            ),
-            sleep_threshold=30,
-        )
+        # Re-derive the aligned request position from pos every iteration:
+        # a fallback request may consume a non-multiple of chunk_size, so
+        # a blind `+= chunk_size` would skip bytes.
+        req_pos = pos - (pos % _GRANULARITY)
+        skip = pos - req_pos
+        extra_skip = 0
+        if use_precise:
+            try:
+                result = await session.invoke(
+                    raw.functions.upload.GetFile(
+                        location=location,
+                        offset=req_pos,
+                        limit=chunk_size,
+                        precise=True,
+                        cdn_supported=True,
+                    ),
+                    sleep_threshold=30,
+                )
+            except LimitInvalid:
+                log.warning("precise GetFile rejected at offset %d; "
+                            "falling back to 4K-aligned requests", req_pos)
+                use_precise = False
+        if not use_precise:
+            # Always the FULL chunk — never trim the limit to the remainder.
+            aligned = req_pos - (req_pos % 4096)
+            extra_skip = req_pos - aligned
+            result = await session.invoke(
+                raw.functions.upload.GetFile(
+                    location=location,
+                    offset=aligned,
+                    limit=chunk_size,
+                    precise=False,
+                    cdn_supported=True,
+                ),
+                sleep_threshold=30,
+            )
         if isinstance(result, raw.types.upload.File):
             data = result.bytes
             if not data:
                 break  # EOF
+            if extra_skip:
+                data = data[extra_skip:]
             if skip:
                 data = data[skip:]
-                skip = 0
             if remaining is not None:
                 data = data[:remaining]
                 remaining -= len(data)
@@ -261,7 +289,6 @@ async def stream_file(
                 break
             yield data
             pos += len(data)
-            req_pos += chunk_size
             if len(result.bytes) < chunk_size:  # short read = EOF
                 break
         elif isinstance(result, raw.types.upload.FileCdnRedirect):
