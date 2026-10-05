@@ -13,11 +13,17 @@ import urllib.parse
 
 import httpx
 
+import os
+
 log = logging.getLogger(__name__)
 
 _SEARCH_BASE = "https://rest.opensubtitles.org/search"
 _DL_BASE = "https://dl.opensubtitles.org/en/download/filead"
 _UA = {"X-User-Agent": "MoovidexBot/1.0"}
+
+# Official API (fallback when OPENSUBTITLES_API_KEY is set — reliable,
+# the keyless endpoint is Cloudflare-flaky from datacenter IPs).
+_OS_API = "https://api.opensubtitles.com/api/v1"
 
 # In-memory cache: sub_id -> file name (for Telegram sends).
 _name_cache: dict[str, str] = {}
@@ -42,25 +48,17 @@ def _clean_query(file_name: str) -> str:
     return s[:80]
 
 
-async def search_subtitles(title: str, languages: str = "eng",
-                           limit: int = 10) -> list[dict]:
-    """Search subtitles. Returns [{id, lang, name, downloads, rating}]."""
-    q = _clean_query(title)
-    if not q:
-        return []
-    url = (f"{_SEARCH_BASE}/query-{urllib.parse.quote(q)}"
+async def _search_keyless(q: str, languages: str) -> list[dict]:
+    """Keyless rest.opensubtitles.org search. May 403 from datacenters."""
+    # NB: spaces must be "+" (quote_plus) — "%20" gets a broken redirect.
+    url = (f"{_SEARCH_BASE}/query-{urllib.parse.quote_plus(q)}"
            f"/sublanguageid-{languages}")
-    try:
-        async with httpx.AsyncClient(timeout=20) as hc:
-            r = await hc.get(url, headers=_UA)
-            if r.status_code != 200:
-                log.warning("subtitle search HTTP %d for %r",
-                            r.status_code, q)
-                return []
-            data = r.json()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("subtitle search failed for %r: %s", q, exc)
-        return []
+    async with httpx.AsyncClient(timeout=20) as hc:
+        r = await hc.get(url, headers=_UA)
+        if r.status_code != 200:
+            log.warning("subtitle search HTTP %d for %r", r.status_code, q)
+            return []
+        data = r.json()
     out = []
     for row in data or []:
         if (row.get("SubFormat") or "").lower() != "srt":
@@ -83,6 +81,74 @@ async def search_subtitles(title: str, languages: str = "eng",
             "downloads": dl_count,
             "rating": row.get("SubRating") or "",
         })
+    return out
+
+
+async def _search_official(q: str, languages: str) -> list[dict]:
+    """Official api.opensubtitles.com search (needs OPENSUBTITLES_API_KEY)."""
+    api_key = (os.environ.get("OPENSUBTITLES_API_KEY") or "").strip()
+    if not api_key:
+        return []
+    langs = ",".join(languages.split(","))  # eng -> eng (ISO 639-2)
+    url = f"{_OS_API}/subtitles"
+    headers = {"Api-Key": api_key, "User-Agent": "MoovidexBot/1.0",
+               "Accept": "application/json"}
+    params = {"query": q, "languages": langs}
+    async with httpx.AsyncClient(timeout=20) as hc:
+        r = await hc.get(url, headers=headers, params=params)
+        if r.status_code != 200:
+            log.warning("official subtitle search HTTP %d for %r",
+                        r.status_code, q)
+            return []
+        data = r.json()
+    out = []
+    for item in (data.get("data") or []):
+        attr = item.get("attributes") or {}
+        files = attr.get("files") or []
+        if not files:
+            continue
+        f0 = files[0]
+        sid = str(f0.get("file_id") or "")
+        if not sid:
+            continue
+        name = f0.get("file_name") or ""
+        _name_cache[sid] = name
+        # Official downloads need a user token; stash the file_id so
+        # download_subtitle can use the official flow when configured.
+        _official_ids[sid] = sid
+        out.append({
+            "id": sid,
+            "lang": attr.get("language") or "",
+            "name": name,
+            "movie": (attr.get("feature_details") or {}).get("title") or "",
+            "year": str((attr.get("feature_details") or {}).get("year") or ""),
+            "downloads": attr.get("download_count") or 0,
+            "rating": "",
+        })
+    return out
+
+
+# sub_ids that came from the official API (download flow differs).
+_official_ids: set[str] = set()
+
+
+async def search_subtitles(title: str, languages: str = "eng",
+                           limit: int = 10) -> list[dict]:
+    """Search subtitles. Returns [{id, lang, name, downloads, rating}]."""
+    q = _clean_query(title)
+    if not q:
+        return []
+    try:
+        out = await _search_keyless(q, languages)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("subtitle search failed for %r: %s", q, exc)
+        out = []
+    if not out:
+        # Fall back to the official API when a key is configured.
+        try:
+            out = await _search_official(q, languages)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("official subtitle search failed for %r: %s", q, exc)
     out.sort(key=lambda x: -x["downloads"])
     return out[:limit]
 

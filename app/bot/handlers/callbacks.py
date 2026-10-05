@@ -212,60 +212,6 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
     return sent
 
 
-async def _subtitles(client: Client, query):
-    """📝 Subtitles button: search OpenSubtitles for this file's title and
-    show the top matches as buttons."""
-    await query.answer("🔍 Searching subtitles…")
-    try:
-        file_db_id = int(query.data.split(":")[1])
-    except (ValueError, IndexError):
-        return
-    f = await _get_file(file_db_id)
-    if not f:
-        await query.answer("❌ File not found.", show_alert=True)
-        return
-    from app import subs
-    results = await subs.search_subtitles(f.file_name or "", "eng,mal,hin,tam",
-                                          limit=8)
-    if not results:
-        await query.answer("No subtitles found for this title.",
-                           show_alert=True)
-        return
-    title = (f.file_name or "file")[:40]
-    rows = []
-    for r in results:
-        label = f"{(r['lang'] or '?').upper()} • {(r['name'] or r['id'])[:28]}"
-        rows.append([InlineKeyboardButton(
-            label, callback_data=f"subdl:{r['id']}")])
-    await query.message.reply_text(
-        f"📝 <b>Subtitles for {title}</b>\nPick one to download:",
-        reply_markup=InlineKeyboardMarkup(rows),
-        parse_mode=ParseMode.HTML)
-
-
-async def _sub_download(client: Client, query):
-    """Download the chosen subtitle and send it as a .srt document."""
-    await query.answer("⬇ Downloading subtitle…")
-    try:
-        sub_id = query.data.split(":")[1]
-    except IndexError:
-        return
-    from app import subs
-    got = await subs.download_subtitle(sub_id)
-    if not got:
-        await query.answer("❌ Couldn't download that subtitle.",
-                           show_alert=True)
-        return
-    data, name = got
-    await client.send_document(
-        query.message.chat.id,
-        document=data,
-        file_name=name,
-        caption=f"📝 {name}",
-    )
-    await query.answer("✅ Subtitle sent!")
-
-
 async def _get_file(file_db_id: int):
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as session:
@@ -774,8 +720,6 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^mv:"))(_movie)
     bot.on_callback_query(filters.regex(r"^bk:"))(_back)
     bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
-    bot.on_callback_query(filters.regex(r"^sub:"))(_subtitles)
-    bot.on_callback_query(filters.regex(r"^subdl:"))(_sub_download)
     bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
     bot.on_callback_query(filters.regex(r"^ait:"))(_ait)
     bot.on_callback_query(filters.regex(r"^ais:"))(_ais)

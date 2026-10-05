@@ -109,9 +109,14 @@ def v8_file_kb(file_db_id: int, user_id: int):
                                          callback_data=f"dl:{file_db_id}")])
     # v10: watchlist — save for later.
     rows.append([InlineKeyboardButton("⭐ Save",
-                                     callback_data=f"save:{file_db_id}"),
-                 InlineKeyboardButton("📝 Subtitles",
-                                      callback_data=f"sub:{file_db_id}")])
+                                     callback_data=f"save:{file_db_id}")])
+    # v10.11.7: subtitles open in the Telegram web app (language picker);
+    # tapping a language sends the .srt and closes the app.
+    from app.web.tokens import sub_pick_url
+    sp = sub_pick_url(file_db_id, user_id)
+    if sp:
+        rows.append([InlineKeyboardButton("📝 Subtitles",
+                                          web_app=WebAppInfo(url=sp))])
     return InlineKeyboardMarkup(rows)
 
 

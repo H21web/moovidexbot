@@ -390,6 +390,146 @@ async def go_ext(token: str, player: str = "mx", request: Request = None):
         "</body></html>")
 
 
+@router.get("/subs/pick/{token}", response_class=HTMLResponse)
+async def subs_pick(token: str, request: Request):
+    """Telegram Web App: subtitle language picker for a file.
+
+    Lists available subtitle languages; tapping one makes the bot send
+    the .srt to the user and closes the web app.
+    """
+    data = parse_watch_token(token)
+    if not data:
+        return _error_page(403, "Link expired",
+                           "This link is invalid or has expired.")
+    try:
+        f = await _get_file(token)
+    except HTTPException:
+        return _error_page(404, "File not found",
+                           "This file is no longer indexed.")
+    from app import subs
+    results = await subs.search_subtitles(f.file_name or "", "eng,mal,hin,tam",
+                                          limit=30)
+    # Group by language, keep the best per language.
+    by_lang: dict[str, dict] = {}
+    for r in results:
+        lang = (r.get("lang") or "?").lower()
+        if lang not in by_lang:
+            by_lang[lang] = {"sub_id": r["id"], "count": 0,
+                             "name": r.get("name") or ""}
+        by_lang[lang]["count"] += 1
+    lang_names = {"eng": "English", "mal": "Malayalam", "hin": "Hindi",
+                  "tam": "Tamil", "tel": "Telugu", "kan": "Kannada"}
+    buttons = []
+    for lang, info in sorted(by_lang.items(),
+                             key=lambda kv: -kv[1]["count"]):
+        label = lang_names.get(lang, lang.upper())
+        buttons.append(
+            f"<button data-sub='{info['sub_id']}' "
+            f"style='display:block;width:100%;margin:8px 0;padding:14px;"
+            f"background:#1a1a24;border:1px solid #333;color:#fff;"
+            f"border-radius:12px;font-size:16px'>"
+            f"{escape(label)} <span style='color:#888;font-size:13px'>"
+            f"({info['count']})</span></button>")
+    body = "".join(buttons) if buttons else (
+        "<p style='color:#888'>No subtitles found for this title.</p>")
+    # Auto-translate: translate the top result to Malayalam / English.
+    trans_html = ""
+    if by_lang:
+        first_id = next(iter(by_lang.values()))["sub_id"]
+        trans_html = (
+            "<p style='color:#888;font-size:13px;margin:16px 0 4px'>"
+            "🌐 Auto-translate</p>"
+            f"<button data-tr='mal:{first_id}' style='display:block;width:100%;"
+            f"margin:8px 0;padding:14px;background:#1a1a24;border:1px solid #333;"
+            f"color:#fff;border-radius:12px;font-size:16px'>"
+            f"→ Malayalam</button>"
+            f"<button data-tr='eng:{first_id}' style='display:block;width:100%;"
+            f"margin:8px 0;padding:14px;background:#1a1a24;border:1px solid #333;"
+            f"color:#fff;border-radius:12px;font-size:16px'>"
+            f"→ English</button>")
+    title = escape((f.file_name or "file")[:60])
+    return HTMLResponse(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Subtitles</title>"
+        "<script src='https://telegram.org/js/telegram-web-app.js'></script>"
+        "</head>"
+        "<body style='background:#0b0b10;color:#fff;font-family:sans-serif;"
+        "padding:24px;max-width:480px;margin:0 auto'>"
+        f"<h3 style='margin:0 0 4px'>📝 Subtitles</h3>"
+        f"<p style='color:#888;font-size:13px;margin:0 0 16px'>{title}</p>"
+        f"<div id='langs'>{body}{trans_html}</div>"
+        "<p id='msg' style='color:#888;font-size:13px'></p>"
+        "<script>"
+        "var tg=(window.Telegram&&window.Telegram.WebApp)?window.Telegram.WebApp:null;"
+        "if(tg){tg.ready();tg.expand();}"
+        f"var token={json.dumps(token)};"
+        "function sendSub(subId, to){"
+        "var msg=document.getElementById('msg');msg.textContent='Sending…';"
+        "var url='/subs/send?token='+encodeURIComponent(token)+"
+        "'&sub_id='+encodeURIComponent(subId);"
+        "if(to)url+='&to='+encodeURIComponent(to);"
+        "fetch(url).then(function(r){return r.json();})"
+        ".then(function(j){"
+        "if(j.ok){msg.textContent='Sent! Closing…';"
+        "setTimeout(function(){if(tg)tg.close();},800);}"
+        "else{msg.textContent='Failed: '+(j.error||'try again');}"
+        "}).catch(function(){msg.textContent='Failed. Try again.';});"
+        "}"
+        "document.getElementById('langs').addEventListener('click',function(e){"
+        "var b=e.target.closest('button[data-sub]');"
+        "if(b){sendSub(b.dataset.sub);return;}"
+        "var t=e.target.closest('button[data-tr]');"
+        "if(t){var p=t.dataset.tr.split(':');sendSub(p[1],p[0]);}"
+        "});"
+        "</script></body></html>")
+
+
+@router.get("/subs/send")
+async def subs_send(token: str, sub_id: str, to: str = ""):
+    """Web-app action: download the subtitle and send it via the bot.
+
+    ``to`` (e.g. ``mal``) auto-translates before sending.
+    """
+    data = parse_watch_token(token)
+    if not data or not data.get("u"):
+        return {"ok": False, "error": "bad token"}
+    from app import subs
+    to = re.sub(r"[^a-z]", "", (to or "").lower())[:5]
+    if to:
+        # Translate via our own endpoint logic.
+        try:
+            tr = await subs_translate(sub_id, to)
+            sdata = tr.body
+            # Extract filename from Content-Disposition.
+            cd = tr.headers.get("content-disposition", "")
+            m = re.search(r"filename\*=UTF-8''(.+)", cd)
+            name = m.group(1) if m else f"subtitle.{to}.srt"
+            from urllib.parse import unquote as _uq
+            name = _uq(name)
+        except HTTPException as exc:
+            return {"ok": False, "error": exc.detail}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("subs/send translate failed: %s", exc)
+            return {"ok": False, "error": "translate failed"}
+    else:
+        got = await subs.download_subtitle(sub_id)
+        if not got:
+            return {"ok": False, "error": "download failed"}
+        sdata, name = got
+    client = bot_app.bot
+    if not client:
+        return {"ok": False, "error": "bot not ready"}
+    try:
+        await client.send_document(data["u"], document=sdata,
+                                   file_name=name,
+                                   caption=f"📝 {name}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("subs/send failed: %s", exc)
+        return {"ok": False, "error": "send failed"}
+    return {"ok": True}
+
+
 @router.get("/subs/search")
 async def subs_search(title: str, langs: str = "eng"):
     """Search subtitles (keyless OpenSubtitles). JSON list."""
@@ -412,6 +552,86 @@ async def subs_file(sub_id: str):
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition":
                  f"attachment; filename*=UTF-8''{quote(name)}"},
+    )
+
+
+@router.get("/subs/translate/{sub_id}")
+async def subs_translate(sub_id: str, to: str = "mal"):
+    """Auto-translate a subtitle via Google Translate (free endpoint).
+
+    Downloads the .srt, translates the text lines, returns a translated
+    .srt. Best-effort — the unofficial endpoint can rate-limit.
+    """
+    import httpx as _httpx
+    to = re.sub(r"[^a-z]", "", (to or "mal").lower())[:5] or "mal"
+    from app import subs
+    got = await subs.download_subtitle(sub_id)
+    if not got:
+        raise HTTPException(404, "subtitle not found")
+    data, name = got
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        raise HTTPException(400, "cannot decode subtitle")
+    # Parse SRT blocks, keep timing, translate text lines.
+    blocks = re.split(r"\r?\n\r?\n", text.strip())
+    texts = []
+    idxs = []
+    for bi, b in enumerate(blocks):
+        lines = b.splitlines()
+        if len(lines) >= 3 and "-->" in lines[1]:
+            t = "\n".join(lines[2:])
+            # Strip basic HTML tags for translation.
+            t_clean = re.sub(r"<[^>]+>", "", t).strip()
+            if t_clean:
+                texts.append(t_clean)
+                idxs.append(bi)
+    if not texts:
+        raise HTTPException(400, "no translatable text")
+    # Batch 25 lines per request.
+    translated: list[str] = [""] * len(texts)
+    try:
+        async with _httpx.AsyncClient(timeout=30) as hc:
+            for i in range(0, len(texts), 25):
+                batch = texts[i:i + 25]
+                r = await hc.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={"client": "gtx", "sl": "auto", "tl": to,
+                            "dt": "t",
+                            "q": batch})
+                if r.status_code != 200:
+                    raise HTTPException(502, "translate service busy")
+                # Response: [[[translated, original, ...], ...], ...]
+                j = r.json()
+                for k, seg in enumerate(j[0]):
+                    if i + k < len(translated) and seg and seg[0]:
+                        translated[i + k] = seg[0]
+                await asyncio.sleep(0.3)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("subtitle translate failed: %s", exc)
+        raise HTTPException(502, "translate failed")
+    # Rebuild SRT.
+    out_blocks = []
+    ti = 0
+    for bi, b in enumerate(blocks):
+        if ti < len(idxs) and bi == idxs[ti]:
+            lines = b.splitlines()
+            timing = lines[1] if len(lines) > 1 else ""
+            num = lines[0] if lines else str(bi + 1)
+            t = translated[ti] or texts[ti]
+            out_blocks.append(f"{num}\n{timing}\n{t}")
+            ti += 1
+        else:
+            out_blocks.append(b)
+    out = "\n\n".join(out_blocks) + "\n"
+    base = name.rsplit(".", 1)[0]
+    return Response(
+        content=out.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition":
+                 f"attachment; filename*=UTF-8''{quote(base + '.' + to + '.srt')}"},
     )
 
 

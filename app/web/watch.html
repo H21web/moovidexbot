@@ -155,23 +155,6 @@
   </section>
   <!-- play on section end -->
 
-  <!-- subtitles section -->
-  <section class="section-lg-b-space">
-    <div class="custom-container">
-      <ul class="setting-list">
-        <li>
-          <div class="setting-details" style="cursor:default">
-            <div class="setting-icon" style="font-size:22px">📝</div>
-            <h4>Subtitles</h4>
-            <div class="setting-arrow"><button id="subSearchBtn" class="retry-btn" style="margin:0">🔍 Find</button></div>
-          </div>
-          <div id="subResults" style="padding:0 16px 12px;display:flex;flex-direction:column;gap:8px"></div>
-        </li>
-      </ul>
-    </div>
-  </section>
-  <!-- subtitles section end -->
-
   <!-- panel-space start -->
   <section class="panel-space"></section>
   <!-- panel-space end -->
@@ -325,48 +308,35 @@
   window.s_player      = function(){ openIntent("com.young.simple.player", "com.young.simple.player.playback_online"); };
   window.u_player      = function(){ openIntent("uplayer.video.player"); };
 
-  /* ---------- subtitles ---------- */
-  function loadSubtitle(s){
+  /* ---------- subtitles (in-player) ---------- */
+  /* Auto-search OpenSubtitles and load the results into OPlayer's own
+     subtitle menu — the CC button in the player controls picks them. */
+  (async function(){
     try {
-      var url = "/subs/file/" + encodeURIComponent(s.id);
-      var ui = window._opl && window._opl.context && window._opl.context.ui;
-      if (ui && ui.subtitle && ui.subtitle.changeSource) {
-        ui.subtitle.changeSource([{ name: (s.lang || "sub") + " subtitle",
-                                    src: url, default: true }]);
-        toast("Subtitle loaded");
-      } else {
-        toast("Player not ready");
-      }
-    } catch(e){ toast("Couldn't load subtitle"); }
-  }
-  document.getElementById("subSearchBtn").onclick = async function(){
-    haptic();
-    var box = document.getElementById("subResults");
-    var title = "";
-    try { title = document.getElementById("checktxt").textContent || ""; } catch(e){}
-    box.innerHTML = "<p style='color:#888;font-size:13px'>Searching subtitles…</p>";
-    try {
+      var title = "";
+      try { title = document.getElementById("checktxt").textContent || ""; } catch(e){}
+      if (!title) return;
       var r = await fetch("/subs/search?title=" + encodeURIComponent(title) +
                           "&langs=eng,mal,hin,tam");
       var j = await r.json();
       var list = (j && j.results) || [];
-      if (!list.length) { box.innerHTML = "<p style='color:#888;font-size:13px'>No subtitles found.</p>"; return; }
-      box.innerHTML = "";
+      if (!list.length) return;
+      var names = {eng:"English", mal:"Malayalam", hin:"Hindi", tam:"Tamil",
+                   tel:"Telugu", kan:"Kannada"};
+      var seen = {}, src = [];
       list.forEach(function(s){
-        var b = document.createElement("button");
-        b.className = "retry-btn";
-        b.style.cssText = "text-align:left;font-size:13px";
-        var lbl = (s.lang ? s.lang.toUpperCase() + " • " : "") +
-                  ((s.name || ("sub " + s.id)).slice(0, 42));
-        if (s.downloads) lbl += " (" + s.downloads + "⬇)";
-        b.textContent = lbl;
-        b.onclick = function(){ loadSubtitle(s); };
-        box.appendChild(b);
+        var lang = (s.lang || "?").toLowerCase();
+        if (seen[lang]) return;
+        seen[lang] = 1;
+        src.push({ name: (names[lang] || lang.toUpperCase()),
+                   src: "/subs/file/" + encodeURIComponent(s.id) });
       });
-    } catch(e){
-      box.innerHTML = "<p style='color:#888;font-size:13px'>Search failed. Try again.</p>";
-    }
-  };
+      var ui = window._opl && window._opl.context && window._opl.context.ui;
+      if (ui && ui.subtitle && ui.subtitle.changeSource) {
+        ui.subtitle.changeSource(src);
+      }
+    } catch(e){}
+  })();
 
   /* ---------- download with progress ---------- */
   function fmt(n){

@@ -70,3 +70,11 @@ def dl_url(file_db_id: int, user_id: int) -> str | None:
     if not base:
         return None
     return f"{base}/dl/{make_watch_token(file_db_id, user_id)}?dl=1"
+
+
+def sub_pick_url(file_db_id: int, user_id: int) -> str | None:
+    """Telegram Web App URL for the subtitle language picker."""
+    base = _web_base()
+    if not base:
+        return None
+    return f"{base}/subs/pick/{make_watch_token(file_db_id, user_id)}"
