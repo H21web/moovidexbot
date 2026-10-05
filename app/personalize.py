@@ -316,6 +316,25 @@ def _top_of(counters: dict, cat: str) -> str | None:
     return max(cat_c, key=lambda k: cat_c[k])
 
 
+async def preferred_lang_qual(
+        user_id: int | None) -> tuple[str | None, str | None]:
+    """(language, quality) the user prefers: manual override wins,
+    else the learned top. Used to order result lists. Never raises."""
+    if not user_id:
+        return None, None
+    try:
+        prefs = await get_prefs(user_id)
+    except Exception:  # noqa: BLE001
+        return None, None
+    manual = (prefs or {}).get("manual") or {}
+    counters = (prefs or {}).get("counters") or {}
+    lang = ((manual.get("language") or _top_of(counters, "language")
+             or "").lower() or None)
+    qual = ((manual.get("quality") or _top_of(counters, "quality")
+             or "").lower() or None)
+    return lang, qual
+
+
 async def choose_best(files: list[dict], parsed: dict,
                       user_id: int | None) -> tuple[dict | None, list[str]]:
     """Pick the best file the way the user would.

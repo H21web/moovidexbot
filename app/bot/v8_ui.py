@@ -3,6 +3,8 @@
 """v8 results UI: best pick + file list with download links + filters."""
 from __future__ import annotations
 
+import re
+
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -87,6 +89,49 @@ def sort_best_first(files: list[dict]) -> list[dict]:
         return (-(f.get("score") or 0.0),
                 -_QUALITY_RANK.get(q, 0),
                 -(f.get("file_size") or 0))
+    return sorted(files, key=key)
+
+
+# A "combined" file: whole-season pack, multi-episode batch, or an
+# episode range (S01E01-E08). These go first in series results.
+_PACK_RE = re.compile(
+    r"\bcomplete\b|\bpack\b|\bbatch\b|all\s*episodes|"
+    r"s\d{1,2}\s*[-~–]\s*s?\d{1,2}|"
+    r"e\d{1,2}\s*[-~–]\s*e?\d{1,2}",
+    re.IGNORECASE)
+
+
+def _is_season_pack(file_name: str | None) -> bool:
+    t = file_name or ""
+    if _PACK_RE.search(t):
+        return True
+    s, e = file_season_episode(t)
+    return bool(s and not e)  # season-level file, no episode number
+
+
+def sort_results(files: list[dict], pref_lang: str | None = None,
+                 pref_qual: str | None = None) -> list[dict]:
+    """Order the result list the way users read it.
+
+    1. The user's preferred language/quality first.
+    2. Combined files (season packs) before single episodes.
+    3. Newest first: season desc, episode desc, then year desc.
+    4. Search relevance as the final tiebreak.
+    """
+    from app.textutil import extract_year
+    pl = (pref_lang or "").lower() or None
+    pq = (pref_qual or "").lower() or None
+
+    def key(f: dict):
+        lang = (f.get("language") or "").lower()
+        qual = (f.get("quality") or "").lower()
+        s, e = file_season_episode(f.get("file_name"))
+        return (0 if (pl and lang == pl) else 1,
+                0 if (pq and qual == pq) else 1,
+                0 if _is_season_pack(f.get("file_name")) else 1,
+                -(s or 0), -(e or 0),
+                -(extract_year(f.get("file_name")) or 0),
+                -(f.get("score") or 0.0))
     return sorted(files, key=key)
 
 
