@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app.config import settings  # noqa: E402
+from app.db import _fix_sslmode  # noqa: E402
 from app.models import Base  # noqa: E402
 
 config = context.config
@@ -34,7 +35,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    engine = create_async_engine(_url())
+    url, connect_args = _fix_sslmode(_url())
+    engine = create_async_engine(url, connect_args=connect_args)
 
     async def _run():
         async with engine.connect() as conn:
