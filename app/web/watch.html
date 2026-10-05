@@ -244,6 +244,19 @@
             var vids = root.getElementsByTagName("video");
             for (var i = 0; i < vids.length; i++) {
               vids[i].addEventListener("playing", hideCover);
+              /* Codec UX: if the browser can't decode this file
+                 (e.g. HEVC/x265 MKV — Chrome's demuxer rejects it),
+                 say so plainly and point at the external players. */
+              vids[i].addEventListener("error", function(){
+                try {
+                  if (this.error && this.error.code === 4) {
+                    document.getElementById("playerErrMsg").textContent =
+                      "This file's format can't play in the browser (often HEVC/x265 MKV). " +
+                      "Use MX Player or VLC below — they play everything.";
+                    document.getElementById("playerErr").classList.add("show");
+                  }
+                } catch(e){}
+              });
               if (!vids[i].paused) hideCover();
             }
           } catch(e){}

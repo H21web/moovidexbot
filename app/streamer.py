@@ -28,7 +28,7 @@ from typing import AsyncGenerator
 
 from pyrogram import raw
 from pyrogram.crypto import aes
-from pyrogram.errors import VolumeLocNotFound
+from pyrogram.errors import FloodWait, VolumeLocNotFound
 from pyrogram.errors.exceptions.bad_request_400 import LimitInvalid
 from pyrogram.file_id import FileId, FileType
 from pyrogram.session import Auth, Session
@@ -213,32 +213,87 @@ async def _stream_cdn(client, main_session: Session,
             break  # short read = EOF
 
 
+def _chunk_size_for(length: int | None) -> int:
+    """Match the Telegram request size to the HTTP range size.
+
+    Small ranges (seek probes, metadata reads) use small blocks so we
+    don't burn bandwidth/time fetching 1 MiB for a few KB — the same
+    adaptive sizing TG-FileStreamBot-MultiWorker uses. Every size keeps
+    the "offset is a multiple of the chunk size" invariant.
+    """
+    if length is not None:
+        if length < 512 * 1024:
+            return 64 * 1024
+        if length < 4 * 1024 * 1024:
+            return 256 * 1024
+    return CHUNK_SIZE  # 1 MiB
+
+
+# A chunk that makes no progress this long is abandoned (NOT cancelled —
+# the task finishes alone) and re-fetched, so one hung request can't
+# stall the whole stream behind it.
+_CHUNK_TIMEOUT = 30.0
+_CHUNK_RETRIES = 2
+
+
 async def _fetch_chunk(session, location, index: int, chunk_size: int):
     """Fetch one chunk. Never raises — returns (index, ok, result|exc).
 
     Tasks are never cancelled (abandoned ones finish on their own and
     their results are discarded), so the session's in-flight bookkeeping
-    is never disturbed.
+    is never disturbed. FloodWait gets a bounded wait + retry here so a
+    throttled chunk doesn't stall the pipeline.
     """
-    try:
-        res = await session.invoke(
-            raw.functions.upload.GetFile(
-                location=location,
-                offset=index * chunk_size,
-                limit=chunk_size,
-                cdn_supported=True,
-            ),
-            sleep_threshold=30,
-        )
-        return (index, True, res)
-    except LimitInvalid:
-        # Should not happen with the chunk-multiple shape; log everything
-        # so the next occurrence is diagnosable instead of a mystery.
-        log.error("GetFile LIMIT_INVALID: chunk=%d offset=%d limit=%d",
-                  index, index * chunk_size, chunk_size)
-        return (index, False, LimitInvalid("chunk request rejected"))
-    except Exception as exc:  # noqa: BLE001
-        return (index, False, exc)
+    for attempt in range(4):
+        try:
+            res = await session.invoke(
+                raw.functions.upload.GetFile(
+                    location=location,
+                    offset=index * chunk_size,
+                    limit=chunk_size,
+                    cdn_supported=True,
+                ),
+                sleep_threshold=10,
+            )
+            return (index, True, res)
+        except FloodWait as exc:
+            # pyrogram already slept through waits < 10s; longer ones we
+            # bound ourselves (cap 15s) and retry the same chunk.
+            wait = min(exc.value + 1, 15)
+            log.warning("FloodWait %ds on chunk %d, waiting %.0fs "
+                        "(attempt %d)", exc.value, index, wait, attempt + 1)
+            await asyncio.sleep(wait)
+        except LimitInvalid:
+            # Should not happen with the chunk-multiple shape; log everything
+            # so the next occurrence is diagnosable instead of a mystery.
+            log.error("GetFile LIMIT_INVALID: chunk=%d offset=%d limit=%d",
+                      index, index * chunk_size, chunk_size)
+            return (index, False, LimitInvalid("chunk request rejected"))
+        except Exception as exc:  # noqa: BLE001
+            return (index, False, exc)
+    return (index, False, FloodWait(15))
+
+
+async def _await_chunk(pending: dict, yield_index: int,
+                       session, location, chunk_size: int):
+    """Wait for the next in-order chunk, abandoning hung fetches.
+
+    On timeout the slow task is left to finish alone (never cancelled)
+    and a fresh fetch for the same chunk is started. Returns the
+    (index, ok, result|exc) tuple.
+    """
+    for _ in range(_CHUNK_RETRIES + 1):
+        task = pending.pop(yield_index)
+        done, _ = await asyncio.wait({task}, timeout=_CHUNK_TIMEOUT)
+        if done:
+            return task.result()
+        log.warning("chunk %d slow (>%.0fs), refetching", yield_index,
+                    _CHUNK_TIMEOUT)
+        pending[yield_index] = asyncio.create_task(
+            _fetch_chunk(session, location, yield_index, chunk_size))
+    task = pending.pop(yield_index)
+    await asyncio.wait({task})  # final wait: no timeout
+    return task.result()
 
 
 async def stream_file(
@@ -252,16 +307,20 @@ async def stream_file(
 
     Up to ``_PARALLEL`` chunk requests stay in flight at once (hides
     Telegram round-trip latency); chunks are always yielded in strict
-    order. Follows CDN redirects transparently (decrypt + hash-verify).
-    ``pyrogram.errors.FileReferenceExpired`` propagates so the caller can
-    refresh the file_id from the source message and retry once.
+    order. Block size adapts to the requested range (64 KiB / 256 KiB /
+    1 MiB). Hung chunks are re-fetched after a timeout; FloodWait gets a
+    bounded wait + retry. Follows CDN redirects transparently (decrypt +
+    hash-verify). ``pyrogram.errors.FileReferenceExpired`` propagates so
+    the caller can refresh the file_id from the source message and
+    retry once.
     """
     fid = FileId.decode(file_id)
     location = _location_for(fid)
     session = await _media_session(client, fid.dc_id)
 
-    # Fixed 1 MiB chunks (pyrogram's own size).
-    chunk_size = CHUNK_SIZE
+    # Adaptive block size: small HTTP ranges (seek probes, metadata)
+    # fetch small Telegram blocks instead of full 1 MiB chunks.
+    chunk_size = _chunk_size_for(length)
     pos = max(0, offset)
     end_pos = pos + length if length is not None else None
 
@@ -292,7 +351,8 @@ async def stream_file(
                 next_fetch += 1
             if yield_index not in pending:
                 break  # drained
-            _, ok, res = await pending.pop(yield_index)
+            _, ok, res = await _await_chunk(pending, yield_index,
+                                            session, location, chunk_size)
             yield_index += 1
             if not ok:
                 pending.clear()  # siblings finish alone; results discarded
