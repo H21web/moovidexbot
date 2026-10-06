@@ -17,6 +17,7 @@ from app.bot import app as bot_app
 from app.bot.handlers import register_all
 from app import analytics
 from app import autodelete
+from app import keepalive
 from app.config import settings
 from app.db import get_session_factory
 from app.web.app import create_app
@@ -66,6 +67,7 @@ async def amain() -> None:
     log.info("web player on port %d", settings.PORT)
     ad_task = autodelete.start()
     prune_task = analytics.start_prune_task()  # v10.8.10: activity log 30d
+    ka_task = keepalive.start()  # v10.11.10: DB idle-sleep keepalive
     try:
         await server.serve()
     finally:
@@ -73,6 +75,7 @@ async def amain() -> None:
         # dangling and can swallow shutdown errors.
         ad_task.cancel()
         prune_task.cancel()
+        ka_task.cancel()
         try:
             await ad_task
         except asyncio.CancelledError:
@@ -85,6 +88,12 @@ async def amain() -> None:
             pass
         except Exception as exc:  # noqa: BLE001
             log.debug("prune shutdown: %s", exc)
+        try:
+            await ka_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("keepalive shutdown: %s", exc)
         # Close shared httpx clients and the DB pool.
         try:
             from app import ai as ai_mod
