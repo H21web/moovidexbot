@@ -164,7 +164,9 @@ async def _search_keyless(q: str, languages: str,
                         deadline: float) -> list[dict]:
     """Keyless rest.opensubtitles.org search (with proxy fallbacks)."""
     # NB: spaces must be "+" (quote_plus) — "%20" gets a broken redirect.
-    url = (f"{_SEARCH_BASE}/query-{urllib.parse.quote_plus(q)}"
+    # v10.12.7: query MUST be lowercase — the API 302-redirects mixed-case
+    # to a broken https://_/ URL; lowercase avoids the redirect entirely.
+    url = (f"{_SEARCH_BASE}/query-{urllib.parse.quote_plus(q.lower())}"
            f"/sublanguageid-{languages}")
     r = await _get(url, deadline)
     if r is None or r.status_code != 200:

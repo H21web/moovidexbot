@@ -1,17 +1,19 @@
-Moovidex v10.12.6 — full tree (2026-10-07)
+Moovidex v10.12.7 — full tree (2026-10-07)
 ==========================================
 
-Subtitle JSON hardening (v10.12.6):
-- Bad/non-JSON proxy responses no longer crash the search — logged
-  with a body preview (first 200 chars) so the real cause is visible
-  in the next deploy's logs, graceful [] return.
+Subtitle breakthrough (v10.12.7) — NO API KEY NEEDED:
+- Root cause found: rest.opensubtitles.org 302-redirects mixed-case
+  queries to a BROKEN https://_/ URL. Lowercasing the query avoids
+  the redirect entirely -> HTTP 200 + valid JSON. Tested live.
+- Keyless subtitles work again, no 5/day limit, no worker needed
+  (worker still works as fallback via SUBS_PROXY_URL).
 
 Also inside:
+- v10.12.6: subtitle JSON hardening + body preview log.
 - v10.12.5: direct JustWatch GraphQL primary, wrapper fallback.
 - v10.12.4: robust subtitles — 18s hard budget, 5-min cache.
-- v10.12.3: SUBS_PROXY_URL (own Cloudflare Worker, keyless).
 - v10.12.1: self-search loop fix, /debug exclusion fix.
 - /debug admin command, DB keepalive, sslmode fix.
 
 DEPLOY: replace repo contents (keep .git + env vars), push, redeploy.
-No DB migration.
+No DB migration. No new env vars needed.
