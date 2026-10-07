@@ -539,6 +539,9 @@ async def _fill_meta(client: Client, message: Message, token: str,
 async def _on_text(client: Client, message: Message):
     if not message.text or message.text.startswith("/"):
         return
+    # v10.12.1: loop guard — never act on the bot's own messages.
+    if message.outgoing or (message.from_user and message.from_user.is_bot):
+        return
     user = await track_user(message)
     if user and user.is_banned:
         return
@@ -599,13 +602,16 @@ async def _handle_text_query(client: Client, message: Message,
 def register(bot: Client) -> None:
     # groups + private, but not channels and not commands.
     # v10.2: every real command is excluded so _on_text never double-fires.
+    # v10.12.1: ~filters.bot — never process the bot's own messages
+    # (the "🔍 Searching…" status used to retrigger searches in a loop).
     bot.on_message(
-        filters.text & ~filters.command(["start", "help", "trending",
+        filters.text & ~filters.bot & ~filters.command(["start", "help",
+                                         "trending",
                                          "request", "index", "stats",
                                          "broadcast", "ban", "unban", "warn",
                                          "users", "settings", "requests",
                                          "connect", "groups", "cancel",
                                          "saved", "mystats", "admin",
-                                         "deltimer", "dbcheck"])
+                                         "deltimer", "dbcheck", "debug"])
         & ~filters.channel
     )(_on_text)
