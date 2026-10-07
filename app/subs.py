@@ -32,10 +32,27 @@ _UA = {"X-User-Agent": "MoovidexBot/1.0"}
 # (Cloudflare/datacenter-IP block). The request then egresses from the
 # proxy's IP instead of the host's blocked IP.
 _CORS_PROXIES = [
-    "https://corsproxy.io/?url=",
     "https://api.allorigins.win/raw?url=",
-    "https://api.codetabs.com/v1/proxy?quest=",
+    "https://api.cors.lol/?url=",
 ]
+
+
+def _custom_proxy() -> str:
+    """User's own CORS proxy (e.g. a free Cloudflare Worker).
+
+    Set SUBS_PROXY_URL=https://xxx.workers.dev — the worker must accept
+    ?url=<encoded-target> and return the target's response body.
+    """
+    return (os.environ.get("SUBS_PROXY_URL") or "").strip().rstrip("/")
+
+# Browser-like headers — sometimes the 403 is header-based, not IP-based.
+_BROWSER_UA = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
+    "Accept": "application/json",
+    "X-User-Agent": "MoovidexBot/1.0",
+}
 
 # Official API (fallback when OPENSUBTITLES_API_KEY is set — reliable,
 # the keyless endpoint is Cloudflare-flaky from datacenter IPs).
@@ -46,16 +63,45 @@ _name_cache: dict[str, str] = {}
 
 
 async def _get(hc: httpx.AsyncClient, url: str) -> httpx.Response:
-    """GET with CORS-proxy retry when OpenSubtitles 403s the host IP."""
+    """GET with fallbacks when OpenSubtitles 403s the host.
+
+    Order: direct -> browser headers -> CORS proxies (short timeout).
+    """
     r = await hc.get(url, headers=_UA)
     if r.status_code != 403:
         return r
-    log.warning("OpenSubtitles 403 for %s — retrying via CORS proxy",
+    log.warning("OpenSubtitles 403 for %s — trying browser headers",
                 url[:70])
+    # 1. Browser-like headers (the block is sometimes header-based).
+    try:
+        br = await hc.get(url, headers=_BROWSER_UA)
+        if br.status_code == 200:
+            log.info("OpenSubtitles OK with browser headers")
+            return br
+    except Exception as exc:  # noqa: BLE001
+        log.warning("browser-header retry failed: %s", exc)
+    # 2. User's own proxy (Cloudflare Worker etc.) — most reliable.
+    custom = _custom_proxy()
+    if custom:
+        try:
+            async with httpx.AsyncClient(timeout=15) as phc:
+                pr = await phc.get(
+                    custom + "/?url=" + urllib.parse.quote(url, safe=""),
+                    headers=_BROWSER_UA)
+            if pr.status_code == 200:
+                log.info("OpenSubtitles OK via custom proxy")
+                return pr
+            log.warning("custom proxy -> HTTP %d", pr.status_code)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("custom proxy failed: %s", exc)
+    # 3. Public CORS proxies (each with a short timeout — don't hang).
+    log.warning("trying CORS proxies for %s", url[:70])
     for proxy in _CORS_PROXIES:
         try:
-            pr = await hc.get(proxy + urllib.parse.quote(url, safe=""),
-                              headers=_UA)
+            async with httpx.AsyncClient(timeout=12) as phc:
+                pr = await phc.get(
+                    proxy + urllib.parse.quote(url, safe=""),
+                    headers=_BROWSER_UA)
         except Exception as exc:  # noqa: BLE001
             log.warning("CORS proxy %s failed: %s", proxy, exc)
             continue
@@ -72,6 +118,7 @@ def _clean_query(file_name: str) -> str:
     Keeps it deliberately simple — the API does fulltext matching.
     """
     s = re.sub(r"[._]+", " ", file_name or "")
+    s = re.sub(r"[()\[\]]", " ", s)  # v10.12.2: drop parens ("Title (2025")
     s = re.sub(r"(?i)\b(s\d{1,2}e\d{1,2}|season\s*\d+|episode\s*\d+)\b.*$", "", s)
     s = re.sub(r"(?i)\b(2160p|1080p|720p|480p|4k|uhd|hd|web-?dl|webrip|"
                r"bluray|brrip|bdrip|dvdrip|hdtv|x264|x265|hevc|10bit|"

@@ -1,26 +1,20 @@
-Moovidex v10.12.1 — full tree (2026-10-07)
+Moovidex v10.12.3 — full tree (2026-10-07)
 ==========================================
 
-CRITICAL FIX (the "bot very slow" + "searching continuously" bug):
-- The bot was processing its OWN "Searching..." status messages as new
-  search queries -> infinite self-search loop -> self-DDoS. Fixed with
-  ~filters.bot on the text handler + an outgoing/is_bot guard.
-- /debug was swallowed by the search handler (not in the command
-  exclusion list) -> added "debug" to exclusions. /debug works now.
+Keyless subtitle proxy (v10.12.3):
+- New env var SUBS_PROXY_URL — your own CORS proxy. Recommended: the
+  free Cloudflare Worker in subs-proxy-worker.js (paste into
+  dash.cloudflare.com -> Workers & Pages -> Create Worker -> Deploy).
+  Then set SUBS_PROXY_URL=https://<name>.<you>.workers.dev and redeploy.
+- Subtitle fetch order (no API key needed):
+  direct -> browser headers -> YOUR worker -> public proxies
+  -> official API (only if OPENSUBTITLES_API_KEY set).
 
-Also inside (from v10.12.0):
-- Subtitles: OpenSubtitles with automatic CORS-proxy retry on HTTP 403
-  (datacenter IP block bypass). OPENSUBTITLES_API_KEY optional fallback.
-- /debug admin command: server + DB + latency + config + verdict.
-- v10.11.9: ?sslmode=require -> asyncpg SSL fix.
-- v10.11.10: in-bot DB keepalive (SELECT 1 every 4 min).
-- Posters/search: JustWatch API kept (imdbinfo rejected — WAF-gated
-  scraper, bad fit for cloud IPs).
+Also inside:
+- v10.12.2: browser-header retry, proxy list fixed (corsproxy.io 401,
+  codetabs 20s hang removed), paren strip in query cleaning.
+- v10.12.1: self-search loop fix, /debug exclusion fix.
+- /debug admin command, DB keepalive, sslmode fix, JustWatch kept.
 
-DEPLOY (Voroa):
-1. Replace repo contents with this tree (keep .env / env vars, keep .git).
-2. DATABASE_URL = LayerBase URL. Push -> redeploy. No DB migration.
-
-AFTER DEPLOY:
-- Send /debug in the bot (admin PM) -> health report.
-- Normal search should reply once, not loop.
+DEPLOY: replace repo contents (keep .git + env vars), push, redeploy.
+No DB migration.
