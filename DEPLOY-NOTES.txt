@@ -1,0 +1,31 @@
+Moovidex v10.12.0 — full tree (2026-10-07)
+==========================================
+
+WHAT'S INSIDE (all previous patches integrated, no patch order to worry about):
+- v10.11.7: subtitle fixes (+ encoding, official OpenSubtitles fallback),
+  Telegram subtitle Web App language picker, OPlayer CC integration
+- v10.11.9: Voroa ?sslmode=require -> asyncpg SSL fix (app/db.py, alembic/env.py)
+- v10.11.10: in-bot DB keepalive (SELECT 1 every 4 min)
+- v10.11.11: /debug admin command (server + DB + latency + config + verdict)
+- Subtitles: OpenSubtitles (SubDL removed) with automatic CORS-proxy retry
+  when OpenSubtitles 403s the host's datacenter IP (Render/Voroa)
+- Posters/search: JustWatch API kept (imdbinfo evaluated and REJECTED —
+  it's an IMDb scraper with AWS WAF bypass, worst fit for Render's IPs)
+
+DEPLOY (Voroa):
+1. Replace repo contents with this tree (keep your .env / env vars).
+2. DATABASE_URL = your LayerBase URL (keep ?sslmode=require if present —
+   the v10.11.9 fix handles it).
+3. Optional: OPENSUBTITLES_API_KEY (free, opensubtitles.com) — only needed
+   as last-resort subtitle fallback.
+4. Push -> redeploy. No new DB migration (alembic upgrade head as usual).
+
+AFTER DEPLOY:
+- /debug in the bot (admin PM) -> full health report. If "distinct client
+  IPs > 1", another bot instance is still running somewhere — stop it.
+- If the bot was slow because of a duplicate instance, delete/suspend the
+  old Render service.
+
+NOT live-tested (offline verified only): /debug output, CORS-proxy
+subtitle retry, keepalive task. Everything compiles; subtitle query
+cleaning unit-checked.

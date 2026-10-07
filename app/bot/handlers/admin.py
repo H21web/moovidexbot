@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as _time
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters
@@ -710,6 +711,166 @@ async def _users(client: Client, message: Message):
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+_DEBUG_STARTED_AT = _time.time()
+
+
+def _debug_server_lines() -> list:
+    import os
+    import platform
+    import sys
+    import time as _time
+    lines = []
+    up = int(_time.time() - _DEBUG_STARTED_AT)
+    d, up = divmod(up, 86400)
+    h, up = divmod(up, 3600)
+    m, s = divmod(up, 60)
+    uptime = (f"{d}d " if d else "") + f"{h:02d}:{m:02d}:{s:02d}"
+    lines.append(f"⏱ uptime: <b>{uptime}</b>")
+    lines.append(f"🐍 python: <code>{platform.python_version()}</code> "
+                 f"({platform.system()} {platform.machine()})")
+    # RSS memory (Linux)
+    try:
+        with open("/proc/self/status") as f:
+            for ln in f:
+                if ln.startswith("VmRSS:"):
+                    rss = int(ln.split()[1]) // 1024
+                    lines.append(f"🧠 memory RSS: <b>{rss} MB</b>")
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        la1, la5, la15 = os.getloadavg()
+        lines.append(f"📊 load avg: <code>{la1:.2f} {la5:.2f} {la15:.2f}</code>")
+    except Exception:  # noqa: BLE001
+        pass
+    # host platform detection (values never shown, only which matched)
+    import os as _os
+    host = "unknown"
+    if _os.environ.get("RENDER"):
+        host = "Render"
+    elif _os.environ.get("VOROA") or _os.environ.get("VOROA_APP_NAME"):
+        host = "Voroa"
+    lines.append(f"🏠 host: <b>{host}</b>")
+    return lines
+
+
+async def _debug_db_lines() -> list:
+    import time as _time
+    from sqlalchemy import text as sa_text
+    from app.db import get_engine
+
+    lines = []
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            t0 = _time.perf_counter()
+            await s.execute(sa_text("SELECT 1"))
+            ping_ms = (_time.perf_counter() - t0) * 1000
+        lines.append(f"📡 ping (SELECT 1): <b>{ping_ms:.0f} ms</b>")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"📡 ping: ❌ {exc}")
+        return lines
+    try:
+        async with factory() as s:
+            ver = (await s.execute(sa_text("SHOW server_version"))).scalar()
+            lines.append(f"🐘 postgres: <code>{ver}</code>")
+            size = (await s.execute(sa_text(
+                "SELECT pg_size_pretty(pg_database_size("
+                "current_database()))"))).scalar()
+            n_files = (await s.execute(
+                sa_text("SELECT count(*) FROM files"))).scalar()
+            lines.append(f"💾 db size: <b>{size}</b> | "
+                         f"files: <b>{n_files:,}</b>")
+            idx = (await s.execute(sa_text(
+                "SELECT count(*) FROM pg_indexes "
+                "WHERE schemaname='public' AND tablename='files'"))).scalar()
+            trgm = (await s.execute(sa_text(
+                "SELECT count(*) FROM pg_indexes "
+                "WHERE tablename='files' "
+                "AND indexdef LIKE '%gin_trgm_ops%'"))).scalar()
+            lines.append(f"🗂 files indexes: <b>{idx}</b> "
+                         f"(trigram: <b>{trgm}</b>/3)")
+            conns = (await s.execute(sa_text(
+                "SELECT count(*), "
+                "count(*) FILTER (WHERE state='active') "
+                "FROM pg_stat_activity "
+                "WHERE datname=current_database()"))).first()
+            lines.append(f"🔌 db connections: <b>{conns[1]}</b> active / "
+                         f"<b>{conns[0]}</b> total")
+            # distinct client IPs talking to this DB (multi-instance check)
+            ips = (await s.execute(sa_text(
+                "SELECT count(DISTINCT client_addr) FROM pg_stat_activity "
+                "WHERE datname=current_database() "
+                "AND client_addr IS NOT NULL"))).scalar()
+            lines.append(f"🌐 distinct client IPs: <b>{ips}</b>"
+                         + (" ⚠️ >1 = another instance may be connected!"
+                            if (ips or 0) > 1 else ""))
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"🗄 db info: ❌ {exc}")
+    # pool stats
+    try:
+        engine = get_engine(settings.DATABASE_URL)
+        pool = engine.pool
+        lines.append(f"🏊 pool: <b>{pool.checkedout()}</b> checked out / "
+                     f"<b>{pool.size()}</b> size")
+    except Exception:  # noqa: BLE001
+        pass
+    return lines
+
+
+def _debug_config_lines() -> list:
+    import os as _os
+    lines = []
+    # only SET/missing — never values
+    checks = [
+        ("BOT_TOKEN", bool(settings.BOT_TOKEN)),
+        ("TG_API_ID/HASH", bool(settings.TG_API_ID and settings.TG_API_HASH)),
+        ("DATABASE_URL", bool(settings.DATABASE_URL)),
+        ("WEB_SECRET", bool(settings.WEB_SECRET and
+                             settings.WEB_SECRET != "change-me")),
+        ("OPENSUBTITLES_API_KEY", bool(_os.environ.get("OPENSUBTITLES_API_KEY"))),
+        ("GROQ_API_KEYS", bool(settings.GROQ_API_KEYS)),
+    ]
+    bad = [n for n, ok in checks if not ok]
+    lines.append("🔑 env: " + ("✅ all set" if not bad
+                               else f"❌ missing: {', '.join(bad)}"))
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(settings.DATABASE_URL).hostname or "?"
+        # show host only (no user/pass/port)
+        lines.append(f"🗄 db host: <code>{host}</code>")
+    except Exception:  # noqa: BLE001
+        pass
+    if settings.WEB_URL:
+        lines.append(f"🌍 web url: <code>{settings.WEB_URL}</code>")
+    return lines
+
+
+@admin_only
+async def _debug(client: Client, message: Message):
+    """Full debug dump: server, DB, latency, config (admin only)."""
+    import time as _time
+    parts = ["🖥 <b>SERVER</b>"] + _debug_server_lines()
+    # telegram latency
+    try:
+        t0 = _time.perf_counter()
+        me = await client.get_me()
+        tg_ms = (_time.perf_counter() - t0) * 1000
+        parts.append(f"✈️ telegram api: <b>{tg_ms:.0f} ms</b> "
+                     f"(@{me.username})")
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"✈️ telegram api: ❌ {exc}")
+    parts.append("")
+    parts.append("🗄 <b>DATABASE</b>")
+    parts += await _debug_db_lines()
+    parts.append("")
+    parts.append("⚙️ <b>CONFIG</b>")
+    parts += _debug_config_lines()
+    # verdict
+    parts.append("")
+    await message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+
+
 @admin_only
 async def _ban(client: Client, message: Message):
     parts = message.text.split()
@@ -961,6 +1122,7 @@ def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.command("requests"))(_requests)
     bot.on_message(filters.private & filters.command("settings"))(_settings)
     bot.on_message(filters.private & filters.command("dbcheck"))(_dbcheck)
+    bot.on_message(filters.private & filters.command("debug"))(_debug)
     bot.on_callback_query(filters.regex(r"^req(done|rej):"))(_req_action)
     # v10.8.10: button dashboard.
     bot.on_callback_query(filters.regex(r"^adm:"))(_adm_cb)
