@@ -171,7 +171,15 @@ async def _search_keyless(q: str, languages: str,
         log.warning("subtitle search failed for %r (budget exhausted)",
                     q)
         return []
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        # Log a preview so we can see what the proxy actually returned
+        # (empty body, HTML error page, etc.).
+        preview = (r.text or "")[:200].replace("\n", " ")
+        log.warning("subtitle search bad JSON for %r: %s | body: %r",
+                    q, exc, preview)
+        return []
     out = []
     for row in data or []:
         if (row.get("SubFormat") or "").lower() != "srt":
