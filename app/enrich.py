@@ -110,14 +110,112 @@ async def enrich_title(keywords: str, year: int | None = None,
 
 
 
-# --- JustWatch title API (v10.8.5) --------------------------------------------
-# https://imdb.iamidiotareyoutoo.com/justwatch?q=<query>&L=en_IN
-# Clean structured titles (no scraping): title, year, type (MOVIE/SHOW),
-# posters. Used BEFORE the web-search API and Groq — free and fast.
-# Note: this API does NOT fuzzy-match typos ("kerma" returns unrelated
-# titles), so results are sanity-checked against the query; the
-# web-search stage stays as the typo-tolerant fallback.
-_JW_BASE = "https://imdb.iamidiotareyoutoo.com/justwatch"
+# --- Direct JustWatch GraphQL (v10.12.5, primary) -------------------------
+# simple-justwatch-python-api hits apis.justwatch.com directly — no
+# middleman wrapper. Sync library, so calls go through to_thread.
+# Falls back to the iamidiotareyoutoo wrapper on any failure.
+def _jw_direct_sync(query: str, limit: int) -> list[dict]:
+    from simplejustwatchapi.justwatch import search as jw_search
+    entries = jw_search(query[:100], country="IN", language="en",
+                        count=min(max(limit, 3), 8))
+    out: list[dict] = []
+    for e in entries or []:
+        title = (e.title or "").strip()
+        if not title or len(title) > 120:
+            continue
+        typ = "series" if (e.object_type or "").upper() == "SHOW" else "movie"
+        backdrops = list(e.backdrops or [])
+        out.append({
+            "title": title,
+            "year": e.release_year,
+            "type": typ,
+            "reason": "justwatch-direct",
+            "imdb_id": (e.imdb_id or "").strip() or None,
+            "tmdb_id": getattr(e, "tmdb_id", None),
+            "backdrop": backdrops[-1] if backdrops else None,
+            "poster": e.poster,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _justwatch_direct_titles(query: str, limit: int) -> list[dict]:
+    """Title candidates via direct JustWatch GraphQL. Never raises."""
+    import asyncio as _aio
+    try:
+        out = await _aio.to_thread(_jw_direct_sync, query, limit)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("justwatch direct failed: %s", exc)
+        return []
+    # same sanity check as the wrapper path
+    sane = [it for it in out if _sane_title(query, it["title"])]
+    if sane:
+        log.info("justwatch-direct candidates %r -> %r", query[:60],
+                 [t["title"][:40] for t in sane])
+    return sane
+
+
+def _sane_title(query: str, title: str) -> bool:
+    """Normalized containment check (shared by both JustWatch paths)."""
+    nq = _norm_alnum(query)
+    nt = _norm_alnum(title)
+    return bool(nq and nt and (nq in nt or nt in nq))
+
+
+async def _justwatch_wrapper_titles(query: str, limit: int) -> list[dict]:
+    """Title candidates from the iamidiotareyoutoo JustWatch wrapper.
+
+    Fallback when the direct GraphQL path fails. Never raises.
+    """
+    # https://imdb.iamidiotareyoutoo.com/justwatch?q=<query>&L=en_IN
+    _JW_BASE = "https://imdb.iamidiotareyoutoo.com/justwatch"
+    q = (query or "").strip()
+    try:
+        r = await _get_client().get(_JW_BASE,
+                                    params={"q": q[:100], "L": "en_IN"})
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("justwatch wrapper failed: %s", exc)
+        return []
+    if not data.get("ok"):
+        return []
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in (data.get("description") or []):
+        title = (item.get("title") or "").strip()
+        if not title or len(title) > 120:
+            continue
+        # Sanity: query and title must contain one another once
+        # normalized ("spiderman" in "theamazingspiderman"). The API
+        # doesn't fuzzy-match, so junk like "kerma" -> "Hum Dil De
+        # Chuke Sanam" is rejected here.
+        if not _sane_title(q, title):
+            continue
+        try:
+            year = int(item.get("year")) if item.get("year") else None
+        except (TypeError, ValueError):
+            year = None
+        typ = ("series" if (item.get("type") or "").upper() == "SHOW"
+               else "movie")
+        key = (title.lower(), typ)
+        if key in seen:
+            continue
+        seen.add(key)
+        photos = item.get("photo_url") or []
+        drops = item.get("backdrops") or []
+        out.append({"title": title, "year": year, "type": typ,
+                    "reason": "justwatch",
+                    "imdb_id": (item.get("imdbId") or "").strip() or None,
+                    "backdrop": drops[-1] if drops else None,
+                    "poster": photos[0] if photos else None})
+        if len(out) >= limit:
+            break
+    if out:
+        log.info("justwatch-wrapper candidates %r -> %r", q[:60],
+                 [t["title"][:40] for t in out])
+    return out
 
 
 def _norm_alnum(text: str) -> str:
@@ -148,7 +246,10 @@ def _jw_cache_put(q: str, items: list[dict]) -> None:
 
 
 async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
-    """Title candidates from the JustWatch API.
+    """Title candidates from JustWatch.
+
+    v10.12.5: direct GraphQL (simple-justwatch-python-api) first,
+    iamidiotareyoutoo wrapper as fallback.
 
     Returns ``[{title, year, type, imdb_id, backdrop, poster}]`` —
     type is ``"movie"``/``"series"``; ``backdrop``/``poster`` are
@@ -164,51 +265,8 @@ async def justwatch_titles(query: str, limit: int = 5) -> list[dict]:
     if cached is not None:
         log.debug("justwatch cache hit for %r", q[:50])
         return cached[:limit]
-    try:
-        r = await _get_client().get(_JW_BASE,
-                                    params={"q": q[:100], "L": "en_IN"})
-        r.raise_for_status()
-        data = r.json() or {}
-    except Exception as exc:  # noqa: BLE001
-        log.warning("justwatch api failed: %s", exc)
-        return []
-    if not data.get("ok"):
-        return []
-    nq = _norm_alnum(q)
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for item in (data.get("description") or []):
-        title = (item.get("title") or "").strip()
-        if not title or len(title) > 120:
-            continue
-        nt = _norm_alnum(title)
-        # Sanity: query and title must contain one another once
-        # normalized ("spiderman" in "theamazingspiderman"). The API
-        # doesn't fuzzy-match, so junk like "kerma" -> "Hum Dil De
-        # Chuke Sanam" is rejected here.
-        if not nq or not nt or (nq not in nt and nt not in nq):
-            continue
-        try:
-            year = int(item.get("year")) if item.get("year") else None
-        except (TypeError, ValueError):
-            year = None
-        typ = ("series" if (item.get("type") or "").upper() == "SHOW"
-               else "movie")
-        key = (title.lower(), typ)
-        if key in seen:
-            continue
-        seen.add(key)
-        photos = item.get("photo_url") or []
-        drops = item.get("backdrops") or []
-        out.append({"title": title, "year": year, "type": typ,
-                    "reason": "justwatch",
-                    "imdb_id": (item.get("imdbId") or "").strip() or None,
-                    "backdrop": drops[-1] if drops else None,
-                    "poster": photos[0] if photos else None})
-        if len(out) >= limit:
-            break
-    if out:
-        log.info("justwatch candidates %r -> %r", q[:60],
-                 [t["title"][:40] for t in out])
+    out = await _justwatch_direct_titles(q, limit)
+    if not out:
+        out = await _justwatch_wrapper_titles(q, limit)
     _jw_cache_put(q, out)
-    return out
+    return out[:limit]

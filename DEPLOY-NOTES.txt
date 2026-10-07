@@ -1,20 +1,20 @@
-Moovidex v10.12.3 — full tree (2026-10-07)
+Moovidex v10.12.5 — full tree (2026-10-07)
 ==========================================
 
-Keyless subtitle proxy (v10.12.3):
-- New env var SUBS_PROXY_URL — your own CORS proxy. Recommended: the
-  free Cloudflare Worker in subs-proxy-worker.js (paste into
-  dash.cloudflare.com -> Workers & Pages -> Create Worker -> Deploy).
-  Then set SUBS_PROXY_URL=https://<name>.<you>.workers.dev and redeploy.
-- Subtitle fetch order (no API key needed):
-  direct -> browser headers -> YOUR worker -> public proxies
-  -> official API (only if OPENSUBTITLES_API_KEY set).
+JustWatch direct (v10.12.5):
+- NEW: simple-justwatch-python-api hits apis.justwatch.com GraphQL
+  DIRECTLY (no middleman). Primary for poster/search title lookup.
+- Old iamidiotareyoutoo wrapper kept as automatic fallback.
+- Richer data per call: poster + backdrops + tmdb_id + scores.
+- New dep: simple-justwatch-python-api>=1.4.0 (in requirements.txt).
 
 Also inside:
-- v10.12.2: browser-header retry, proxy list fixed (corsproxy.io 401,
-  codetabs 20s hang removed), paren strip in query cleaning.
+- v10.12.4: robust subtitles — 18s hard budget, 5-min cache, never
+  stalls the bot; order: direct -> browser headers -> your Worker
+  (SUBS_PROXY_URL) -> public proxies -> official API.
+- v10.12.3: SUBS_PROXY_URL (own Cloudflare Worker, keyless).
 - v10.12.1: self-search loop fix, /debug exclusion fix.
-- /debug admin command, DB keepalive, sslmode fix, JustWatch kept.
+- /debug admin command, DB keepalive, sslmode fix.
 
 DEPLOY: replace repo contents (keep .git + env vars), push, redeploy.
 No DB migration.
