@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # --- Optional integrations ---
     TMDB_API_KEY: str = ""
     OPENSUBTITLES_API_KEY: str = ""  # v10.14: official subtitle API key
+    # v10.15.2: free-user login — anonymous API-key requests get
+    # ~5 downloads/day per IP; logging in raises it to the account
+    # quota (~200/day). Create a free account at opensubtitles.com.
+    OPENSUBTITLES_USERNAME: str = ""
+    OPENSUBTITLES_PASSWORD: str = ""
     REQUEST_CHANNEL: str = ""      # where /request posts go (@username or id)
     LOG_CHANNEL: str = ""          # admin log channel (@username or id)
     UPDATE_CHANNEL_ID: int = 0    # v10.15: new-release announcements
