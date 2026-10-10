@@ -251,7 +251,16 @@ async def _panel_text(client: Client, g: Group) -> str:
     un = await _bot_username(client)
     start_link = (f"\n🔗 Start link: <code>https://t.me/{un}"
                   f"?start=grp_{g.id}</code>" if un else "")
-    ai = bool(s.get("ai_mode", True))
+    # v10.14.1: show the EFFECTIVE AI status, not just the toggle —
+    # a small group shows 🔒 instead of a misleading "ON".
+    ai_toggle = bool(s.get("ai_mode", True))
+    if not ai_toggle:
+        ai_txt = "OFF"
+    elif await is_owner_group(g.id) or await group_tier_ok(
+            client, g.id, TIER_3000):
+        ai_txt = "ON"
+    else:
+        ai_txt = "🔒 needs 3000+"
     return (
         f"👪 <b>{ui.esc(g.title or str(g.id))}</b>\n<code>{g.id}</code>\n"
         f"👥 {n:,} members · tier <b>{tier}</b>{start_link}\n\n"
@@ -261,7 +270,7 @@ async def _panel_text(client: Client, g: Group) -> str:
         f"🖼 Poster: <b>{'ON' if s.get('poster', True) else 'OFF'}</b>\n"
         f"💬 Start msg: <b>{'set' if s.get('start_message') else 'off'}</b>\n"
         f"📝 Caption tpl: <b>{'set' if s.get('caption_tpl') else 'off'}</b>\n"
-        f"🤖 AI mode: <b>{'ON' if ai else 'OFF'}</b>\n\n"
+        f"🤖 AI mode: <b>{ai_txt}</b>\n\n"
         f"<i>🛡 Mod: /gban /gunban /gwarn · 📣 /gbroadcast · "
         f"1000+ group admins: /ubroadcast</i>"
     )
