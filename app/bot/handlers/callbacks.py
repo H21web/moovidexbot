@@ -179,6 +179,10 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
     Shared by in-PM delivery, group→PM delivery, and the ``dl_``
     deep-link handler. Returns the sent message.
     """
+    # v10.13.1 sharding: f.id is the LOCAL id on its shard, but web
+    # tokens and download counters need the GLOBAL (shard-packed) id.
+    from app.db_shard import encode_gid
+    gid = encode_gid(getattr(f, "_shard_idx", 0), f.id)
     # send_cached_media (not send_document): send_document rejects
     # non-document file_ids ("Expected DOCUMENT, got VIDEO"), which
     # broke delivery for every video file.
@@ -189,14 +193,14 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
             "file_name": f.file_name, "quality": f.quality,
             "language": f.language, "file_size": f.file_size}),
         parse_mode=ParseMode.HTML,
-        reply_markup=v8_ui.v8_file_kb(f.id, uid),
+        reply_markup=v8_ui.v8_file_kb(gid, uid),
         protect_content=settings.PROTECT_CONTENT,
     )
     asyncio.create_task(log_event(
         "download", user_id=uid, chat_id=sent.chat.id,
-        detail=f"file:{f.id} | {(f.file_name or '')[:100]}"))
+        detail=f"file:{gid} | {(f.file_name or '')[:100]}"))
     # v8.1: per-file download counter (drives "most downloaded = best pick").
-    asyncio.create_task(bump_file_downloads(f.id))
+    asyncio.create_task(bump_file_downloads(gid))
     # v10.2: the user's own /deltimer wins; otherwise the group/global
     # default (no per-group row exists for a user id in PM).
     from app.bot.handlers.deltimer import get_user_del_timer
@@ -221,8 +225,13 @@ async def _get_file(file_db_id: int):
     shard, local_id = decode_gid(file_db_id)
     factory = get_shard_factories()[shard]
     async with factory() as session:
-        return (await session.execute(
+        f = (await session.execute(
             select(File).where(File.id == local_id))).scalar_one_or_none()
+    if f is not None:
+        # v10.13.1: remember the owning shard so _send_file can build
+        # the global id for web tokens / download counters.
+        f._shard_idx = shard
+    return f
 
 
 async def _deliver(client: Client, query):
