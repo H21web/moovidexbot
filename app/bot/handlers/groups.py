@@ -29,22 +29,32 @@ from app import runtime as rt
 
 log = logging.getLogger(__name__)
 
-# uid -> {"action": "fsub"|"welcome", "gid": int, "ts": float}
-# while awaiting a reply. Swept on access: 15-min TTL + size cap.
-_pending: dict[int, dict] = {}
-_PENDING_TTL = 15 * 60
-_PENDING_CAP = 200
-
-
-def _pending_sweep() -> None:
-    """Drop expired pending replies and cap the dict size."""
-    now = time.time()
-    for uid in [u for u, p in _pending.items()
-                if now - p.get("ts", 0) > _PENDING_TTL]:
-        _pending.pop(uid, None)
-    while len(_pending) > _PENDING_CAP:
-        oldest = min(_pending, key=lambda u: _pending[u].get("ts", 0))
-        _pending.pop(oldest, None)
+# v10.14.2: pending group-setting replies are DB-backed
+# (state.gpending_*) — restart-proof. The old in-memory _pending dict
+# silently ate settings on restart / second instance; it is gone.
+_ACTION_LABELS = {
+    "welcome": "Welcome message",
+    "startmsg": "Start message",
+    "caption_tpl": "File caption",
+    "start_btn": "Start button",
+}
+# settings key(s) cleared by "off", and text length limits.
+_ACTION_KEYS = {
+    "welcome": ("welcome",),
+    "startmsg": ("start_message",),
+    "caption_tpl": ("caption_tpl",),
+    "start_btn": ("start_btn_text", "start_btn_url"),
+}
+_ACTION_LIMITS = {
+    "welcome": 1000,
+    "startmsg": 1500,
+    "caption_tpl": 500,
+}
+_ACTION_SAVE_KEY = {
+    "welcome": "welcome",
+    "startmsg": "start_message",
+    "caption_tpl": "caption_tpl",
+}
 
 AD_CHOICES = [("Off", 0), ("5 min", 300), ("15 min", 900),
               ("30 min", 1800), ("1 hour", 3600),
@@ -632,26 +642,31 @@ async def _bot_added(client: Client, message: Message):
 
 
 async def _welcome_new_members(client: Client, message: Message):
-    """v10.14: per-group custom welcome for new human members.
+    """v10.14.2 rewrite: send the group's custom welcome to new humans.
 
-    Reads groups.settings["welcome"]; {name} becomes the member's first
-    name. Skips bots and groups without a welcome set.
+    Reads the group's settings fresh on every join event; never raises.
+    Set via the group panel → 👋 Welcome ("off" clears it).
+    ``{name}`` becomes the new member's first name.
     """
     try:
         g = await _get_group(message.chat.id)
-        welcome = (g.settings or {}).get("welcome") if g else None
-        if not welcome:
-            return
-        for u in message.new_chat_members or []:
-            if u.is_bot:
-                continue
-            text = welcome.replace("{name}", u.first_name or "friend")
-            try:
-                await message.reply_text(text, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
     except Exception as exc:  # noqa: BLE001
-        log.debug("welcome new members failed: %s", exc)
+        log.debug("welcome: group lookup failed: %s", exc)
+        return
+    tmpl = (g.settings or {}).get("welcome") if g else None
+    if not tmpl:
+        return
+    for u in message.new_chat_members or []:
+        if getattr(u, "is_bot", False):
+            continue
+        text = tmpl.replace("{name}", u.first_name or "friend")
+        try:
+            await message.reply_text(text, parse_mode=ParseMode.HTML)
+            log.info("welcome sent in group %s to user %s",
+                     message.chat.id, u.id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("welcome send failed in %s: %s",
+                        message.chat.id, exc)
 
 
 # ---------- /groups (PM) ----------
@@ -733,16 +748,20 @@ async def _ad_set(client: Client, query):
 
 
 async def _ask_reply(client: Client, query, action: str, prompt: str):
+    """v10.14.2 rewrite: arm a group-setting reply prompt.
+
+    The pending state is DB-backed (state.gpending_*) so the setting
+    survives restarts and a briefly-duplicate instance — the old
+    in-memory dict silently lost it in both cases.
+    """
     gid = int(query.data.split(":")[1])
     uid = query.from_user.id
-    _pending_sweep()
-    _pending[uid] = {"action": action, "gid": gid,
-                     "panel_msg_id": query.message.id,
-                     "panel_chat_id": query.message.chat.id,
-                     "ts": time.time()}
+    await state.gpending_set(uid, {
+        "action": action, "gid": gid,
+        "panel_msg_id": query.message.id,
+        "panel_chat_id": query.message.chat.id,
+    })
     # Turn the panel itself into the prompt — no extra message.
-    # v10.14.1: own cancel button — the shared ix_setup_cancel_kb fires
-    # the INDEX setup handler and left the group reply-capture armed.
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ Cancel",
                              callback_data=f"grp:cancel:{gid}")]])
@@ -780,98 +799,82 @@ async def _grp_del_ok(client: Client, query):
 
 
 async def _pending_reply(client: Client, message: Message):
-    """Catch PM replies for group-setting edits."""
-    _pending_sweep()
-    uid = message.from_user.id if message.from_user else None
-    pend = _pending.get(uid)
-    if not pend or not message.text:
-        return
+    """v10.14.2 rewrite: catch PM replies for group-setting edits.
+
+    Pending state is DB-backed (state.gpending_*) — never silently
+    lost to a restart. Every outcome tells the admin exactly what
+    happened, and every save/clear is logged (Render logs prove it).
+    """
     from pyrogram import StopPropagation
 
-    async def _restore_panel():
-        """Edit the panel back to the updated settings (clean UI)."""
-        g = await _get_group(pend["gid"])
-        if not g:
-            return
-        try:
-            # v10.14.1: the panel may live in the group (in-group
-            # /settings) while the reply came in PM — edit it where
-            # it actually is.
-            await client.edit_message_text(
-                pend.get("panel_chat_id") or message.chat.id,
-                pend.get("panel_msg_id"),
-                await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
-                parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+    uid = message.from_user.id if message.from_user else None
+    if not uid or not message.text:
+        return
+    pend = await state.gpending_get(uid)
+    if not pend:
+        return
 
-    if message.text.strip() == "/cancel":
-        _pending.pop(uid, None)
+    gid = pend["gid"]
+    action = pend["action"]
+    label = _ACTION_LABELS.get(action, "Setting")
+
+    async def _done(note: str):
+        """Clear the prompt, restore the panel, confirm to the admin."""
+        await state.gpending_clear(uid)
         try:
-            await message.delete()
+            await message.delete()  # panel shows the new value
         except Exception:
             pass
-        await _restore_panel()
-        raise StopPropagation
-    text = message.text.strip()
-    gid = pend["gid"]
-    if pend["action"] == "welcome":
-        if text.lower() == "off":
-            await _save_group(gid, None,
-                              mutate=lambda s: {k: v for k, v in s.items()
-                                                if k != "welcome"})
-        else:
-            await _save_group(gid, None,
-                              mutate=lambda s: {**s, "welcome": text[:1000]})
-    elif pend["action"] == "startmsg":
-        # v10.14: custom /start message for this group's start link.
-        if text.lower() == "off":
-            await _save_group(gid, None,
-                              mutate=lambda s: {k: v for k, v in s.items()
-                                                if k != "start_message"})
-        else:
-            await _save_group(gid, None,
-                              mutate=lambda s: {**s,
-                                                "start_message": text[:1500]})
-    elif pend["action"] == "caption_tpl":
-        # v10.14: custom file caption. Placeholders: {name} {quality}
-        # {lang} {size}. 500+ members.
-        if text.lower() == "off":
-            await _save_group(gid, None,
-                              mutate=lambda s: {k: v for k, v in s.items()
-                                                if k != "caption_tpl"})
-        else:
-            await _save_group(gid, None,
-                              mutate=lambda s: {**s,
-                                                "caption_tpl": text[:500]})
-    elif pend["action"] == "start_btn":
-        # v10.14: "Button Text | https://…" under the start message.
-        # 1000+ members.
-        if text.lower() == "off":
-            await _save_group(gid, None,
-                              mutate=lambda s: {k: v for k, v in s.items()
-                                                if k not in ("start_btn_text",
-                                                             "start_btn_url")})
-        else:
-            parts = [p.strip() for p in text.split("|", 1)]
-            if len(parts) == 2 and parts[0] and parts[1]:
-                await _save_group(
-                    gid, None,
-                    mutate=lambda s: {**s, "start_btn_text": parts[0][:60],
-                                      "start_btn_url": parts[1][:300]})
-            else:
-                await message.reply_text(
-                    "❌ Send as <code>Button Text | https://…</code>\n"
-                    "Try again, or /cancel to abort.",
+        g = await _get_group(gid)
+        if g:
+            try:
+                await client.edit_message_text(
+                    pend.get("panel_chat_id") or message.chat.id,
+                    pend.get("panel_msg_id"),
+                    await _panel_text(client, g),
+                    reply_markup=await _panel_kb(client, g),
                     parse_mode=ParseMode.HTML)
-                raise StopPropagation
-    _pending.pop(uid, None)
-    try:
-        await message.delete()  # panel shows the new value — no clutter
-    except Exception:
-        pass
-    await _restore_panel()
-    raise StopPropagation
+            except Exception:
+                pass
+        # Explicit confirmation — the admin always knows it saved.
+        try:
+            await message.reply_text(note, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        raise StopPropagation
+
+    text = message.text.strip()
+    if text == "/cancel":
+        await _done("❌ Cancelled.")
+
+    if text.lower() == "off":
+        drop = _ACTION_KEYS[action]
+        await _save_group(
+            gid, None,
+            mutate=lambda s: {k: v for k, v in s.items() if k not in drop})
+        log.info("group %s: %s cleared by %s", gid, action, uid)
+        await _done(f"✅ <b>{label} cleared.</b>")
+
+    if action == "start_btn":
+        # "Button Text | https://…" under the start message.
+        parts = [p.strip() for p in text.split("|", 1)]
+        if not (len(parts) == 2 and parts[0] and parts[1]):
+            await message.reply_text(
+                "❌ Send as <code>Button Text | https://…</code>\n"
+                "Try again, or /cancel to abort.",
+                parse_mode=ParseMode.HTML)
+            raise StopPropagation
+        await _save_group(
+            gid, None,
+            mutate=lambda s: {**s, "start_btn_text": parts[0][:60],
+                              "start_btn_url": parts[1][:300]})
+    else:
+        key = _ACTION_SAVE_KEY[action]
+        limit = _ACTION_LIMITS[action]
+        await _save_group(gid, None,
+                          mutate=lambda s: {**s, key: text[:limit]})
+    log.info("group %s: %s set by %s", gid, action, uid)
+    await _done(f"✅ <b>{label} saved.</b>\n<i>{ui.esc(text[:120])}</i>")
 
 
 def _admin_cb(func):
@@ -962,26 +965,40 @@ async def _grp_ai(client: Client, query):
 
 
 async def _grp_cancel(client: Client, query):
-    """v10.14.1: cancel a pending group-setting reply (❌ Cancel button).
+    """v10.14.2: cancel a pending group-setting reply (❌ Cancel button).
 
-    Previously this button fired the INDEX setup's ixs:cancel handler,
-    which left the group reply-capture armed — every later PM message
-    kept getting swallowed as a setting value.
+    Clears the DB-backed prompt, restores the panel, and tells the
+    admin — the reply-capture is always disarmed.
     """
     uid = query.from_user.id if query.from_user else None
-    pend = _pending.pop(uid, None) if uid else None
+    pend = await state.gpending_get(uid) if uid else None
+    if uid:
+        await state.gpending_clear(uid)
     await query.answer("Cancelled.")
-    if pend and pend.get("gid"):
-        g = await _get_group(pend["gid"])
-        if g:
-            try:
-                await query.message.edit_text(
-                    await _panel_text(client, g),
-                    reply_markup=await _panel_kb(client, g),
-                    parse_mode=ParseMode.HTML)
-                return
-            except Exception:
-                pass
+    gid = pend.get("gid") if pend else None
+    if gid is None:
+        try:
+            gid = int((query.data or "").split(":")[1])
+        except (ValueError, IndexError):
+            gid = None
+    if gid:
+        g = await _get_group(gid)
+    else:
+        g = None
+    if g:
+        try:
+            chat_id = (pend.get("panel_chat_id")
+                       if pend else query.message.chat.id)
+            msg_id = (pend.get("panel_msg_id")
+                      if pend else query.message.id)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                await _panel_text(client, g),
+                reply_markup=await _panel_kb(client, g),
+                parse_mode=ParseMode.HTML)
+            return
+        except Exception:
+            pass
     try:
         await query.message.edit_text("❌ Cancelled.")
     except Exception:

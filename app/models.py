@@ -234,6 +234,25 @@ class IndexSession(Base):
     )
 
 
+class GroupPrompt(Base):
+    """Pending group-setting reply — survives bot restarts.
+
+    v10.14.2: the group panel's "reply in PM" flow used a pure
+    in-memory dict, so a restart (or a second instance briefly alive)
+    between the button tap and the reply silently ate the setting.
+    Memory is the L1 cache, this table is the source of truth —
+    same pattern as ``IndexSession``.
+    """
+
+    __tablename__ = "group_prompts"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    data: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class UserPref(Base):
     """Per-user personalization profile (v6 super update).
 

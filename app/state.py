@@ -186,6 +186,103 @@ async def pending_clear(user_id: int) -> None:
         log.debug("pending_clear failed: %s", exc)
 
 
+# --- pending group-setting replies: admin user id -> dict ---
+# {"action": "welcome" | "startmsg" | "start_btn" | "caption_tpl" | ...,
+#  "gid": int, "panel_chat_id": int, "panel_msg_id": int}
+#
+# v10.14.2: the group panel's "reply in PM" flow used a pure in-memory
+# dict, so a restart (or a second instance briefly alive) between the
+# button tap and the admin's reply silently ate the setting. The
+# ``group_prompts`` table is the source of truth; memory is the L1
+# cache — same pattern as the /index setup sessions above.
+_gpending: dict[int, dict] = {}
+_gpending_ts: dict[int, float] = {}
+GPENDING_TTL = 900
+
+
+async def _gpending_db_get(user_id: int):
+    from sqlalchemy import select
+
+    from app.config import settings
+    from app.db import get_session_factory
+    from app.models import GroupPrompt
+
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        return (await s.execute(
+            select(GroupPrompt).where(GroupPrompt.user_id == user_id)
+        )).scalar_one_or_none()
+
+
+async def gpending_get(user_id: int) -> dict | None:
+    data = _gpending.get(user_id)
+    if data is not None:
+        if time.time() - _gpending_ts.get(user_id, 0.0) < GPENDING_TTL:
+            return data
+        await gpending_clear(user_id)
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        row = await _gpending_db_get(user_id)
+        if row is None:
+            return None
+        updated = row.updated_at
+        if updated is not None:
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - updated).total_seconds()
+            if age > GPENDING_TTL:
+                await gpending_clear(user_id)
+                return None
+        data = dict(row.data or {})
+        _gpending[user_id] = data
+        _gpending_ts[user_id] = time.time()
+        return data
+    except Exception as exc:
+        log.debug("gpending_get failed: %s", exc)
+        return None
+
+
+async def gpending_set(user_id: int, data: dict) -> None:
+    _gpending[user_id] = data
+    _gpending_ts[user_id] = time.time()
+    try:
+        from app.config import settings
+        from app.db import get_session_factory
+        from app.models import GroupPrompt
+
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            row = await s.get(GroupPrompt, user_id)
+            payload = dict(data)
+            if row is None:
+                s.add(GroupPrompt(user_id=user_id, data=payload))
+            else:
+                row.data = payload
+            await s.commit()
+    except Exception as exc:
+        log.warning("gpending_set DB persist failed: %s", exc)
+
+
+async def gpending_clear(user_id: int) -> None:
+    _gpending.pop(user_id, None)
+    _gpending_ts.pop(user_id, None)
+    try:
+        from app.config import settings
+        from app.db import get_session_factory
+        from app.models import GroupPrompt
+
+        factory = get_session_factory(settings.DATABASE_URL)
+        async with factory() as s:
+            row = await s.get(GroupPrompt, user_id)
+            if row is not None:
+                await s.delete(row)
+                await s.commit()
+    except Exception as exc:
+        log.debug("gpending_clear failed: %s", exc)
+
+
 # --- pending deep-link deliveries: user id -> file db id ---
 # Set when /start dl_<id> hits the force-sub wall; consumed by
 # fsub_retry after the user joins. Short-lived; memory-only is fine.

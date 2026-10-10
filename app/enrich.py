@@ -101,6 +101,10 @@ async def enrich_title(keywords: str, year: int | None = None,
             meta.setdefault("backdrop_url", jw.get("backdrop"))
             if not meta.get("poster_url"):
                 meta["poster_url"] = jw.get("poster")
+            # v10.14.2: OTT "where to watch" providers for the card.
+            ott = _format_ott(jw.get("offers"))
+            if ott:
+                meta["ott"] = ott
         _cache[cache_key] = (time.time(), meta)
     # P3#17: evict the oldest ~100 instead of nuking the whole cache.
     if len(_cache) > 500:
@@ -114,6 +118,42 @@ async def enrich_title(keywords: str, year: int | None = None,
 # simple-justwatch-python-api hits apis.justwatch.com directly — no
 # middleman wrapper. Sync library, so calls go through to_thread.
 # Falls back to the iamidiotareyoutoo wrapper on any failure.
+def _extract_offers(entry) -> list[dict]:
+    """v10.14.2: pull OTT offers from a simplejustwatchapi entry.
+
+    Fully defensive — the library isn't installed in every env and its
+    shape may drift. Returns [{provider, type}] with type like
+    "FLATRATE" (subscription), "RENT", "BUY".
+    """
+    out: list[dict] = []
+    try:
+        offers = getattr(entry, "offers", None) or []
+        for o in offers:
+            pkg = getattr(o, "package", None)
+            name = (getattr(pkg, "name", "") or "").strip()
+            mtype = (getattr(o, "monetization_type", "") or "").upper()
+            if name:
+                out.append({"provider": name, "type": mtype})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _format_ott(offers: list[dict] | None) -> list[str]:
+    """v10.14.2: deduped provider names, subscriptions first."""
+    flat: list[str] = []
+    other: list[str] = []
+    seen: set[str] = set()
+    for o in offers or []:
+        name = (o.get("provider") or "").strip()
+        key = name.lower()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        (flat if o.get("type") == "FLATRATE" else other).append(name)
+    return (flat + other)[:8]
+
+
 def _jw_direct_sync(query: str, limit: int) -> list[dict]:
     from simplejustwatchapi.justwatch import search as jw_search
     entries = jw_search(query[:100], country="IN", language="en",
@@ -134,6 +174,7 @@ def _jw_direct_sync(query: str, limit: int) -> list[dict]:
             "tmdb_id": getattr(e, "tmdb_id", None),
             "backdrop": backdrops[-1] if backdrops else None,
             "poster": e.poster,
+            "offers": _extract_offers(e),  # v10.14.2: OTT providers
         })
         if len(out) >= limit:
             break

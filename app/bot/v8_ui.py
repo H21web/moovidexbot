@@ -194,6 +194,10 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
         if meta.get("plot"):
             plot = meta["plot"]
             parts.append(f"<i>{esc(plot[:170] + '…' if len(plot) > 170 else plot)}</i>")
+        # v10.14.2: OTT "where to watch" from JustWatch.
+        ott = meta.get("ott") or []
+        if ott:
+            parts.append(f"📺 <i>Available on: {esc(', '.join(ott[:6]))}</i>")
         parts.append("")
     from app.textutil import clean_display_name
     # v10.14: series — newest season/episode first (idempotent: _build_v8
