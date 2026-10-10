@@ -516,16 +516,10 @@ async def subs_send(token: str, sub_id: str, to: str = ""):
     from app import subs
     to = re.sub(r"[^a-z]", "", (to or "").lower())[:5]
     if to:
-        # Translate via our own endpoint logic.
+        # v10.15.5: translate to bytes directly (the old path read
+        # .body off the Response and handed Pyrogram text).
         try:
-            tr = await subs_translate(sub_id, to)
-            sdata = tr.body
-            # Extract filename from Content-Disposition.
-            cd = tr.headers.get("content-disposition", "")
-            m = re.search(r"filename\*=UTF-8''(.+)", cd)
-            name = m.group(1) if m else f"subtitle.{to}.srt"
-            from urllib.parse import unquote as _uq
-            name = _uq(name)
+            sdata, name = await translate_subtitle_data(sub_id, to)
         except HTTPException as exc:
             return {"ok": False, "error": exc.detail}
         except Exception as exc:  # noqa: BLE001
@@ -575,11 +569,13 @@ async def subs_file(sub_id: str):
 
 
 @router.get("/subs/translate/{sub_id}")
-async def subs_translate(sub_id: str, to: str = "mal"):
-    """Auto-translate a subtitle via Google Translate (free endpoint).
+async def translate_subtitle_data(sub_id: str, to: str = "mal"
+                                ) -> tuple[bytes, str]:
+    """Translate a subtitle's text lines, return (srt_bytes, filename).
 
-    Downloads the .srt, translates the text lines, returns a translated
-    .srt. Best-effort — the unofficial endpoint can rate-limit.
+    v10.15.5: extracted from subs_translate so subs_send can use the
+    bytes directly — reading .body off the Response gave Pyrogram text
+    instead of bytes ("Invalid file" error).
     """
     import httpx as _httpx
     to = re.sub(r"[^a-z]", "", (to or "mal").lower())[:5] or "mal"
@@ -646,11 +642,21 @@ async def subs_translate(sub_id: str, to: str = "mal"):
             out_blocks.append(b)
     out = "\n\n".join(out_blocks) + "\n"
     base = name.rsplit(".", 1)[0]
+    return out.encode("utf-8"), f"{base}.{to}.srt"
+
+
+async def subs_translate(sub_id: str, to: str = "mal"):
+    """Auto-translate a subtitle via Google Translate (free endpoint).
+
+    Downloads the .srt, translates the text lines, returns a translated
+    .srt. Best-effort — the unofficial endpoint can rate-limit.
+    """
+    data, fname = await translate_subtitle_data(sub_id, to)
     return Response(
-        content=out.encode("utf-8"),
+        content=data,
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition":
-                 f"attachment; filename*=UTF-8''{quote(base + '.' + to + '.srt')}"},
+                 f"attachment; filename*=UTF-8''{quote(fname)}"},
     )
 
 
