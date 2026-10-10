@@ -741,10 +741,15 @@ async def _ask_reply(client: Client, query, action: str, prompt: str):
                      "panel_chat_id": query.message.chat.id,
                      "ts": time.time()}
     # Turn the panel itself into the prompt — no extra message.
+    # v10.14.1: own cancel button — the shared ix_setup_cancel_kb fires
+    # the INDEX setup handler and left the group reply-capture armed.
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel",
+                             callback_data=f"grp:cancel:{gid}")]])
     await query.message.edit_text(
         prompt + "\n<i>Reply here in PM. /cancel to abort.</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=ui.ix_setup_cancel_kb())
+        reply_markup=kb)
     await query.answer()
 
 
@@ -856,7 +861,8 @@ async def _pending_reply(client: Client, message: Message):
                                       "start_btn_url": parts[1][:300]})
             else:
                 await message.reply_text(
-                    "❌ Send as <code>Button Text | https://…</code>",
+                    "❌ Send as <code>Button Text | https://…</code>\n"
+                    "Try again, or /cancel to abort.",
                     parse_mode=ParseMode.HTML)
                 raise StopPropagation
     _pending.pop(uid, None)
@@ -955,6 +961,33 @@ async def _grp_ai(client: Client, query):
     await query.answer(f"🤖 AI mode {'ON' if not cur else 'OFF'}")
 
 
+async def _grp_cancel(client: Client, query):
+    """v10.14.1: cancel a pending group-setting reply (❌ Cancel button).
+
+    Previously this button fired the INDEX setup's ixs:cancel handler,
+    which left the group reply-capture armed — every later PM message
+    kept getting swallowed as a setting value.
+    """
+    uid = query.from_user.id if query.from_user else None
+    pend = _pending.pop(uid, None) if uid else None
+    await query.answer("Cancelled.")
+    if pend and pend.get("gid"):
+        g = await _get_group(pend["gid"])
+        if g:
+            try:
+                await query.message.edit_text(
+                    await _panel_text(client, g),
+                    reply_markup=await _panel_kb(client, g),
+                    parse_mode=ParseMode.HTML)
+                return
+            except Exception:
+                pass
+    try:
+        await query.message.edit_text("❌ Cancelled.")
+    except Exception:
+        pass
+
+
 def register(bot: Client) -> None:
     bot.on_message(filters.group & filters.command("connect"))(_connect)
     bot.on_message(filters.group & filters.command("start"))(_group_start)
@@ -993,6 +1026,8 @@ def register(bot: Client) -> None:
         _mgr_cb(_grp_poster))
     bot.on_callback_query(filters.regex(r"^grp:ai:-?\d+$"))(
         _mgr_cb(_grp_ai))
+    bot.on_callback_query(filters.regex(r"^grp:cancel:-?\d+$"))(
+        _mgr_cb(_grp_cancel))
     bot.on_callback_query(filters.regex(r"^grpsmsg:-?\d+$"))(
         _mgr_cb(lambda c, q: _ask_reply(
             c, q, "startmsg",
