@@ -1,6 +1,7 @@
 """v10: watchlist (⭐ Save) + /saved + /mystats."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from pyrogram import Client, filters
@@ -38,14 +39,22 @@ async def _save_cb(client: Client, query) -> None:
         fid = int(query.data.split(":")[1])
     except (ValueError, IndexError):
         return
+    # v10.13 sharding: fid is the global (shard-packed) id — the File
+    # row is fetched from its owning shard; the SavedFile row itself
+    # always lives on shard 0 (stores the global id).
+    from app.db_shard import decode_gid, get_shard_factories
+
+    shard, local_id = decode_gid(fid)
+    file_factory = get_shard_factories()[shard]
     factory = get_session_factory(settings.DATABASE_URL)
     try:
+        async with file_factory() as fs:
+            f = (await fs.execute(
+                select(File).where(File.id == local_id))).scalar_one_or_none()
+        if not f:
+            await query.answer("❌ File not found.", show_alert=True)
+            return
         async with factory() as s:
-            f = (await s.execute(
-                select(File).where(File.id == fid))).scalar_one_or_none()
-            if not f:
-                await query.answer("❌ File not found.", show_alert=True)
-                return
             await s.execute(
                 pg_insert(SavedFile).values(user_id=uid, file_id=fid)
                 .on_conflict_do_nothing(
@@ -92,15 +101,49 @@ async def _unsave_cb(client: Client, query) -> None:
 
 
 async def _saved_rows(uid: int):
+    """(SavedFile, File) pairs for a user, newest first.
+
+    v10.13 sharding: SavedFile rows live on shard 0 and store the
+    *global* file id; File rows are batch-fetched from their owning
+    shards and joined in Python (cross-database JOINs don't exist).
+    """
+    from app.db_shard import decode_gid, get_shard_factories
+
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
-        rows = (await s.execute(
-            select(SavedFile, File)
-            .join(File, File.id == SavedFile.file_id)
+        saved = (await s.execute(
+            select(SavedFile)
             .where(SavedFile.user_id == uid)
             .order_by(SavedFile.created_at.desc())
-            .limit(200))).all()
-        return [(sv, f) for sv, f in rows]
+            .limit(200))).scalars().all()
+
+    # Group wanted files by owning shard for one batched query each.
+    by_shard: dict[int, list[int]] = {}
+    order: list[tuple] = []  # (saved_row, shard, local_id) in saved order
+    for sv in saved:
+        shard, local_id = decode_gid(sv.file_id)
+        by_shard.setdefault(shard, []).append(local_id)
+        order.append((sv, shard, local_id))
+
+    files: dict[tuple[int, int], File] = {}
+    shard_factories = get_shard_factories()
+
+    async def _fetch(shard: int, local_ids: list[int]) -> None:
+        try:
+            async with shard_factories[shard]() as fs:
+                rows = (await fs.execute(
+                    select(File).where(File.id.in_(local_ids))
+                )).scalars().all()
+                for f in rows:
+                    files[(shard, f.id)] = f
+        except Exception:  # noqa: BLE001 - one bad shard ≠ broken list
+            log.warning("saved list: shard #%d fetch failed", shard,
+                        exc_info=True)
+
+    await asyncio.gather(*(_fetch(sh, ids) for sh, ids in by_shard.items()))
+    return [(sv, files[(shard, local_id)])
+            for sv, shard, local_id in order
+            if (shard, local_id) in files]
 
 
 async def _render_saved(message, uid: int, page: int = 0,
@@ -134,10 +177,12 @@ async def _render_saved(message, uid: int, page: int = 0,
         kb_rows = []
         for sv, f in chunk:
             lines.append(_file_line(f))
+            # v10.13 sharding: sv.file_id is the *global* (shard-packed)
+            # id — f.id is only unique within its shard.
             kb_rows.append([
                 InlineKeyboardButton("📥 Get",
-                                     callback_data=f"dl:{f.id}"),
-                InlineKeyboardButton("🗑", callback_data=f"unsave:{f.id}"),
+                                     callback_data=f"dl:{sv.file_id}"),
+                InlineKeyboardButton("🗑", callback_data=f"unsave:{sv.file_id}"),
             ])
         if pages > 1:
             nav = []

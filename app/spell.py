@@ -67,20 +67,37 @@ def _levenshtein(a: str, b: str, cap: int) -> int:
 
 
 async def _title_vocab(session_factory) -> frozenset[str]:
-    """All distinct words appearing in indexed title keys (cached 1h)."""
+    """All distinct words appearing in indexed title keys (cached 1h).
+
+    v10.13 sharding: when called without a factory, the vocab unions
+    the top titles of every shard.
+    """
     global _VOCAB
     now = time.time()
     if now - _VOCAB[0] < _VOCAB_TTL and _VOCAB[1]:
         return _VOCAB[1]
     words: set[str] = set()
     try:
-        async with session_factory() as session:
-            rows = (await session.execute(
-                select(File.title_key).where(File.title_key.isnot(None))
-                # v10.3: bounded — most-downloaded titles first so the
-                # vocab keeps its quality without a full-table scan.
-                .order_by(File.downloads.desc()).limit(25000)
-            )).scalars().all()
+        if session_factory is None:
+            from app.db_shard import fanout
+
+            async def _one(idx: int, session):
+                return (await session.execute(
+                    select(File.title_key).where(File.title_key.isnot(None))
+                    .order_by(File.downloads.desc()).limit(25000)
+                )).scalars().all()
+
+            per_shard = await fanout(_one)
+            rows = [tk for shard_rows in per_shard
+                    for tk in (shard_rows or [])]
+        else:
+            async with session_factory() as session:
+                rows = (await session.execute(
+                    select(File.title_key).where(File.title_key.isnot(None))
+                    # v10.3: bounded — most-downloaded titles first so the
+                    # vocab keeps its quality without a full-table scan.
+                    .order_by(File.downloads.desc()).limit(25000)
+                )).scalars().all()
         for tk in rows:
             if not tk:
                 continue
@@ -192,4 +209,25 @@ async def suggest(session, query: str, limit: int = 3) -> list[str]:
             out.append(title)
         if len(out) >= limit:
             break
+    return out
+
+
+async def suggest_sharded(query: str, limit: int = 3) -> list[str]:
+    """``suggest`` across every shard, merged and deduped by title."""
+    from app.db_shard import fanout
+
+    async def _one(idx: int, session):
+        return await suggest(session, query, limit)
+
+    per_shard = await fanout(_one)
+    seen: set[str] = set()
+    out: list[str] = []
+    for titles in per_shard:
+        for t in titles or []:
+            key = (t or "").lower()
+            if t and key not in seen:
+                seen.add(key)
+                out.append(t)
+            if len(out) >= limit:
+                return out
     return out

@@ -69,16 +69,22 @@ def get_session_factory(database_url: str) -> async_sessionmaker[AsyncSession]:
 
 
 async def bump_file_downloads(file_db_id: int) -> None:
-    """+1 download counter for a file (fire-and-forget safe)."""
-    from app.config import settings  # lazy: avoids import cycles
+    """+1 download counter for a file (fire-and-forget safe).
 
+    v10.13 sharding: ``file_db_id`` is the *global* id (shard-packed);
+    the update is routed to the owning shard. Pre-sharding plain ids
+    decode to shard 0 automatically.
+    """
     try:
-        factory = get_session_factory(settings.DATABASE_URL)
+        from app.db_shard import decode_gid, get_shard_factories
+
+        shard, local_id = decode_gid(file_db_id)
+        factory = get_shard_factories()[shard]
         async with factory() as session:
             await session.execute(
                 text("UPDATE files SET downloads = downloads + 1 "
                      "WHERE id = :id"),
-                {"id": file_db_id},
+                {"id": local_id},
             )
             await session.commit()
     except Exception as exc:  # noqa: BLE001 - counter must never break delivery

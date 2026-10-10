@@ -30,6 +30,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import get_session_factory
+from app.db_shard import encode_gid, fanout
 from app.models import File, SearchLog
 from app.textutil import (
     QUALITY_ORDER,
@@ -60,8 +61,15 @@ _NOISE_WORDS_RE = re.compile(
 )
 
 
-def _item_to_dict(row: File, score: float) -> dict:
-    return {f: getattr(row, f) for f in ITEM_FIELDS} | {"score": float(score or 0)}
+def _item_to_dict(row: File, score: float, shard_idx: int = 0) -> dict:
+    d = {f: getattr(row, f) for f in ITEM_FIELDS} | {
+        "score": float(score or 0)}
+    # v10.13 sharding: downstream code (callbacks, tokens, download
+    # counters) keys files by this id — the *global* id packs the shard
+    # so every consumer works unchanged. Pre-sharding ids (< 100M)
+    # decode back to shard 0 automatically.
+    d["id"] = encode_gid(shard_idx, row.id)
+    return d
 
 
 def _apply_filters(stmt, parsed: dict):
@@ -216,6 +224,52 @@ def _rank_items(query: str, items: list[dict], parsed: dict) -> list[dict]:
     return items
 
 
+async def _search_one_shard(session, q: str, words: list[str],
+                            parsed: dict) -> list[tuple[File, float]]:
+    """Run the 4-stage cascade against one shard's session.
+
+    A failing shard degrades to no hits (never breaks the search).
+    Dedup key is the Telegram ``file_id`` (globally unique); the
+    per-shard ``files.id`` is only unique within its shard.
+    """
+    try:
+        # 1) strict words + hard quality/language filters
+        hits = await _stage_contains(session, words, parsed,
+                                     use_filters=True)
+        seen = {f.file_id for f, _ in hits}
+        # 2) strict words, filters dropped (metadata may be missing)
+        if len(hits) < TRIGRAM_MIN_HITS and (
+            parsed["quality"] or parsed["language"]
+        ):
+            for f, score in await _stage_contains(
+                session, words, parsed, use_filters=False
+            ):
+                if f.file_id not in seen:
+                    hits.append((f, score))
+                    seen.add(f.file_id)
+        # 3) relaxed: two longest words (partial queries still hit)
+        if len(hits) < TRIGRAM_MIN_HITS and len(words) > 2:
+            rwords = sorted(words, key=len, reverse=True)[:2]
+            for f, score in await _stage_contains(
+                session, rwords, parsed, use_filters=False
+            ):
+                if f.file_id not in seen:
+                    hits.append((f, score * 0.8))
+                    seen.add(f.file_id)
+        # 4) trigram typo fallback, unfiltered
+        if len(hits) < TRIGRAM_MIN_HITS:
+            for f, score in await _stage_trigram(
+                session, q, parsed, use_filters=False
+            ):
+                if f.file_id not in seen:
+                    hits.append((f, score * 0.9))
+                    seen.add(f.file_id)
+        return hits
+    except Exception as exc:  # noqa: BLE001 - one bad shard ≠ failed search
+        log.warning("shard search stage failed: %s", exc)
+        return []
+
+
 async def search_files(
     raw_query: str,
     user_id: int | None = None,
@@ -247,43 +301,27 @@ async def search_files(
 
     if items is None:
         items = []
-        factory = get_session_factory(settings.DATABASE_URL)
         try:
-            async with factory() as session:
-                words = _query_words(q)
-                # 1) strict words + hard quality/language filters
-                hits = await _stage_contains(session, words, parsed,
-                                             use_filters=True)
-                seen = {f.id for f, _ in hits}
-                # 2) strict words, filters dropped (metadata may be missing)
-                if len(hits) < TRIGRAM_MIN_HITS and (
-                    parsed["quality"] or parsed["language"]
-                ):
-                    for f, score in await _stage_contains(
-                        session, words, parsed, use_filters=False
-                    ):
-                        if f.id not in seen:
-                            hits.append((f, score))
-                            seen.add(f.id)
-                # 3) relaxed: two longest words (partial queries still hit)
-                if len(hits) < TRIGRAM_MIN_HITS and len(words) > 2:
-                    rwords = sorted(words, key=len, reverse=True)[:2]
-                    for f, score in await _stage_contains(
-                        session, rwords, parsed, use_filters=False
-                    ):
-                        if f.id not in seen:
-                            hits.append((f, score * 0.8))
-                            seen.add(f.id)
-                # 4) trigram typo fallback, unfiltered
-                if len(hits) < TRIGRAM_MIN_HITS:
-                    for f, score in await _stage_trigram(
-                        session, q, parsed, use_filters=False
-                    ):
-                        if f.id not in seen:
-                            hits.append((f, score * 0.9))
-                            seen.add(f.id)
-                items = [_item_to_dict(f, s) for f, s in hits]
-                items = _rank_items(q, items, parsed)[:RESULT_LIMIT]
+            words = _query_words(q)
+            # v10.13 sharding: fan the stage cascade out to every shard
+            # in parallel, then merge. Per-shard hits are capped at
+            # RESULT_LIMIT each; the global re-rank below trims to the
+            # final RESULT_LIMIT.
+            shard_hits = await fanout(
+                lambda idx, session: _search_one_shard(
+                    session, q, words, parsed))
+            merged: dict[str, tuple[int, File, float]] = {}
+            for shard_idx, hits in enumerate(shard_hits):
+                for f, score in hits or []:
+                    # Telegram file_id is globally unique; fall back to a
+                    # shard-qualified key for rows missing one.
+                    key = f.file_id or f"shard:{shard_idx}:{f.id}"
+                    prev = merged.get(key)
+                    if prev is None or score > prev[2]:
+                        merged[key] = (shard_idx, f, score)
+            items = [_item_to_dict(f, s, shard_idx)
+                     for shard_idx, f, s in merged.values()]
+            items = _rank_items(q, items, parsed)[:RESULT_LIMIT]
             # P1#8: cache only on success — a transient DB failure must not
             # poison the hot cache with an empty result for 5 minutes.
             hot_set(cache_key, items)

@@ -55,9 +55,12 @@ def _back_kb() -> InlineKeyboardMarkup:
 async def _home_panel() -> tuple[str, InlineKeyboardMarkup]:
     factory = get_session_factory(settings.DATABASE_URL)
     try:
+        # v10.13 sharding: file count spans all shards; the rest are
+        # shard-0 (primary) tables.
+        from app.db_shard import total_files
+
+        files = await total_files()
         async with factory() as s:
-            files = (await s.execute(
-                select(func.count(File.id)))).scalar() or 0
             users = (await s.execute(
                 select(func.count(User.id)))).scalar() or 0
             open_req = (await s.execute(
@@ -91,10 +94,12 @@ async def _home_panel() -> tuple[str, InlineKeyboardMarkup]:
 
 async def _stats_panel() -> tuple[str, InlineKeyboardMarkup]:
     factory = get_session_factory(settings.DATABASE_URL)
+    # v10.13 sharding: files span all shards; everything else is shard 0.
+    from app.db_shard import total_file_bytes, total_files
+
+    files = await total_files()
+    total_bytes = await total_file_bytes()
     async with factory() as s:
-        files = (await s.execute(select(func.count(File.id)))).scalar() or 0
-        total_bytes = (await s.execute(
-            select(func.coalesce(func.sum(File.file_size), 0)))).scalar() or 0
         users = (await s.execute(select(func.count(User.id)))).scalar() or 0
         groups = (await s.execute(select(func.count(Group.id)))).scalar() or 0
         banned = (await s.execute(
@@ -310,11 +315,15 @@ async def _clean_count(mode: str, param: str) -> tuple[int, str]:
         label = f"posted {param}"
     elif mode == "all":
         label = "ALL files"
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        n = (await s.execute(
+    # v10.13 sharding: count across every shard.
+    from app.db_shard import fanout
+
+    async def _one(idx: int, s) -> int:
+        return (await s.execute(
             select(func.count()).select_from(q.subquery()))).scalar() or 0
-    return n, label
+
+    counts = await fanout(_one)
+    return sum(c or 0 for c in counts), label
 
 
 async def _clean_exec(mode: str, param: str) -> int:
@@ -328,14 +337,19 @@ async def _clean_exec(mode: str, param: str) -> int:
         d_from = datetime.strptime(param.split()[0], "%Y-%m-%d")
         d_to = datetime.strptime(param.split()[1], "%Y-%m-%d")
         q = q.where(File.posted_at >= d_from, File.posted_at <= d_to)
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
+    # v10.13 sharding: delete from every shard.
+    from app.db_shard import fanout
+
+    async def _one(idx: int, s) -> int:
         stmt = sa_delete(File)
         if q.whereclause is not None:
             stmt = stmt.where(q.whereclause)
-        res = await s.execute(stmt)
+        result = await s.execute(stmt)
         await s.commit()
-        return res.rowcount or 0
+        return result.rowcount or 0
+
+    counts = await fanout(_one)
+    return sum(c or 0 for c in counts)
 
 
 def _clean_menu_kb() -> InlineKeyboardMarkup:
@@ -670,9 +684,12 @@ async def _pending_input(client: Client, message: Message) -> None:
 
 @admin_only
 async def _stats(client: Client, message: Message):
+    # v10.13 sharding: file count spans all shards; the rest are shard 0.
+    from app.db_shard import total_files
+
+    files = await total_files()
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
-        files = (await s.execute(select(func.count(File.id)))).scalar() or 0
         users = (await s.execute(select(func.count(User.id)))).scalar() or 0
         groups = (await s.execute(select(func.count(Group.id)))).scalar() or 0
         open_req = (await s.execute(

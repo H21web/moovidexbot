@@ -213,10 +213,16 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
 
 
 async def _get_file(file_db_id: int):
-    factory = get_session_factory(settings.DATABASE_URL)
+    # v10.13 sharding: file_db_id is the global (shard-packed) id —
+    # routed to the owning shard. Pre-sharding plain ids decode to
+    # shard 0 automatically.
+    from app.db_shard import decode_gid, get_shard_factories
+
+    shard, local_id = decode_gid(file_db_id)
+    factory = get_shard_factories()[shard]
     async with factory() as session:
         return (await session.execute(
-            select(File).where(File.id == file_db_id))).scalar_one_or_none()
+            select(File).where(File.id == local_id))).scalar_one_or_none()
 
 
 async def _deliver(client: Client, query):

@@ -141,9 +141,10 @@ async def _trending_cb(client: Client, query):
 
 
 async def _file_count(client: Client, query):
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as session:
-        n = (await session.execute(select(func.count(File.id)))).scalar() or 0
+    # v10.13 sharding: count spans all shards.
+    from app.db_shard import total_files
+
+    n = await total_files()
     await query.answer(f"📦 {n:,} files indexed", show_alert=False)
 
 

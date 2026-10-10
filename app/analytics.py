@@ -126,6 +126,21 @@ def start_prune_task() -> asyncio.Task:
     return _prune_task
 
 
+async def _daily_on(session, table, date_col, days: int,
+                  kind: str | None, since, out: dict) -> None:
+    """Fill ``out`` daily counts using one session."""
+    q = (select(func.date_trunc("day", date_col).label("d"),
+                func.count().label("c"))
+         .where(date_col >= since)
+         .group_by("d"))
+    if kind is not None:
+        q = q.where(table.kind == kind)
+    for day, count in (await session.execute(q)).all():
+        key = day.strftime("%Y-%m-%d")
+        if key in out:
+            out[key] = out.get(key, 0) + int(count)
+
+
 async def _daily(table, date_col, days: int = 30,
                  kind: str | None = None) -> dict[str, int]:
     """{YYYY-MM-DD: count} for the last `days` days (UTC)."""
@@ -135,31 +150,48 @@ async def _daily(table, date_col, days: int = 30,
            for i in range(days)}
     try:
         async with factory() as s:
-            q = (select(func.date_trunc("day", date_col).label("d"),
-                        func.count().label("c"))
-                 .where(date_col >= since)
-                 .group_by("d"))
-            if kind is not None:
-                q = q.where(table.kind == kind)
-            for day, count in (await s.execute(q)).all():
-                key = day.strftime("%Y-%m-%d")
-                if key in out:
-                    out[key] = int(count)
+            await _daily_on(s, table, date_col, days, kind, since, out)
     except Exception as exc:
         log.debug("analytics _daily failed: %s", exc)
+    return out
+
+
+async def _daily_sharded(table, date_col, days: int = 30,
+                         kind: str | None = None) -> dict[str, int]:
+    """``_daily`` summed across every shard (for the sharded tables)."""
+    from app.db_shard import fanout
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    out = {(datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y-%m-%d"): 0
+           for i in range(days)}
+
+    async def _one(idx: int, session):
+        shard_out: dict[str, int] = {}
+        try:
+            await _daily_on(session, table, date_col, days, kind, since,
+                            shard_out)
+        except Exception as exc:
+            log.debug("analytics shard #%d _daily failed: %s", idx, exc)
+        return shard_out
+
+    for part in await fanout(_one):
+        for k, v in (part or {}).items():
+            if k in out:
+                out[k] += v
     return out
 
 
 async def overview(days: int = 30) -> dict:
     """Everything the dashboard homepage needs."""
     # 6 independent daily series -> run concurrently, not sequentially.
+    # v10.13 sharding: new_files spans all shards; the rest are shard 0.
     searches, downloads, starts, new_users, new_files, new_requests = \
         await asyncio.gather(
             _daily(SearchLog, SearchLog.created_at, days),
             _daily(EventLog, EventLog.created_at, days, kind="download"),
             _daily(EventLog, EventLog.created_at, days, kind="start"),
             _daily(User, User.joined_at, days),
-            _daily(File, File.created_at, days),
+            _daily_sharded(File, File.created_at, days),
             _daily(MovieRequest, MovieRequest.created_at, days),
         )
 

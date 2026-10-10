@@ -89,11 +89,19 @@ def extract_record(msg, channel_id: int) -> dict | None:
 async def _bulk_insert(rows: list[dict]) -> int:
     """Insert rows, ignoring duplicates (file_id OR name+size).
 
+    v10.13 sharding: rows go to the current write shard (first shard
+    under SHARD_SIZE_MB). Dedup is per-shard via on_conflict_do_nothing;
+    cross-shard duplicates from re-indexing after a shard rotation are
+    merged away at read time (dedup by Telegram file_id).
+
     Returns inserted count — the rest were duplicates.
     """
     if not rows:
         return 0
-    factory = get_session_factory(settings.DATABASE_URL)
+    from app.db_shard import get_shard_factories, write_shard_index
+
+    shard_idx = await write_shard_index()
+    factory = get_shard_factories()[shard_idx]
     async with factory() as session:
         # no index_elements: ANY unique violation (file_id or the
         # (file_name, file_size) constraint) skips the row

@@ -26,8 +26,6 @@ from sqlalchemy import func, select
 
 from app import personalize
 from app.bot.v8_ui import sort_best_first
-from app.config import settings
-from app.db import get_session_factory
 from app.models import File
 from app.search import RESULT_LIMIT, search_files
 from app.textutil import extract_year, parse_query
@@ -107,20 +105,34 @@ def _sweep_queries(raw: str, parsed: dict) -> list[str]:
 
 
 async def _fuzzy_sweep(q: str, limit: int = RESULT_LIMIT) -> list[dict]:
-    """Low-threshold trigram sweep for typos (no filters)."""
-    factory = get_session_factory(settings.DATABASE_URL)
+    """Low-threshold trigram sweep for typos (no filters).
+
+    v10.13 sharding: swept across every shard in parallel; ids in the
+    returned dicts are global (shard-packed) so the merge in
+    ``_hot_sweeps`` stays correct.
+    """
+    from app.db_shard import encode_gid, fanout
+
+    async def _one(shard_idx: int, session) -> list[dict]:
+        sim = func.similarity(File.file_name, q)
+        stmt = (
+            select(File, sim.label("rank"))
+            .where(sim > FUZZY_THRESHOLD)
+            .order_by(sim.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(stmt)).all()
+        return [{f: getattr(r[0], f) for f in _FUZZY_FIELDS
+                 if f != "id"}
+                | {"id": encode_gid(shard_idx, r[0].id),
+                   "score": float(r[1] or 0) * 0.7} for r in rows]
+
     try:
-        async with factory() as session:
-            sim = func.similarity(File.file_name, q)
-            stmt = (
-                select(File, sim.label("rank"))
-                .where(sim > FUZZY_THRESHOLD)
-                .order_by(sim.desc())
-                .limit(limit)
-            )
-            rows = (await session.execute(stmt)).all()
-            return [{f: getattr(r[0], f) for f in _FUZZY_FIELDS}
-                    | {"score": float(r[1] or 0) * 0.7} for r in rows]
+        per_shard = await fanout(_one)
+        out: list[dict] = []
+        for hits in per_shard:
+            out.extend(hits or [])
+        return out
     except Exception as exc:  # noqa: BLE001
         log.debug("v9 fuzzy sweep failed: %s", exc)
         return []

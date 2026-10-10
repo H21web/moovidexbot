@@ -468,7 +468,11 @@ async def _auto_index(client: Client, message: Message):
         rec = extract_record(message, chat_id)
         if not rec:
             return
-        factory = get_session_factory(settings.DATABASE_URL)
+        # v10.13 sharding: live posts go to the current write shard.
+        from app.db_shard import get_shard_factories, write_shard_index
+
+        shard_idx = await write_shard_index()
+        factory = get_shard_factories()[shard_idx]
         async with factory() as session:
             stmt = pg_insert(File).values(rec).on_conflict_do_nothing()
             await session.execute(stmt)

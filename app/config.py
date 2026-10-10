@@ -24,7 +24,15 @@ class Settings(BaseSettings):
     # indexed channel. This is how Tech VJ-style bots index.
 
     # --- Database ---
-    DATABASE_URL: str = ""
+    DATABASE_URL: str = ""           # shard 0 (primary); all small tables live here
+    # v10.13 sharding: comma-separated shard DATABASE_URLs in fill order.
+    # Empty = single-DB mode (DATABASE_URL only). Shard 0 must equal
+    # DATABASE_URL. Writes fill shard 0 first, then rotate to the next
+    # shard once it passes SHARD_SIZE_MB.
+    DATABASE_URLS: str = ""
+    # Per-shard soft size cap in MB — writes rotate to the next shard
+    # past this. Keep under the provider's hard cap (Supabase free: 500).
+    SHARD_SIZE_MB: int = 400
 
     # --- Access control ---
     ADMIN_IDS: str = ""            # comma separated telegram user ids
@@ -72,6 +80,22 @@ class Settings(BaseSettings):
         elif v and v.startswith("postgresql://"):
             v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
         return v
+
+    @field_validator("DATABASE_URLS", mode="before")
+    @classmethod
+    def _fix_db_urls(cls, v: str) -> str:
+        # Same asyncpg scheme fix as DATABASE_URL, per comma-separated URL.
+        if not v:
+            return v
+        out = []
+        for u in v.split(","):
+            u = u.strip()
+            if u.startswith("postgres://"):
+                u = u.replace("postgres://", "postgresql+asyncpg://", 1)
+            elif u.startswith("postgresql://"):
+                u = u.replace("postgresql://", "postgresql+asyncpg://", 1)
+            out.append(u)
+        return ",".join(out)
 
     @field_validator("TG_API_ID", mode="before")
     @classmethod

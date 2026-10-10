@@ -106,12 +106,20 @@ async def _get_file(token: str) -> File:
     data = parse_watch_token(token)
     if not data:
         raise HTTPException(403, "invalid or expired link")
-    factory = get_session_factory(settings.DATABASE_URL)
+    # v10.13 sharding: the token's "f" is the global (shard-packed) id —
+    # routed to the owning shard. Pre-sharding plain ids decode to
+    # shard 0 automatically.
+    from app.db_shard import decode_gid, get_shard_factories
+
+    shard, local_id = decode_gid(data["f"])
+    factory = get_shard_factories()[shard]
     async with factory() as session:
         f = (await session.execute(
-            select(File).where(File.id == data["f"]))).scalar_one_or_none()
+            select(File).where(File.id == local_id))).scalar_one_or_none()
     if not f:
         raise HTTPException(404, "file not found")
+    # v10.13 sharding: remember the owning shard for _refresh_file_id.
+    f._shard_idx = shard
     return f
 
 
@@ -184,7 +192,11 @@ async def _refresh_file_id(f: File) -> str:
     if not new_id:
         raise FileReferenceExpired("source message has no media")
     if new_id != f.file_id:
-        factory = get_session_factory(settings.DATABASE_URL)
+        # v10.13 sharding: the update must hit the file's own shard —
+        # f._shard_idx is tagged by _get_file (defaults to 0).
+        from app.db_shard import get_shard_factories
+
+        factory = get_shard_factories()[getattr(f, "_shard_idx", 0)]
         async with factory() as session:
             await session.execute(
                 update(File).where(File.id == f.id).values(file_id=new_id))

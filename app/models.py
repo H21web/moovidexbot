@@ -10,7 +10,6 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
-    ForeignKey,
     Index,
     Integer,
     String,
@@ -72,7 +71,13 @@ Index("ix_files_title_key_trgm", File.title_key,
 
 
 class SavedFile(Base):
-    """v10: per-user watchlist. One row per (user, file)."""
+    """v10: per-user watchlist. One row per (user, file).
+
+    v10.13 sharding: ``file_id`` stores the *global* (shard-packed) file
+    id — the File row may live on any shard, so there is deliberately
+    NO foreign key here (a cross-database FK is impossible). Always on
+    shard 0 with the other small tables.
+    """
 
     __tablename__ = "saved_files"
     __table_args__ = (
@@ -82,9 +87,8 @@ class SavedFile(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True,
                                         nullable=False)
-    file_id: Mapped[int] = mapped_column(
-        ForeignKey("files.id", ondelete="CASCADE"), nullable=False,
-        index=True)
+    file_id: Mapped[int] = mapped_column(BigInteger, nullable=False,
+                                        index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

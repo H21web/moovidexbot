@@ -183,9 +183,13 @@ async def dashboard(request: Request):
     _need_auth(request)
 
     data = await analytics.overview(30)
+    # v10.13 sharding: file counts span all shards; the rest are shard 0.
+    from app.db_shard import total_file_bytes, total_files
+
+    n_files = await total_files()
+    total_bytes = await total_file_bytes()
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
-        n_files = (await s.execute(select(func.count(File.id)))).scalar() or 0
         n_users = (await s.execute(select(func.count(User.id)))).scalar() or 0
         n_groups = (await s.execute(select(func.count(Group.id)))).scalar() or 0
         n_open = (await s.execute(
@@ -194,9 +198,6 @@ async def dashboard(request: Request):
         n_banned = (await s.execute(
             select(func.count(User.id)).where(User.is_banned.is_(True))
         )).scalar() or 0
-        # v10.8.10: total file size.
-        total_bytes = (await s.execute(
-            select(func.coalesce(func.sum(File.file_size), 0)))).scalar() or 0
         # v10.8.10: request fulfilment stats.
         req_total = (await s.execute(
             select(func.count(MovieRequest.id)))).scalar() or 0
@@ -429,14 +430,25 @@ async def groups_page(request: Request, msg: str = ""):
         groups = (await s.execute(
             select(Group).order_by(Group.joined_at.desc())
         )).scalars().all()
-        # indexed channels: distinct channel_id + file counts from files
-        indexed = (await s.execute(
+    # v10.13 sharding: per-channel file stats merge across shards.
+    from app.db_shard import fanout
+
+    async def _one(idx: int, s):
+        return (await s.execute(
             select(File.channel_id, func.count(File.id),
                    func.coalesce(func.sum(File.file_size), 0))
             .where(File.channel_id.isnot(None))
             .group_by(File.channel_id)
-            .order_by(func.count(File.id).desc())
         )).all()
+
+    per_shard = await fanout(_one)
+    merged: dict = {}
+    for part in per_shard:
+        for ch_id, cnt, size in part or []:
+            c, sz = merged.get(ch_id, (0, 0))
+            merged[ch_id] = (c + (cnt or 0), sz + (size or 0))
+    indexed = sorted(merged.items(), key=lambda kv: kv[1][0], reverse=True)
+    indexed = [(ch_id, cnt, size) for ch_id, (cnt, size) in indexed]
 
     banner = f'<div class="okmsg">{esc(msg)}</div>' if msg else ""
     trs = ""
@@ -851,30 +863,76 @@ async def files(request: Request, q: str = "", page_num: int = 1,
     }
     order, _label = sorts.get(sort, sorts["newest"])
     sort = sort if sort in sorts else "newest"
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        base = select(File)
-        if q:
-            like = f"%{q}%"
-            base = base.where(or_(File.file_name.ilike(like),
-                                  File.caption.ilike(like)))
-        total = (await s.execute(
+    base = select(File)
+    if q:
+        like = f"%{q}%"
+        base = base.where(or_(File.file_name.ilike(like),
+                              File.caption.ilike(like)))
+    # v10.13 sharding: fan the browser out to every shard, then merge +
+    # sort + paginate in Python. Each shard returns enough head rows for
+    # the requested page so the global slice is exact. Admin-only page:
+    # a few hundred extra rows in memory is fine.
+    from datetime import datetime, timezone
+
+    from app.db_shard import encode_gid, fanout
+
+    want = page_num * per
+
+    async def _one(idx: int, s):
+        n = (await s.execute(
             select(func.count()).select_from(base.subquery()))).scalar() or 0
         rows = (await s.execute(
-            base.order_by(order)
-            .offset((page_num - 1) * per).limit(per))).scalars().all()
+            base.order_by(order).limit(want))).scalars().all()
+        return n, [(idx, r) for r in rows]
+
+    per_shard = await fanout(_one)
+    total = 0
+    all_rows: list = []
+    for part in per_shard:
+        if not part:
+            continue
+        n, rows = part
+        total += n or 0
+        all_rows.extend(rows)
+
+    _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def _key(pair):
+        _idx, f = pair
+        if sort == "oldest":
+            return (f.created_at is None,
+                    (f.created_at or _EPOCH).timestamp())
+        if sort == "name_az":
+            return ((f.file_name or "").lower(),)
+        if sort == "name_za":
+            return ((f.file_name or "").lower(),)
+        if sort == "size_desc":
+            return (f.file_size is None, -(f.file_size or 0))
+        if sort == "size_asc":
+            return (f.file_size is None, f.file_size or 0)
+        if sort == "dl_desc":
+            return (-(f.downloads or 0),)
+        # newest (default): created_at desc, unposted last
+        return (f.created_at is None,
+                -((f.created_at or _EPOCH).timestamp()))
+
+    all_rows.sort(key=_key, reverse=(sort == "name_za"))
+    page_rows = all_rows[(page_num - 1) * per:page_num * per]
 
     banner = f'<div class="okmsg">{esc(msg)}</div>' if msg else ""
     trs = ""
-    for f in rows:
+    # v10.13 sharding: links carry the *global* id so detail/delete
+    # land on the owning shard.
+    for idx, f in page_rows:
+        gid = encode_gid(idx, f.id)
         name = esc((f.file_name or "—")[:60])
-        trs += ("<tr><td><a href='/admin/files/" + str(f.id) + "'>" + name + "</a></td>"
+        trs += ("<tr><td><a href='/admin/files/" + str(gid) + "'>" + name + "</a></td>"
                 f"<td>{_fmt_size(f.file_size)}</td>"
                 f"<td>{esc(f.quality or '—')}</td>"
                 f"<td>{esc(f.language or '—')}</td>"
                 f"<td class='mut'>{esc(str(f.posted_at)[:10] if f.posted_at else '—')}</td>"
                 "<td>"
-                f"<form class='inline' method='post' action='/admin/files/{f.id}/delete' "
+                f"<form class='inline' method='post' action='/admin/files/{gid}/delete' "
                 "onsubmit=\"return confirm('Delete this file from the index?')\">"
                 "<button class='btn sm red' type='submit'>Delete</button></form>"
                 "</td></tr>")
@@ -906,9 +964,13 @@ async def files(request: Request, q: str = "", page_num: int = 1,
 @router.get("/files/{fid}", response_class=HTMLResponse)
 async def file_detail(request: Request, fid: int):
     _need_auth(request)
-    factory = get_session_factory(settings.DATABASE_URL)
+    # v10.13 sharding: fid is the global (shard-packed) id.
+    from app.db_shard import decode_gid, get_shard_factories
+
+    shard, local_id = decode_gid(fid)
+    factory = get_shard_factories()[shard]
     async with factory() as s:
-        f = (await s.execute(select(File).where(File.id == fid))).scalar_one_or_none()
+        f = (await s.execute(select(File).where(File.id == local_id))).scalar_one_or_none()
     if not f:
         return page("File", "<div class='alert'>File not found.</div>", "files")
     rows = "".join(
@@ -934,9 +996,13 @@ async def file_detail(request: Request, fid: int):
 @router.post("/files/{fid}/delete")
 async def file_delete(request: Request, fid: int):
     _need_auth(request)
-    factory = get_session_factory(settings.DATABASE_URL)
+    # v10.13 sharding: fid is the global (shard-packed) id.
+    from app.db_shard import decode_gid, get_shard_factories
+
+    shard, local_id = decode_gid(fid)
+    factory = get_shard_factories()[shard]
     async with factory() as s:
-        f = (await s.execute(select(File).where(File.id == fid))).scalar_one_or_none()
+        f = (await s.execute(select(File).where(File.id == local_id))).scalar_one_or_none()
         if f:
             await s.delete(f)
             await s.commit()
@@ -1104,32 +1170,40 @@ async def cleanup_run(request: Request, mode: str = Form(""),
                       date_to: str = Form(""), confirm: str = Form("")):
     _need_auth(request)
     q, label = _cleanup_filter(mode, keyword, date_from, date_to)
-    factory = get_session_factory(settings.DATABASE_URL)
-    async with factory() as s:
-        count = (await s.execute(
+    # v10.13 sharding: count + delete across every shard.
+    from app.db_shard import fanout
+
+    async def _count_one(idx: int, s) -> int:
+        return (await s.execute(
             select(func.count()).select_from(q.subquery()))).scalar() or 0
-        if not confirm:
-            # step 1: show count, ask for confirmation
-            body = (f"<h2>🧹 Confirm delete</h2>"
-                    f"<div class='alert'><b>{count:,}</b> files match {esc(label)}.</div>"
-                    "<form method='post'>"
-                    f"<input type='hidden' name='mode' value='{esc(mode)}'>"
-                    f"<input type='hidden' name='keyword' value='{esc(keyword)}'>"
-                    f"<input type='hidden' name='date_from' value='{esc(date_from)}'>"
-                    f"<input type='hidden' name='date_to' value='{esc(date_to)}'>"
-                    "<input type='hidden' name='confirm' value='yes'>"
-                    "<button class='btn red' type='submit'>"
-                    f"Yes, delete {count:,} files</button> "
-                    "<a class='btn grey' href='/admin/cleanup'>Cancel</a></form>")
-            return page("Confirm delete", body, "clean")
-        # step 2: execute
-        from sqlalchemy import delete as sa_delete
+
+    count = sum(c or 0 for c in await fanout(_count_one))
+    if not confirm:
+        # step 1: show count, ask for confirmation
+        body = (f"<h2>🧹 Confirm delete</h2>"
+                f"<div class='alert'><b>{count:,}</b> files match {esc(label)}.</div>"
+                "<form method='post'>"
+                f"<input type='hidden' name='mode' value='{esc(mode)}'>"
+                f"<input type='hidden' name='keyword' value='{esc(keyword)}'>"
+                f"<input type='hidden' name='date_from' value='{esc(date_from)}'>"
+                f"<input type='hidden' name='date_to' value='{esc(date_to)}'>"
+                "<input type='hidden' name='confirm' value='yes'>"
+                "<button class='btn red' type='submit'>"
+                f"Yes, delete {count:,} files</button> "
+                "<a class='btn grey' href='/admin/cleanup'>Cancel</a></form>")
+        return page("Confirm delete", body, "clean")
+    # step 2: execute on every shard
+    from sqlalchemy import delete as sa_delete
+
+    async def _del_one(idx: int, s) -> int:
         stmt = sa_delete(File)
         if q.whereclause is not None:
             stmt = stmt.where(q.whereclause)
         result = await s.execute(stmt)
         await s.commit()
-        deleted = result.rowcount or 0
+        return result.rowcount or 0
+
+    deleted = sum(c or 0 for c in await fanout(_del_one))
     return RedirectResponse(
         f"/admin/cleanup?msg=Deleted {deleted:,} files ({label})",
         status_code=303)
