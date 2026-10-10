@@ -86,6 +86,20 @@ def _parse_grp_arg(text: str | None) -> int | None:
     return None
 
 
+def _parse_srch_arg(text: str | None) -> str | None:
+    """v10.15: /start srch_<b64> — search deep link from release posts."""
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("srch_"):
+        try:
+            import base64
+            tok = parts[1][5:]
+            return base64.urlsafe_b64decode(
+                tok + "=" * (-len(tok) % 4)).decode()
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
 async def _start(client: Client, message: Message):
     user = await track_user(message)
     if user and user.is_banned:
@@ -96,6 +110,7 @@ async def _start(client: Client, message: Message):
     uid = message.from_user.id
     dl_id = _parse_dl_arg(message.text)
     grp_id = _parse_grp_arg(message.text)
+    srch_q = _parse_srch_arg(message.text)
     grp_sent = False
     if grp_id:
         # v10.14.1: group's custom start message (+ optional button,
@@ -127,6 +142,9 @@ async def _start(client: Client, message: Message):
         # Remember the file so it auto-delivers after joining.
         if dl_id:
             state.pending_dl[uid] = dl_id
+        # v10.15: remember the search too — runs after they join.
+        if srch_q:
+            state.pending_search[uid] = srch_q
         from app.bot.handlers.callbacks import send_join_prompt
         await send_join_prompt(client, message, uid, kb,
                                chat_id=message.chat.id)
@@ -134,6 +152,11 @@ async def _start(client: Client, message: Message):
     if dl_id:
         state.pending_dl.pop(uid, None)
         await _deliver_deeplink(client, message, dl_id)
+        return
+    if srch_q:
+        # v10.15: search deep link from a release announcement.
+        from app.bot.handlers.search import _handle_text_query
+        await _handle_text_query(client, message, uid, srch_q)
         return
     if grp_sent:
         return

@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     OPENSUBTITLES_API_KEY: str = ""  # v10.14: official subtitle API key
     REQUEST_CHANNEL: str = ""      # where /request posts go (@username or id)
     LOG_CHANNEL: str = ""          # admin log channel (@username or id)
+    UPDATE_CHANNEL_ID: int = 0    # v10.15: new-release announcements
+                                  # (numeric channel id; bot must be admin)
 
     # --- AI (Groq) — v6 super update ---
     GROQ_API_KEY: str = ""         # empty = AI features disabled gracefully
