@@ -95,24 +95,12 @@ async def _start(client: Client, message: Message):
                                   chat_id=message.chat.id))
     uid = message.from_user.id
     dl_id = _parse_dl_arg(message.text)
-    kb = await forcesub.ensure_joined(client, uid,
-                                      chat_id=message.chat.id)
-    if kb:
-        # Remember the file so it auto-delivers after joining.
-        if dl_id:
-            state.pending_dl[uid] = dl_id
-        from app.bot.handlers.callbacks import send_join_prompt
-        await send_join_prompt(client, message, uid, kb,
-                               chat_id=message.chat.id)
-        return
-    if dl_id:
-        state.pending_dl.pop(uid, None)
-        await _deliver_deeplink(client, message, dl_id)
-        return
     grp_id = _parse_grp_arg(message.text)
+    grp_sent = False
     if grp_id:
-        # v10.14: group's custom start message (+ optional button,
-        # unlocked at 1000+ members).
+        # v10.14.1: group's custom start message (+ optional button,
+        # unlocked at 1000+ members). Checked BEFORE the force-sub gate
+        # so /start grp_... never gets swallowed by the join prompt.
         from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         from app.bot.handlers.groups import (
@@ -132,7 +120,23 @@ async def _start(client: Client, message: Message):
             await message.reply_text(
                 start_msg, reply_markup=kb, parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True)
-            return
+            grp_sent = True
+    kb = await forcesub.ensure_joined(client, uid,
+                                      chat_id=message.chat.id)
+    if kb:
+        # Remember the file so it auto-delivers after joining.
+        if dl_id:
+            state.pending_dl[uid] = dl_id
+        from app.bot.handlers.callbacks import send_join_prompt
+        await send_join_prompt(client, message, uid, kb,
+                               chat_id=message.chat.id)
+        return
+    if dl_id:
+        state.pending_dl.pop(uid, None)
+        await _deliver_deeplink(client, message, dl_id)
+        return
+    if grp_sent:
+        return
     text = await rt.aget_setting("WELCOME_PM") or START_TEXT
     await message.reply_text(text, reply_markup=ui.start_kb(),
                              parse_mode=ParseMode.HTML)

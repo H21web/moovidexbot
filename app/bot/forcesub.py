@@ -43,28 +43,6 @@ def _norm_ref(ref: str) -> int | str:
     return s
 
 
-async def _group_force_sub(chat_id: int | None) -> list[str]:
-    """Extra force-sub channels configured for a connected group."""
-    if chat_id is None:
-        return []
-    try:
-        from sqlalchemy import select
-
-        from app.db import get_session_factory
-        from app.models import Group
-
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as s:
-            g = (await s.execute(
-                select(Group).where(Group.id == chat_id)
-            )).scalar_one_or_none()
-            if g and g.settings:
-                return list(g.settings.get("force_sub") or [])
-    except Exception as exc:
-        log.debug("group forcesub lookup failed: %s", exc)
-    return []
-
-
 async def effective_channels() -> list[str]:
     """Force-sub channels with the DB override winning over the env var."""
     try:
@@ -80,10 +58,8 @@ async def effective_channels() -> list[str]:
 async def missing_channels(client, user_id: int,
                            chat_id: int | None = None) -> list[str]:
     """Return the required channels the user has NOT joined."""
+    # v10.14.1: force-sub is global-only (per-group override removed).
     refs = await effective_channels()
-    for ref in await _group_force_sub(chat_id):
-        if ref not in refs:
-            refs.append(ref)
     missing = []
     for ref in refs:
         try:
@@ -185,25 +161,8 @@ async def ensure_joined(client, user_id: int,
     missing = await missing_channels(client, user_id, chat_id)
     if not missing:
         return None
-    # v10.14: a group's custom join channel (3000+ tier) is appended
-    # under the force-sub buttons for that group's users.
-    extra = None
-    if chat_id and str(chat_id).startswith("-"):
-        try:
-            from sqlalchemy import select
-
-            from app.db import get_session_factory
-            from app.models import Group
-            factory = get_session_factory(settings.DATABASE_URL)
-            async with factory() as s:
-                g = (await s.execute(
-                    select(Group).where(Group.id == chat_id)
-                )).scalar_one_or_none()
-                extra = ((g.settings or {}).get("join_channel")
-                         or "").strip() or None
-        except Exception:
-            extra = None
-    return await join_kb(client, missing, extra)
+    # v10.14.1: no per-group join channel anymore — global force-sub only.
+    return await join_kb(client, missing, None)
 
 
 async def approve_pending(client, user_id: int,

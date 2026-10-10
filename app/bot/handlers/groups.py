@@ -93,9 +93,19 @@ async def is_owner_group(chat_id: int) -> bool:
 
 async def group_ai_allowed(client: Client, chat_id: int | None) -> bool:
     """Groq AI spell help is allowed in PM, the owner group,
-    or groups with 3000+ members. Everyone else gets local spell only."""
+    or groups with 3000+ members. Everyone else gets local spell only.
+
+    v10.14.1: the per-group "AI mode" toggle (default ON) can turn it
+    off even where the tier would allow it.
+    """
     if chat_id is None or not str(chat_id).startswith("-"):
         return True
+    try:
+        g = await _get_group(int(chat_id))
+        if g is not None and (g.settings or {}).get("ai_mode") is False:
+            return False
+    except Exception:
+        pass
     if await is_owner_group(chat_id):
         return True
     return await group_tier_ok(client, chat_id, TIER_3000)
@@ -192,7 +202,6 @@ async def _panel_kb(client: Client, g: Group) -> InlineKeyboardMarkup:
         ad = int(raw_ad)
         ad_label = next((l for l, s_ in AD_CHOICES if s_ == ad),
                         f"{ad // 60}m")
-    fsub = s.get("force_sub") or []
     welcome = s.get("welcome")
     imdb = s.get("imdb_enabled", True)
     poster = s.get("poster", True)
@@ -200,9 +209,6 @@ async def _panel_kb(client: Client, g: Group) -> InlineKeyboardMarkup:
         [await _tier_btn(client, gid, TIER_500,
                          f"🗑 Auto-delete: {ad_label}",
                          f"grpadmenu:{gid}")],
-        [InlineKeyboardButton(
-            f"📢 Force-sub: {', '.join(fsub) if fsub else 'off'}",
-            callback_data=f"grpfsub:{gid}")],
         [InlineKeyboardButton(
             f"👋 Welcome: {'set' if welcome else 'off'}",
             callback_data=f"grpwelcome:{gid}")],
@@ -222,8 +228,8 @@ async def _panel_kb(client: Client, g: Group) -> InlineKeyboardMarkup:
                          f"🔘 Start button: {'set' if s.get('start_btn_text') else 'off'}",
                          f"grpsbtn:{gid}")],
         [await _tier_btn(client, gid, TIER_3000,
-                         f"🔗 Join channel: {'set' if s.get('join_channel') else 'off'}",
-                         f"grpjoin:{gid}")],
+                         f"🤖 AI mode: {'ON' if s.get('ai_mode', True) else 'OFF'}",
+                         f"grp:ai:{gid}")],
         [InlineKeyboardButton("🔌 Disconnect",
                               callback_data=f"grpdel:{gid}")],
         [InlineKeyboardButton("⬅️ All groups", callback_data="grplist")],
@@ -236,7 +242,6 @@ async def _panel_text(client: Client, g: Group) -> str:
     raw_ad = s.get("autodelete_seconds")
     ad_txt = "🌐 global" if raw_ad is None else (
         "off" if not int(raw_ad) else f"{int(raw_ad) // 60} min")
-    fsub = s.get("force_sub") or []
     imdb = s.get("imdb_enabled", True)
     n = await group_member_count(client, g.id)
     tier = ("BASIC" if n < TIER_500 else "500+" if n < TIER_1000
@@ -246,19 +251,17 @@ async def _panel_text(client: Client, g: Group) -> str:
     un = await _bot_username(client)
     start_link = (f"\n🔗 Start link: <code>https://t.me/{un}"
                   f"?start=grp_{g.id}</code>" if un else "")
-    ai = await group_ai_allowed(client, g.id)
+    ai = bool(s.get("ai_mode", True))
     return (
         f"👪 <b>{ui.esc(g.title or str(g.id))}</b>\n<code>{g.id}</code>\n"
         f"👥 {n:,} members · tier <b>{tier}</b>{start_link}\n\n"
         f"🗑 Auto-delete: <b>{ad_txt}</b>\n"
-        f"📢 Force-sub: <b>{ui.esc(', '.join(fsub) if fsub else 'off')}</b>\n"
         f"👋 Welcome: <b>{'set' if s.get('welcome') else 'off'}</b>\n"
         f"🎬 IMDB info: <b>{'ON' if imdb else 'OFF'}</b>\n"
         f"🖼 Poster: <b>{'ON' if s.get('poster', True) else 'OFF'}</b>\n"
         f"💬 Start msg: <b>{'set' if s.get('start_message') else 'off'}</b>\n"
         f"📝 Caption tpl: <b>{'set' if s.get('caption_tpl') else 'off'}</b>\n"
-        f"🔗 Join channel: <b>{ui.esc(s.get('join_channel') or 'off')}</b>\n"
-        f"🤖 AI spell: <b>{'ON' if ai else 'OFF'}</b>\n\n"
+        f"🤖 AI mode: <b>{'ON' if ai else 'OFF'}</b>\n\n"
         f"<i>🛡 Mod: /gban /gunban /gwarn · 📣 /gbroadcast · "
         f"1000+ group admins: /ubroadcast</i>"
     )
@@ -726,6 +729,7 @@ async def _ask_reply(client: Client, query, action: str, prompt: str):
     _pending_sweep()
     _pending[uid] = {"action": action, "gid": gid,
                      "panel_msg_id": query.message.id,
+                     "panel_chat_id": query.message.chat.id,
                      "ts": time.time()}
     # Turn the panel itself into the prompt — no extra message.
     await query.message.edit_text(
@@ -776,8 +780,12 @@ async def _pending_reply(client: Client, message: Message):
         if not g:
             return
         try:
+            # v10.14.1: the panel may live in the group (in-group
+            # /settings) while the reply came in PM — edit it where
+            # it actually is.
             await client.edit_message_text(
-                message.chat.id, pend.get("panel_msg_id"),
+                pend.get("panel_chat_id") or message.chat.id,
+                pend.get("panel_msg_id"),
                 await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
                 parse_mode=ParseMode.HTML)
         except Exception:
@@ -793,15 +801,7 @@ async def _pending_reply(client: Client, message: Message):
         raise StopPropagation
     text = message.text.strip()
     gid = pend["gid"]
-    if pend["action"] == "fsub":
-        if text.lower() == "off":
-            chans = []
-        else:
-            chans = [c.strip() for c in text.replace(";", ",").split(",")
-                     if c.strip()]
-        await _save_group(gid, None,
-                          mutate=lambda s: {**s, "force_sub": chans})
-    elif pend["action"] == "welcome":
+    if pend["action"] == "welcome":
         if text.lower() == "off":
             await _save_group(gid, None,
                               mutate=lambda s: {k: v for k, v in s.items()
@@ -850,16 +850,6 @@ async def _pending_reply(client: Client, message: Message):
                     "❌ Send as <code>Button Text | https://…</code>",
                     parse_mode=ParseMode.HTML)
                 raise StopPropagation
-    elif pend["action"] == "join_channel":
-        # v10.14: extra join-channel button under force-sub. 3000+ members.
-        if text.lower() == "off":
-            await _save_group(gid, None,
-                              mutate=lambda s: {k: v for k, v in s.items()
-                                                if k != "join_channel"})
-        else:
-            await _save_group(gid, None,
-                              mutate=lambda s: {**s,
-                                                "join_channel": text[:200]})
     _pending.pop(uid, None)
     try:
         await message.delete()  # panel shows the new value — no clutter
@@ -940,6 +930,22 @@ async def _grp_poster(client: Client, query):
     await query.answer(f"🖼 Poster {'ON' if not cur else 'OFF'}")
 
 
+async def _grp_ai(client: Client, query):
+    """v10.14.1: per-group AI mode toggle (3000+ tier, default ON)."""
+    gid = int(query.data.split(":")[2])
+    g = await _get_group(gid)
+    if not g:
+        await query.answer("Group not found.", show_alert=True)
+        return
+    cur = bool((g.settings or {}).get("ai_mode", True))
+    await _save_group(gid, None,
+                      mutate=lambda s: {**s, "ai_mode": not cur})
+    g = await _get_group(gid)
+    await query.message.edit_text(await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
+                                  parse_mode=ParseMode.HTML)
+    await query.answer(f"🤖 AI mode {'ON' if not cur else 'OFF'}")
+
+
 def register(bot: Client) -> None:
     bot.on_message(filters.group & filters.command("connect"))(_connect)
     bot.on_message(filters.group & filters.command("start"))(_group_start)
@@ -968,10 +974,6 @@ def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^grplist$"))(_grp_list)
     bot.on_callback_query(filters.regex(r"^grpadmenu:-?\d+$"))(_mgr_cb(_ad_menu))
     bot.on_callback_query(filters.regex(r"^grpad:-?\d+:-?\d+$"))(_mgr_cb(_ad_set))
-    bot.on_callback_query(filters.regex(r"^grpfsub:-?\d+$"))(
-        _mgr_cb(lambda c, q: _ask_reply(
-            c, q, "fsub",
-            "📢 Send the force-sub channels (comma separated @usernames), or <code>off</code> to clear.")))
     bot.on_callback_query(filters.regex(r"^grpwelcome:-?\d+$"))(
         _mgr_cb(lambda c, q: _ask_reply(
             c, q, "welcome",
@@ -980,6 +982,8 @@ def register(bot: Client) -> None:
     # v10.14: tiered settings.
     bot.on_callback_query(filters.regex(r"^grp:poster:-?\d+$"))(
         _mgr_cb(_grp_poster))
+    bot.on_callback_query(filters.regex(r"^grp:ai:-?\d+$"))(
+        _mgr_cb(_grp_ai))
     bot.on_callback_query(filters.regex(r"^grpsmsg:-?\d+$"))(
         _mgr_cb(lambda c, q: _ask_reply(
             c, q, "startmsg",
@@ -996,10 +1000,5 @@ def register(bot: Client) -> None:
             c, q, "start_btn",
             "🔘 Send <code>Button Text | https://…</code> for the button "
             "under the start message, or <code>off</code> to clear.")))
-    bot.on_callback_query(filters.regex(r"^grpjoin:-?\d+$"))(
-        _mgr_cb(lambda c, q: _ask_reply(
-            c, q, "join_channel",
-            "🔗 Send the extra join channel (<code>@username</code> or URL) "
-            "shown under the force-sub buttons, or <code>off</code> to clear.")))
     bot.on_callback_query(filters.regex(r"^grpdel:-?\d+$"))(_mgr_cb(_grp_del))
     bot.on_callback_query(filters.regex(r"^grpdelok:-?\d+$"))(_mgr_cb(_grp_del_ok))

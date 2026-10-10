@@ -26,10 +26,19 @@ _LANG3 = {"en": "eng", "ml": "mal", "hi": "hin", "ta": "tam",
 _LANG1 = {v: k for k, v in _LANG3.items()}
 
 _cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_key_warned = False
 
 
 def _api_key() -> str:
-    return (settings.OPENSUBTITLES_API_KEY or "").strip()
+    # v10.14.1: warn ONCE (not per request) when the key is missing so a
+    # dead subtitle button is diagnosable from the Render logs.
+    global _key_warned
+    key = (settings.OPENSUBTITLES_API_KEY or "").strip()
+    if not key and not _key_warned:
+        _key_warned = True
+        log.warning("OPENSUBTITLES_API_KEY not set — subtitles disabled. "
+                    "Get a free key at opensubtitles.com and set it as env.")
+    return key
 
 
 def _headers() -> dict:
