@@ -13,7 +13,7 @@ EXT_RE = re.compile(r"\.[a-z0-9]{2,4}$", re.IGNORECASE)
 NOISE_RE = re.compile(
     r"\b(uhd|hd|hq|hd-?cam|cam|hdts|dvdrip|dvdscr|webrip|web-?dl|bluray|brrip|"
     r"x264|x265|hevc|10bit|aac|dts|dd5\.1|esub|subs|proper|repack|extended|"
-    r"unrated|imax|hdr|remux)\b",
+    r"unrated|imax|hdr|remux|amzn|atvp|telly|h\s*26[45]|aac2|eac3|opus)\b",
     re.IGNORECASE,
 )
 LANG_RE = re.compile(

@@ -8,6 +8,7 @@ empty/None and the callers show their normal "not available" paths.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from app.config import settings
@@ -19,6 +20,25 @@ _BASE = "https://api.opensubtitles.com/api/v1"
 _UA = "MoovidexBot/1.0"
 _BUDGET_S = 12.0
 _CACHE_TTL_S = 300.0  # 5-minute in-memory search cache
+
+# v10.15.4: release-group junk clean_title misses (AMZN, H.264, AAC2.0,
+# Telly…) — subtitle-search only, so a lone digit is safe to drop.
+_SUB_JUNK_RE = re.compile(
+    r"\b(amzn|atvp|telly|nf|dsnp|hmax|h\s*26[45]|aac2?|ac3|eac3|opus|"
+    r"ddp\d?|atmos)\b|\b\d\b",
+    re.IGNORECASE,
+)
+
+
+def _subtitle_query(file_name: str) -> str:
+    """Subtitle-search query from a filename.
+
+    v10.15.4: clean_title left junk like "Furious AMZN AAC2 0 H 264"
+    which finds nothing. Strip the leftovers here.
+    """
+    q = clean_title(file_name or "")
+    q = _SUB_JUNK_RE.sub(" ", q)
+    return re.sub(r"\s+", " ", q).strip(" -")[:120]
 
 # ISO 639-1 (API wire) <-> 639-2/B (player language picker).
 _LANG3 = {"en": "eng", "ml": "mal", "hi": "hin", "ta": "tam",
@@ -88,7 +108,7 @@ async def _ensure_login() -> str | None:
         return _login_token
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=_BUDGET_S) as c:
+        async with httpx.AsyncClient(timeout=_BUDGET_S, follow_redirects=True) as c:
             r = await c.post(f"{_BASE}/login", headers=_headers(),
                              json={"username": user, "password": pwd})
         if r.status_code != 200:
@@ -121,7 +141,7 @@ async def search_subtitles(title: str, languages: str = "eng",
     downloadable file_id. Empty list when no API key is configured."""
     if not _api_key():
         return []
-    q = clean_title(title or "")[:120].strip()
+    q = _subtitle_query(title)
     if not q:
         return []
     ck = (q.lower(), languages or "")
@@ -137,7 +157,9 @@ async def search_subtitles(title: str, languages: str = "eng",
         langs = _langs_639_1(languages)
         if langs:
             params["languages"] = langs
-        async with httpx.AsyncClient(timeout=_BUDGET_S) as c:
+        # v10.15.4: follow the API's canonical-param 301 (X-OS-Rule).
+        async with httpx.AsyncClient(timeout=_BUDGET_S,
+                                     follow_redirects=True) as c:
             r = await c.get(f"{_BASE}/subtitles", headers=_headers(token),
                             params=params)
         if r.status_code != 200:
@@ -195,7 +217,7 @@ async def download_subtitle(sub_id) -> tuple[bytes | None, str | None]:
         token = await _ensure_login()
 
         async def _dl(tok: str | None):
-            async with httpx.AsyncClient(timeout=_BUDGET_S) as c:
+            async with httpx.AsyncClient(timeout=_BUDGET_S, follow_redirects=True) as c:
                 r = await c.post(f"{_BASE}/download",
                                  headers=_headers(tok),
                                  json={"file_id": file_id})
