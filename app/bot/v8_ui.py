@@ -195,9 +195,17 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
             plot = meta["plot"]
             parts.append(f"<i>{esc(plot[:170] + '…' if len(plot) > 170 else plot)}</i>")
         # v10.14.2: OTT "where to watch" from JustWatch.
+        # v10.14.3: hyperlinked, max 2 providers.
         ott = meta.get("ott") or []
         if ott:
-            parts.append(f"📺 <i>Available on: {esc(', '.join(ott[:6]))}</i>")
+            ott_url = meta.get("ott_url") or ""
+            if ott_url:
+                links = ", ".join(
+                    f'<a href="{esc(ott_url)}">{esc(p)}</a>'
+                    for p in ott[:2])
+            else:
+                links = esc(", ".join(ott[:2]))
+            parts.append(f"📺 <i>Available on: {links}</i>")
         parts.append("")
     from app.textutil import clean_display_name
     # v10.14: series — newest season/episode first (idempotent: _build_v8

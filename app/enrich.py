@@ -104,7 +104,19 @@ async def enrich_title(keywords: str, year: int | None = None,
             # v10.14.2: OTT "where to watch" providers for the card.
             ott = _format_ott(jw.get("offers"))
             if ott:
-                meta["ott"] = ott
+                meta["ott"] = ott[:2]  # v10.14.3: max 2 providers
+                # v10.14.3: hyperlink target — JustWatch title page when
+                # the entry carries a path, else a JustWatch search.
+                jw_path = (jw.get("jw_url") or "").strip()
+                if jw_path.startswith("/"):
+                    meta["ott_url"] = f"https://www.justwatch.com{jw_path}"
+                elif jw_path.startswith("http"):
+                    meta["ott_url"] = jw_path
+                else:
+                    from urllib.parse import quote_plus
+                    meta["ott_url"] = (
+                        "https://www.justwatch.com/in/search?q="
+                        + quote_plus(jw.get("title") or keywords))
         _cache[cache_key] = (time.time(), meta)
     # P3#17: evict the oldest ~100 instead of nuking the whole cache.
     if len(_cache) > 500:
@@ -175,6 +187,11 @@ def _jw_direct_sync(query: str, limit: int) -> list[dict]:
             "backdrop": backdrops[-1] if backdrops else None,
             "poster": e.poster,
             "offers": _extract_offers(e),  # v10.14.2: OTT providers
+            # v10.14.3: JustWatch title path for hyperlinks (defensive —
+            # the field name may vary; the enrich layer falls back to a
+            # JustWatch search URL when it is absent).
+            "jw_url": (getattr(e, "full_path", None)
+                       or getattr(e, "url", None) or ""),
         })
         if len(out) >= limit:
             break

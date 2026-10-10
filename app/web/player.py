@@ -419,6 +419,13 @@ async def subs_pick(token: str, request: Request):
         return _error_page(404, "File not found",
                            "This file is no longer indexed.")
     from app import subs
+    from app.config import settings as _settings
+    # v10.14.3: tell the user WHY when the key is missing — "no
+    # subtitles found" is misleading when the API was never configured.
+    if not (_settings.OPENSUBTITLES_API_KEY or "").strip():
+        return HTMLResponse(
+            "<p style='color:#e8a13a'>⚠️ Subtitles aren't configured on "
+            "this bot yet (missing API key). Ask the admin to add it.</p>")
     results = await subs.search_subtitles(f.file_name or "", "eng,mal,hin,tam",
                                           limit=30)
     # Group by language, keep the best per language.
