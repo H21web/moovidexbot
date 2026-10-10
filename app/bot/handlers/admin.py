@@ -872,6 +872,39 @@ async def _debug(client: Client, message: Message):
 
 
 @admin_only
+async def _ping(client: Client, message: Message):
+    """Lightweight latency probe: telegram + DB (3 samples). Admin only."""
+    import time as _time
+    from sqlalchemy import text as sa_text
+    from app.db import get_session_factory
+
+    lines = ["🏓 <b>PONG</b>"]
+    try:
+        t0 = _time.perf_counter()
+        await client.get_me()
+        tg_ms = (_time.perf_counter() - t0) * 1000
+        lines.append(f"✈️ telegram api: <b>{tg_ms:.0f} ms</b>")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"✈️ telegram api: ❌ {exc}")
+    # 3 DB samples on one connection: 1st slow + rest fast = cold
+    # connection/pooler handshake; all slow = persistent DB latency.
+    try:
+        factory = get_session_factory(settings.DATABASE_URL)
+        samples = []
+        async with factory() as s:
+            for _ in range(3):
+                t0 = _time.perf_counter()
+                await s.execute(sa_text("SELECT 1"))
+                samples.append((_time.perf_counter() - t0) * 1000)
+        avg = sum(samples) / len(samples)
+        lines.append("🗄 db ping: <b>" + " | ".join(f"{x:.0f} ms"
+                     for x in samples) + f"</b> (avg <b>{avg:.0f} ms</b>)")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"🗄 db ping: ❌ {exc}")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
 async def _ban(client: Client, message: Message):
     parts = message.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
@@ -1123,6 +1156,7 @@ def register(bot: Client) -> None:
     bot.on_message(filters.private & filters.command("settings"))(_settings)
     bot.on_message(filters.private & filters.command("dbcheck"))(_dbcheck)
     bot.on_message(filters.private & filters.command("debug"))(_debug)
+    bot.on_message(filters.private & filters.command("ping"))(_ping)
     bot.on_callback_query(filters.regex(r"^req(done|rej):"))(_req_action)
     # v10.8.10: button dashboard.
     bot.on_callback_query(filters.regex(r"^adm:"))(_adm_cb)

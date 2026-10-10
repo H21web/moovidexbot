@@ -612,6 +612,6 @@ def register(bot: Client) -> None:
                                          "users", "settings", "requests",
                                          "connect", "groups", "cancel",
                                          "saved", "mystats", "admin",
-                                         "deltimer", "dbcheck", "debug"])
+                                         "deltimer", "dbcheck", "debug", "ping"])
         & ~filters.channel
     )(_on_text)
