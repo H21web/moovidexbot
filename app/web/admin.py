@@ -94,6 +94,8 @@ label{display:block;margin:12px 0 4px;color:#aebdd8;font-weight:600}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
 .row>div{flex:1;min-width:180px}
 .note{color:#8fa0bd;font-size:12px;margin-top:4px}
+.bar{background:#0e1422;border-radius:6px;height:10px;min-width:120px;overflow:hidden;margin:4px 0}
+.bar>div{background:linear-gradient(90deg,#8b2ff7,#4da3ff);height:100%;border-radius:6px}
 .alert{background:#2a1f1f;border:1px solid #c0392b;border-radius:10px;padding:12px;margin:12px 0}
 .okmsg{background:#14261c;border:1px solid #1e9e5a;border-radius:10px;padding:12px;margin:12px 0}
 .login{max-width:380px;margin:80px auto;background:#161d2e;padding:28px;border-radius:14px;border:1px solid #2a3550}
@@ -177,6 +179,30 @@ async def logout():
 
 
 # ---------- dashboard homepage ----------
+
+async def _shard_stats() -> list[dict]:
+    """v10.14: per-shard size + file rows. Unreachable shards are
+    reported as such instead of crashing the dashboard."""
+    from sqlalchemy import text as sa_text
+
+    from app.db_shard import get_shard_factories
+
+    out: list[dict] = []
+    for idx, factory in enumerate(get_shard_factories()):
+        row: dict = {"idx": idx, "ok": False}
+        try:
+            async with factory() as s:
+                size = (await s.execute(sa_text(
+                    "SELECT pg_database_size(current_database())")
+                )).scalar() or 0
+                n = (await s.execute(sa_text(
+                    "SELECT count(*) FROM files"))).scalar() or 0
+            row.update(ok=True, size_mb=size / (1024 * 1024), files=n)
+        except Exception as exc:  # noqa: BLE001
+            row["error"] = str(exc)[:100]
+        out.append(row)
+    return out
+
 
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
@@ -288,8 +314,30 @@ async def dashboard(request: Request):
               "<th>🔍</th><th>📥</th><th>▶️</th><th>👤</th><th>📦</th><th>🎞</th>"
               "</tr>" + rows + "</table>")
 
+    # v10.14: per-shard storage overview (500 MB free quota each).
+    shards = await _shard_stats()
+    srows = ""
+    for sh in shards:
+        if not sh["ok"]:
+            srows += (f"<tr><td>#{sh['idx']}</td>"
+                      f"<td colspan='3'>⚠️ unreachable</td></tr>")
+            continue
+        pct = min(100.0, sh["size_mb"] / 500 * 100)
+        bar = (f"<div class='bar'><div style='width:{pct:.0f}%'>"
+               f"</div></div>")
+        srows += (f"<tr><td><b>#{sh['idx']}</b></td>"
+                  f"<td>{sh['size_mb']:.0f} MB</td>"
+                  f"<td>{bar}{pct:.0f}% of 500 MB</td>"
+                  f"<td>{sh['files']:,}</td></tr>")
+    shard_html = ("<h2>🗄 Database shards</h2><table>"
+                  "<tr><th>Shard</th><th>Size</th><th>Quota</th>"
+                  "<th>Files</th></tr>" + srows + "</table>"
+                  "<div class='note'>Each shard is a Supabase free project "
+                  "(500 MB). New files fill the first shard under the "
+                  "rotation limit, then spill to the next.</div>")
+
     body = (f"<h2>📊 Dashboard</h2><div class='cards'>{cards}</div>"
-            f"{req_stats}{summary}{detail}")
+            f"{shard_html}{req_stats}{summary}{detail}")
     return page("Dashboard", body, "dash")
 
 

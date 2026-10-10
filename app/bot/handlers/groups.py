@@ -24,7 +24,7 @@ from app.bot import ui
 from app.bot.handlers.common import admin_only, track_user
 from app.config import settings
 from app.db import get_session_factory
-from app.models import Group
+from app.models import Group, User
 from app import runtime as rt
 
 log = logging.getLogger(__name__)
@@ -47,7 +47,91 @@ def _pending_sweep() -> None:
         _pending.pop(oldest, None)
 
 AD_CHOICES = [("Off", 0), ("5 min", 300), ("15 min", 900),
-              ("30 min", 1800), ("1 hour", 3600)]
+              ("30 min", 1800), ("1 hour", 3600),
+              ("🌐 Global default", -1)]
+
+
+# ---------- v10.14: member tiers ----------
+# BASIC <500 · T500 >=500 · T1000 >=1000 · T3000 >=3000 members.
+TIER_500 = 500
+TIER_1000 = 1000
+TIER_3000 = 3000
+
+_member_cache: dict[int, tuple[int, float]] = {}
+_MEMBER_TTL = 3600.0  # 1 hour
+
+
+async def group_member_count(client: Client, chat_id: int) -> int:
+    """Member count with a 1-hour in-memory cache (tier gating)."""
+    now = time.monotonic()
+    hit = _member_cache.get(chat_id)
+    if hit and now - hit[1] < _MEMBER_TTL:
+        return hit[0]
+    try:
+        n = await client.get_chat_members_count(chat_id)
+    except Exception:
+        n = 0
+    _member_cache[chat_id] = (n, now)
+    return n
+
+
+async def group_tier_ok(client: Client, chat_id: int, needed: int) -> bool:
+    """True when the group has >= ``needed`` members."""
+    if needed <= 0:
+        return True
+    return await group_member_count(client, chat_id) >= needed
+
+
+async def is_owner_group(chat_id: int) -> bool:
+    """True when this group is the bot owner's designated main group."""
+    try:
+        og = await rt.aget_setting("OWNER_GROUP_ID")
+        return int(og or 0) == int(chat_id)
+    except (TypeError, ValueError):
+        return False
+
+
+async def group_ai_allowed(client: Client, chat_id: int | None) -> bool:
+    """Groq AI spell help is allowed in PM, the owner group,
+    or groups with 3000+ members. Everyone else gets local spell only."""
+    if chat_id is None or not str(chat_id).startswith("-"):
+        return True
+    if await is_owner_group(chat_id):
+        return True
+    return await group_tier_ok(client, chat_id, TIER_3000)
+
+
+async def group_unlocked(client: Client, chat_id: int, need: int) -> bool:
+    """v10.14: tier feature unlocked? Owner group bypasses all tiers."""
+    if await is_owner_group(chat_id):
+        return True
+    return await group_tier_ok(client, chat_id, need)
+
+
+async def _tier_btn(client: Client, gid: int, need: int, label: str,
+                    ok_cb: str) -> InlineKeyboardButton:
+    """v10.14: tier-gated panel button — shows 🔒 when locked."""
+    if await group_unlocked(client, gid, need):
+        return InlineKeyboardButton(label, callback_data=ok_cb)
+    short = label.split(":")[0]
+    return InlineKeyboardButton(f"🔒 {short}",
+                                callback_data=f"grp:locked:{need}:{gid}")
+
+
+_bot_username: str | None = None
+
+
+async def _bot_username(client: Client) -> str | None:
+    """Cached bot username for group start links."""
+    global _bot_username
+    if _bot_username:
+        return _bot_username
+    try:
+        me = await client.get_me()
+        _bot_username = me.username or None
+    except Exception:
+        pass
+    return _bot_username
 
 
 # ---------- helpers ----------
@@ -97,43 +181,86 @@ async def effective_autodelete(chat_id: int) -> int:
     return int(await rt.aget_setting("AUTO_DELETE_SECONDS") or 0)
 
 
-def _panel_kb(g: Group) -> InlineKeyboardMarkup:
-    ad = int((g.settings or {}).get("autodelete_seconds") or 0)
-    ad_label = next((l for l, s in AD_CHOICES if s == ad), f"{ad // 60}m")
-    fsub = (g.settings or {}).get("force_sub") or []
-    welcome = (g.settings or {}).get("welcome")
-    imdb = (g.settings or {}).get("imdb_enabled", True)
+async def _panel_kb(client: Client, g: Group) -> InlineKeyboardMarkup:
+    # v10.14: absent autodelete key = inherit the global default (🌐).
+    s = g.settings or {}
+    gid = g.id
+    raw_ad = s.get("autodelete_seconds")
+    if raw_ad is None:
+        ad_label = "🌐 Global"
+    else:
+        ad = int(raw_ad)
+        ad_label = next((l for l, s_ in AD_CHOICES if s_ == ad),
+                        f"{ad // 60}m")
+    fsub = s.get("force_sub") or []
+    welcome = s.get("welcome")
+    imdb = s.get("imdb_enabled", True)
+    poster = s.get("poster", True)
     rows = [
-        [InlineKeyboardButton(f"🗑 Auto-delete: {ad_label}",
-                              callback_data=f"grpadmenu:{g.id}")],
+        [await _tier_btn(client, gid, TIER_500,
+                         f"🗑 Auto-delete: {ad_label}",
+                         f"grpadmenu:{gid}")],
         [InlineKeyboardButton(
             f"📢 Force-sub: {', '.join(fsub) if fsub else 'off'}",
-            callback_data=f"grpfsub:{g.id}")],
+            callback_data=f"grpfsub:{gid}")],
         [InlineKeyboardButton(
             f"👋 Welcome: {'set' if welcome else 'off'}",
-            callback_data=f"grpwelcome:{g.id}")],
+            callback_data=f"grpwelcome:{gid}")],
         [InlineKeyboardButton(
             f"🎬 IMDB info: {'ON' if imdb else 'OFF'}",
-            callback_data=f"grpimdb:{g.id}")],
+            callback_data=f"grpimdb:{gid}")],
+        [InlineKeyboardButton(
+            f"🖼 Poster: {'ON' if poster else 'OFF'}",
+            callback_data=f"grp:poster:{gid}")],
+        [InlineKeyboardButton(
+            f"💬 Start msg: {'set' if s.get('start_message') else 'off'}",
+            callback_data=f"grpsmsg:{gid}")],
+        [await _tier_btn(client, gid, TIER_500,
+                         f"📝 Caption: {'set' if s.get('caption_tpl') else 'off'}",
+                         f"grpcap:{gid}")],
+        [await _tier_btn(client, gid, TIER_1000,
+                         f"🔘 Start button: {'set' if s.get('start_btn_text') else 'off'}",
+                         f"grpsbtn:{gid}")],
+        [await _tier_btn(client, gid, TIER_3000,
+                         f"🔗 Join channel: {'set' if s.get('join_channel') else 'off'}",
+                         f"grpjoin:{gid}")],
         [InlineKeyboardButton("🔌 Disconnect",
-                              callback_data=f"grpdel:{g.id}")],
+                              callback_data=f"grpdel:{gid}")],
         [InlineKeyboardButton("⬅️ All groups", callback_data="grplist")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def _panel_text(g: Group) -> str:
+async def _panel_text(client: Client, g: Group) -> str:
     s = g.settings or {}
-    ad = int(s.get("autodelete_seconds") or 0)
-    ad_txt = "off" if not ad else f"{ad // 60} min"
+    raw_ad = s.get("autodelete_seconds")
+    ad_txt = "🌐 global" if raw_ad is None else (
+        "off" if not int(raw_ad) else f"{int(raw_ad) // 60} min")
     fsub = s.get("force_sub") or []
     imdb = s.get("imdb_enabled", True)
+    n = await group_member_count(client, g.id)
+    tier = ("BASIC" if n < TIER_500 else "500+" if n < TIER_1000
+            else "1000+" if n < TIER_3000 else "3000+")
+    if await is_owner_group(g.id):
+        tier += " 👑"
+    un = await _bot_username(client)
+    start_link = (f"\n🔗 Start link: <code>https://t.me/{un}"
+                  f"?start=grp_{g.id}</code>" if un else "")
+    ai = await group_ai_allowed(client, g.id)
     return (
-        f"👪 <b>{ui.esc(g.title or str(g.id))}</b>\n<code>{g.id}</code>\n\n"
+        f"👪 <b>{ui.esc(g.title or str(g.id))}</b>\n<code>{g.id}</code>\n"
+        f"👥 {n:,} members · tier <b>{tier}</b>{start_link}\n\n"
         f"🗑 Auto-delete: <b>{ad_txt}</b>\n"
         f"📢 Force-sub: <b>{ui.esc(', '.join(fsub) if fsub else 'off')}</b>\n"
         f"👋 Welcome: <b>{'set' if s.get('welcome') else 'off'}</b>\n"
-        f"🎬 IMDB info: <b>{'ON' if imdb else 'OFF'}</b>"
+        f"🎬 IMDB info: <b>{'ON' if imdb else 'OFF'}</b>\n"
+        f"🖼 Poster: <b>{'ON' if s.get('poster', True) else 'OFF'}</b>\n"
+        f"💬 Start msg: <b>{'set' if s.get('start_message') else 'off'}</b>\n"
+        f"📝 Caption tpl: <b>{'set' if s.get('caption_tpl') else 'off'}</b>\n"
+        f"🔗 Join channel: <b>{ui.esc(s.get('join_channel') or 'off')}</b>\n"
+        f"🤖 AI spell: <b>{'ON' if ai else 'OFF'}</b>\n\n"
+        f"<i>🛡 Mod: /gban /gunban /gwarn · 📣 /gbroadcast · "
+        f"1000+ group admins: /ubroadcast</i>"
     )
 
 
@@ -144,6 +271,25 @@ def _can_manage(uid: int | None, g: Group | None) -> bool:
     if settings.is_admin(uid):
         return True
     return (g.settings or {}).get("connected_by") == uid
+
+
+async def _can_manage_async(client: Client, uid: int | None,
+                           g: Group | None) -> bool:
+    """v10.14: _can_manage + a LIVE get_chat_member fallback.
+
+    Fixes groups where the bot was added directly (no connected_by
+    stored): the group's real admins can still control the bot.
+    """
+    if _can_manage(uid, g):
+        return True
+    if not uid or not g:
+        return False
+    try:
+        m = await client.get_chat_member(g.id, uid)
+        return m.status in (ChatMemberStatus.ADMINISTRATOR,
+                            ChatMemberStatus.OWNER)
+    except Exception:
+        return False
 
 
 async def _manageable_groups(uid: int) -> list[Group]:
@@ -172,14 +318,22 @@ async def _connect(client: Client, message: Message):
         await message.reply_text("Run /connect inside the group.")
         return
     uid = message.from_user.id if message.from_user else None
-    try:
-        m = await client.get_chat_member(message.chat.id, uid)
-        if m.status not in (ChatMemberStatus.ADMINISTRATOR,
-                             ChatMemberStatus.OWNER):
-            await message.reply_text("⛔ Only group admins can connect.")
-            return
-    except Exception:
-        await message.reply_text("⚠️ Couldn't verify admin status.")
+    ok = False
+    if uid is None and message.sender_chat \
+            and message.sender_chat.id == message.chat.id:
+        # v10.14: anonymous admin — posting as the group implies rights.
+        ok = True
+    elif uid:
+        try:
+            m = await client.get_chat_member(message.chat.id, uid)
+            ok = m.status in (ChatMemberStatus.ADMINISTRATOR,
+                              ChatMemberStatus.OWNER)
+        except Exception:
+            ok = False
+    if not ok:
+        await message.reply_text(
+            "⛔ Only group admins can connect." if uid
+            else "⚠️ Couldn't verify admin status.")
         return
     await _save_group(message.chat.id, message.chat.title,
                       connected_by=uid)
@@ -187,6 +341,269 @@ async def _connect(client: Client, message: Message):
         f"✅ <b>{message.chat.title}</b> connected.\n"
         "Manage it from my PM with /groups.",
         parse_mode=ParseMode.HTML)
+
+
+async def _set_main_group(client: Client, message: Message):
+    """v10.14: /setmaingroup — bot-owner-only, run inside the group.
+
+    Marks the group as the owner's main group: every feature unlocked.
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("Run /setmaingroup inside the group.")
+        return
+    uid = message.from_user.id if message.from_user else None
+    if not uid or not settings.is_admin(uid):
+        await message.reply_text("⛔ Bot owner only.")
+        return
+    await rt.set_setting("OWNER_GROUP_ID", str(message.chat.id))
+    await _save_group(message.chat.id, message.chat.title)
+    await message.reply_text(
+        f"✅ Owner group set: <b>{ui.esc(message.chat.title or '')}</b>\n"
+        "All features unlocked here.", parse_mode=ParseMode.HTML)
+
+
+async def _locked_cb(client: Client, query):
+    """v10.14: 🔒 tier buttons — explain the member requirement."""
+    try:
+        need = int((query.data or "").split(":")[2])
+        gid = int((query.data or "").split(":")[3])
+    except (ValueError, IndexError):
+        await query.answer("🔒 Locked.", show_alert=True)
+        return
+    n = await group_member_count(client, gid)
+    await query.answer(
+        f"🔒 Needs {need}+ members (this group: {n}).", show_alert=True)
+
+
+async def _require_group_admin(client: Client,
+                             message: Message) -> int | None:
+    """v10.14: gate for in-group mod commands.
+
+    Returns the admin uid (0 = anonymous admin), or None after replying.
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("Use this inside the group.")
+        return None
+    uid = message.from_user.id if message.from_user else None
+    if uid is None and message.sender_chat \
+            and message.sender_chat.id == message.chat.id:
+        return 0  # anonymous admin
+    if uid and settings.is_admin(uid):
+        return uid
+    try:
+        m = await client.get_chat_member(message.chat.id, uid)
+        if m.status in (ChatMemberStatus.ADMINISTRATOR,
+                        ChatMemberStatus.OWNER):
+            return uid
+    except Exception:
+        pass
+    await message.reply_text("⛔ Only group admins can use this.")
+    return None
+
+
+def _ban_target(message: Message) -> int | None:
+    """Target user for /gban|/gunban|/gwarn: reply, else first arg."""
+    r = message.reply_to_message
+    if r and r.from_user and not r.from_user.is_bot:
+        return r.from_user.id
+    parts = (message.text or "").split()
+    if len(parts) > 1:
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+async def _is_gbanned(chat_id: int, uid: int) -> bool:
+    """v10.14: is this user group-banned here?"""
+    try:
+        g = await _get_group(chat_id)
+        return str(uid) in ((g.settings or {}).get("gbanned") or {})
+    except Exception:
+        return False
+
+
+async def _gban(client: Client, message: Message):
+    """/gban — group-admin-only. Usage: reply, or /gban <id> [reason]."""
+    if await _require_group_admin(client, message) is None:
+        return
+    target = _ban_target(message)
+    if not target:
+        await message.reply_text(
+            "Usage: reply to a user with <code>/gban</code>, or "
+            "<code>/gban &lt;user_id&gt; [reason]</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+    parts = (message.text or "").split(None, 2)
+    reason = parts[2] if len(parts) > 2 else ""
+
+    def _mut(s):
+        gb = dict(s.get("gbanned") or {})
+        gb[str(target)] = reason
+        s["gbanned"] = gb
+        return s
+
+    await _save_group(message.chat.id, None, mutate=_mut)
+    await message.reply_text(
+        f"⛔ Banned <code>{target}</code> in this group."
+        + (f" Reason: {ui.esc(reason)}" if reason else ""),
+        parse_mode=ParseMode.HTML)
+
+
+async def _gunban(client: Client, message: Message):
+    """/gunban — group-admin-only. Usage: reply, or /gunban <id>."""
+    if await _require_group_admin(client, message) is None:
+        return
+    target = _ban_target(message)
+    if not target:
+        await message.reply_text(
+            "Usage: reply to a user with <code>/gunban</code>, or "
+            "<code>/gunban &lt;user_id&gt;</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    def _mut(s):
+        gb = dict(s.get("gbanned") or {})
+        gb.pop(str(target), None)
+        s["gbanned"] = gb
+        gw = dict(s.get("gwarns") or {})
+        gw.pop(str(target), None)
+        s["gwarns"] = gw
+        return s
+
+    await _save_group(message.chat.id, None, mutate=_mut)
+    await message.reply_text(f"✅ Unbanned <code>{target}</code>.",
+                             parse_mode=ParseMode.HTML)
+
+
+async def _gwarn(client: Client, message: Message):
+    """/gwarn — group-admin-only. 3 warns = auto group-ban."""
+    if await _require_group_admin(client, message) is None:
+        return
+    target = _ban_target(message)
+    if not target:
+        await message.reply_text(
+            "Usage: reply to a user with <code>/gwarn</code>, or "
+            "<code>/gwarn &lt;user_id&gt;</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+    warn_limit = 3
+    try:
+        warn_limit = int(await rt.aget_setting("WARN_LIMIT") or 3)
+    except (TypeError, ValueError):
+        pass
+
+    def _mut(s):
+        gw = dict(s.get("gwarns") or {})
+        gw[str(target)] = int(gw.get(str(target)) or 0) + 1
+        s["gwarns"] = gw
+        return s
+
+    g = await _save_group(message.chat.id, None, mutate=_mut)
+    n = int((g.settings or {}).get("gwarns", {}).get(str(target), 0))
+    if n >= warn_limit:
+        def _ban(s):
+            gb = dict(s.get("gbanned") or {})
+            gb[str(target)] = f"auto-ban: {n} warns"
+            s["gbanned"] = gb
+            return s
+
+        await _save_group(message.chat.id, None, mutate=_ban)
+        await message.reply_text(
+            f"⛔ <code>{target}</code> reached {n} warns — banned.",
+            parse_mode=ParseMode.HTML)
+    else:
+        await message.reply_text(
+            f"⚠️ Warned <code>{target}</code> ({n}/{warn_limit}).",
+            parse_mode=ParseMode.HTML)
+
+
+async def _gbroadcast(client: Client, message: Message):
+    """/gbroadcast — group-admin-only: send to THIS group only."""
+    if await _require_group_admin(client, message) is None:
+        return
+    src = message.reply_to_message
+    text = (message.text or "").partition(" ")[2].strip()
+    if not src and not text:
+        await message.reply_text(
+            "Usage: reply to a message with <code>/gbroadcast</code>, or "
+            "<code>/gbroadcast &lt;text&gt;</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+    try:
+        if src:
+            await src.copy(message.chat.id)
+        else:
+            await client.send_message(message.chat.id, text,
+                                      parse_mode=ParseMode.HTML)
+        await message.reply_text("📢 Sent to this group.")
+    except Exception as exc:  # noqa: BLE001
+        await message.reply_text(f"❌ Failed: {ui.esc(str(exc)[:120])}",
+                                 parse_mode=ParseMode.HTML)
+
+
+async def _ubroadcast(client: Client, message: Message):
+    """v10.14: /ubroadcast — group-admin of a 1000+ group (or bot owner)
+    broadcasts to ALL bot PM users. 1000+ tier."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("Use /ubroadcast inside the group.")
+        return
+    uid = message.from_user.id if message.from_user else None
+    if not (uid and settings.is_admin(uid)):
+        if await _require_group_admin(client, message) is None:
+            return
+        if not await group_unlocked(client, message.chat.id, TIER_1000):
+            n = await group_member_count(client, message.chat.id)
+            await message.reply_text(
+                f"🔒 /ubroadcast needs 1000+ members (this group: {n}).")
+            return
+    src = message.reply_to_message
+    text = (message.text or "").partition(" ")[2].strip()
+    if not src and not text:
+        await message.reply_text(
+            "Usage: reply to a message with <code>/ubroadcast</code>, or "
+            "<code>/ubroadcast &lt;text&gt;</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+    from app.bot.handlers.common import broadcast_to_users
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as s:
+        ids = (await s.execute(
+            select(User.id).where(User.is_banned.is_(False)))).scalars().all()
+    status = await message.reply_text(
+        f"📢 Broadcasting to {len(ids):,} users…")
+
+    async def _prog(sent: int, failed: int, total: int) -> None:
+        try:
+            await status.edit_text(
+                f"📢 {sent + failed:,}/{total:,}… ✅{sent} ❌{failed}")
+        except Exception:
+            pass
+
+    sent, failed = await broadcast_to_users(
+        client, list(ids), text=text or None, src_msg=src,
+        progress_cb=_prog)
+    await status.edit_text(f"📢 Done. ✅ {sent:,} sent, ❌ {failed:,} failed.")
+
+
+async def _group_settings(client: Client, message: Message):
+    """v10.14: /settings inside the group — opens the panel in-group."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("Run /settings inside the group.")
+        return
+    uid = message.from_user.id if message.from_user else None
+    g = await _get_group(message.chat.id)
+    if g is None:
+        await _save_group(message.chat.id, message.chat.title)
+        g = await _get_group(message.chat.id)
+    anonymous = (uid is None and message.sender_chat
+                 and message.sender_chat.id == message.chat.id)
+    if not anonymous and not await _can_manage_async(client, uid, g):
+        await message.reply_text("⛔ Only group admins.")
+        return
+    await message.reply_text(await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
+                             parse_mode=ParseMode.HTML)
 
 
 async def _bot_added(client: Client, message: Message):
@@ -200,6 +617,29 @@ async def _bot_added(client: Client, message: Message):
             await message.reply_text(welcome, parse_mode=ParseMode.HTML)
         except Exception:
             pass
+
+
+async def _welcome_new_members(client: Client, message: Message):
+    """v10.14: per-group custom welcome for new human members.
+
+    Reads groups.settings["welcome"]; {name} becomes the member's first
+    name. Skips bots and groups without a welcome set.
+    """
+    try:
+        g = await _get_group(message.chat.id)
+        welcome = (g.settings or {}).get("welcome") if g else None
+        if not welcome:
+            return
+        for u in message.new_chat_members or []:
+            if u.is_bot:
+                continue
+            text = welcome.replace("{name}", u.first_name or "friend")
+            try:
+                await message.reply_text(text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+    except Exception as exc:  # noqa: BLE001
+        log.debug("welcome new members failed: %s", exc)
 
 
 # ---------- /groups (PM) ----------
@@ -229,7 +669,7 @@ async def _grp_open(client: Client, query):
     if not g:
         await query.answer("Group not found.", show_alert=True)
         return
-    await query.message.edit_text(_panel_text(g), reply_markup=_panel_kb(g),
+    await query.message.edit_text(await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
                                   parse_mode=ParseMode.HTML)
     await query.answer()
 
@@ -265,10 +705,17 @@ async def _ad_menu(client: Client, query):
 async def _ad_set(client: Client, query):
     _, gid, sec = query.data.split(":")
     gid, sec = int(gid), int(sec)
-    await _save_group(gid, None,
-                      mutate=lambda s: {**s, "autodelete_seconds": sec})
+    if sec < 0:
+        # v10.14: 🌐 Global default — delete the override, inherit global.
+        def _drop(s):
+            s.pop("autodelete_seconds", None)
+            return s
+        await _save_group(gid, None, mutate=_drop)
+    else:
+        await _save_group(gid, None,
+                          mutate=lambda s: {**s, "autodelete_seconds": sec})
     g = await _get_group(gid)
-    await query.message.edit_text(_panel_text(g), reply_markup=_panel_kb(g),
+    await query.message.edit_text(await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
                                   parse_mode=ParseMode.HTML)
     await query.answer("Saved.")
 
@@ -331,7 +778,7 @@ async def _pending_reply(client: Client, message: Message):
         try:
             await client.edit_message_text(
                 message.chat.id, pend.get("panel_msg_id"),
-                _panel_text(g), reply_markup=_panel_kb(g),
+                await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
                 parse_mode=ParseMode.HTML)
         except Exception:
             pass
@@ -362,6 +809,57 @@ async def _pending_reply(client: Client, message: Message):
         else:
             await _save_group(gid, None,
                               mutate=lambda s: {**s, "welcome": text[:1000]})
+    elif pend["action"] == "startmsg":
+        # v10.14: custom /start message for this group's start link.
+        if text.lower() == "off":
+            await _save_group(gid, None,
+                              mutate=lambda s: {k: v for k, v in s.items()
+                                                if k != "start_message"})
+        else:
+            await _save_group(gid, None,
+                              mutate=lambda s: {**s,
+                                                "start_message": text[:1500]})
+    elif pend["action"] == "caption_tpl":
+        # v10.14: custom file caption. Placeholders: {name} {quality}
+        # {lang} {size}. 500+ members.
+        if text.lower() == "off":
+            await _save_group(gid, None,
+                              mutate=lambda s: {k: v for k, v in s.items()
+                                                if k != "caption_tpl"})
+        else:
+            await _save_group(gid, None,
+                              mutate=lambda s: {**s,
+                                                "caption_tpl": text[:500]})
+    elif pend["action"] == "start_btn":
+        # v10.14: "Button Text | https://…" under the start message.
+        # 1000+ members.
+        if text.lower() == "off":
+            await _save_group(gid, None,
+                              mutate=lambda s: {k: v for k, v in s.items()
+                                                if k not in ("start_btn_text",
+                                                             "start_btn_url")})
+        else:
+            parts = [p.strip() for p in text.split("|", 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                await _save_group(
+                    gid, None,
+                    mutate=lambda s: {**s, "start_btn_text": parts[0][:60],
+                                      "start_btn_url": parts[1][:300]})
+            else:
+                await message.reply_text(
+                    "❌ Send as <code>Button Text | https://…</code>",
+                    parse_mode=ParseMode.HTML)
+                raise StopPropagation
+    elif pend["action"] == "join_channel":
+        # v10.14: extra join-channel button under force-sub. 3000+ members.
+        if text.lower() == "off":
+            await _save_group(gid, None,
+                              mutate=lambda s: {k: v for k, v in s.items()
+                                                if k != "join_channel"})
+        else:
+            await _save_group(gid, None,
+                              mutate=lambda s: {**s,
+                                                "join_channel": text[:200]})
     _pending.pop(uid, None)
     try:
         await message.delete()  # panel shows the new value — no clutter
@@ -383,18 +881,25 @@ def _admin_cb(func):
 
 
 def _mgr_cb(func):
-    """v10.10.1: the bot admin, or the group admin who connected it."""
+    """v10.10.1: the bot admin, or the group admin who connected it.
+
+    v10.14: falls back to a live get_chat_member check so real group
+    admins can manage the bot even when it was added without /connect.
+    """
     async def wrapper(client: Client, query):
         uid = query.from_user.id if query.from_user else None
         if settings.is_admin(uid):
             return await func(client, query)
         gid = None
         try:
-            gid = int((query.data or "").split(":")[1])
+            parts = (query.data or "").split(":")
+            # 3-part form grp:<action>:<gid> — gid is last there.
+            gid = int(parts[2] if len(parts) > 2 and parts[0] == "grp"
+                      else parts[1])
         except (ValueError, IndexError):
             pass
         g = await _get_group(gid) if gid else None
-        if not _can_manage(uid, g):
+        if not await _can_manage_async(client, uid, g):
             await query.answer("⛔ Only this group's admin can do that.",
                                show_alert=True)
             return
@@ -414,24 +919,55 @@ async def _grp_imdb(client: Client, query):
     await _save_group(gid, None,
                       mutate=lambda s: {**s, "imdb_enabled": not cur})
     g = await _get_group(gid)
-    await query.message.edit_text(_panel_text(g), reply_markup=_panel_kb(g),
+    await query.message.edit_text(await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
                                   parse_mode=ParseMode.HTML)
     await query.answer(f"🎬 IMDB {'ON' if not cur else 'OFF'}")
+
+
+async def _grp_poster(client: Client, query):
+    """v10.14: toggle per-group TMDB poster (default ON)."""
+    gid = int(query.data.split(":")[2])
+    g = await _get_group(gid)
+    if not g:
+        await query.answer("Group not found.", show_alert=True)
+        return
+    cur = bool((g.settings or {}).get("poster", True))
+    await _save_group(gid, None,
+                      mutate=lambda s: {**s, "poster": not cur})
+    g = await _get_group(gid)
+    await query.message.edit_text(await _panel_text(client, g), reply_markup=await _panel_kb(client, g),
+                                  parse_mode=ParseMode.HTML)
+    await query.answer(f"🖼 Poster {'ON' if not cur else 'OFF'}")
 
 
 def register(bot: Client) -> None:
     bot.on_message(filters.group & filters.command("connect"))(_connect)
     bot.on_message(filters.group & filters.command("start"))(_group_start)
+    # v10.14: group management.
+    bot.on_message(filters.group & filters.command("setmaingroup"))(
+        _set_main_group)
+    bot.on_message(filters.group & filters.command("settings"))(
+        _group_settings)
+    bot.on_message(filters.group & filters.command("gban"))(_gban)
+    bot.on_message(filters.group & filters.command("gunban"))(_gunban)
+    bot.on_message(filters.group & filters.command("gwarn"))(_gwarn)
+    bot.on_message(filters.group & filters.command("gbroadcast"))(
+        _gbroadcast)
+    bot.on_message(filters.group & filters.command("ubroadcast"))(
+        _ubroadcast)
     bot.on_message(filters.group & filters.new_chat_members)(_bot_added)
+    bot.on_message(filters.group & filters.new_chat_members)(
+        _welcome_new_members)
     bot.on_message(filters.private & filters.command("groups"))(_groups)
     # pending replies must run before the search text handler
     bot.on_message(filters.private & filters.text,
                    group=-1)(_pending_reply)
 
+    bot.on_callback_query(filters.regex(r"^grp:locked:\d+:-?\d+$"))(_locked_cb)
     bot.on_callback_query(filters.regex(r"^grp:-?\d+$"))(_mgr_cb(_grp_open))
     bot.on_callback_query(filters.regex(r"^grplist$"))(_grp_list)
     bot.on_callback_query(filters.regex(r"^grpadmenu:-?\d+$"))(_mgr_cb(_ad_menu))
-    bot.on_callback_query(filters.regex(r"^grpad:-?\d+:\d+$"))(_mgr_cb(_ad_set))
+    bot.on_callback_query(filters.regex(r"^grpad:-?\d+:-?\d+$"))(_mgr_cb(_ad_set))
     bot.on_callback_query(filters.regex(r"^grpfsub:-?\d+$"))(
         _mgr_cb(lambda c, q: _ask_reply(
             c, q, "fsub",
@@ -441,5 +977,29 @@ def register(bot: Client) -> None:
             c, q, "welcome",
             "👋 Send the welcome text for new members, or <code>off</code> to clear.")))
     bot.on_callback_query(filters.regex(r"^grpimdb:-?\d+$"))(_mgr_cb(_grp_imdb))
+    # v10.14: tiered settings.
+    bot.on_callback_query(filters.regex(r"^grp:poster:-?\d+$"))(
+        _mgr_cb(_grp_poster))
+    bot.on_callback_query(filters.regex(r"^grpsmsg:-?\d+$"))(
+        _mgr_cb(lambda c, q: _ask_reply(
+            c, q, "startmsg",
+            "💬 Send the custom <b>/start</b> message for this group's "
+            "start link, or <code>off</code> to clear.")))
+    bot.on_callback_query(filters.regex(r"^grpcap:-?\d+$"))(
+        _mgr_cb(lambda c, q: _ask_reply(
+            c, q, "caption_tpl",
+            "📝 Send the caption template — placeholders "
+            "<code>{name}</code> <code>{quality}</code> <code>{lang}</code> "
+            "<code>{size}</code> — or <code>off</code> to clear.")))
+    bot.on_callback_query(filters.regex(r"^grpsbtn:-?\d+$"))(
+        _mgr_cb(lambda c, q: _ask_reply(
+            c, q, "start_btn",
+            "🔘 Send <code>Button Text | https://…</code> for the button "
+            "under the start message, or <code>off</code> to clear.")))
+    bot.on_callback_query(filters.regex(r"^grpjoin:-?\d+$"))(
+        _mgr_cb(lambda c, q: _ask_reply(
+            c, q, "join_channel",
+            "🔗 Send the extra join channel (<code>@username</code> or URL) "
+            "shown under the force-sub buttons, or <code>off</code> to clear.")))
     bot.on_callback_query(filters.regex(r"^grpdel:-?\d+$"))(_mgr_cb(_grp_del))
     bot.on_callback_query(filters.regex(r"^grpdelok:-?\d+$"))(_mgr_cb(_grp_del_ok))

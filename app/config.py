@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     # --- Optional integrations ---
     TMDB_API_KEY: str = ""
+    OPENSUBTITLES_API_KEY: str = ""  # v10.14: official subtitle API key
     REQUEST_CHANNEL: str = ""      # where /request posts go (@username or id)
     LOG_CHANNEL: str = ""          # admin log channel (@username or id)
 

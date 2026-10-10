@@ -526,7 +526,7 @@ async def subs_send(token: str, sub_id: str, to: str = ""):
             return {"ok": False, "error": "translate failed"}
     else:
         got = await subs.download_subtitle(sub_id)
-        if not got:
+        if not got or not got[0]:
             return {"ok": False, "error": "download failed"}
         sdata, name = got
     client = bot_app.bot
@@ -556,7 +556,7 @@ async def subs_file(sub_id: str):
     """Proxy one .srt so the web player can load it (same-origin)."""
     from app import subs
     got = await subs.download_subtitle(sub_id)
-    if not got:
+    if not got or not got[0]:
         raise HTTPException(404, "subtitle not found")
     data, name = got
     return Response(
@@ -578,7 +578,7 @@ async def subs_translate(sub_id: str, to: str = "mal"):
     to = re.sub(r"[^a-z]", "", (to or "mal").lower())[:5] or "mal"
     from app import subs
     got = await subs.download_subtitle(sub_id)
-    if not got:
+    if not got or not got[0]:
         raise HTTPException(404, "subtitle not found")
     data, name = got
     try:

@@ -175,7 +175,7 @@ async def correct_query(raw_query: str, session_factory) -> str | None:
     if not changed:
         return None
     fixed = " ".join(out)
-    log.info("spell auto-correct %r -> %r", q[:60], fixed[:60])
+    log.debug("spell auto-correct %r -> %r", q[:60], fixed[:60])
     return fixed
 
 

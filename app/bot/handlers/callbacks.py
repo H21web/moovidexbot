@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app import personalize, state
 from app import autodelete
+from app import runtime as rt
 from app.analytics import log_event
 from app.bot import forcesub, ui, v8_ui
 from app.bot.handlers.common import is_banned
@@ -59,7 +60,9 @@ def _page_data(token: str, page: int):
     if not data:
         return None, None, None
     groups = data["groups"]
-    per = settings.RESULTS_PER_PAGE
+    # v10.14: live setting (sync cache read — set_setting writes through,
+    # so admin changes apply immediately even here).
+    per = int(rt.get_setting("RESULTS_PER_PAGE") or 10)
     total_pages = max(1, math.ceil(len(groups) / per))
     page = max(0, min(page, total_pages - 1))
     return data, groups[page * per:(page + 1) * per], (page, total_pages,
@@ -104,7 +107,7 @@ async def _movie(client: Client, query):
         await query.answer("⌛ Expired — search again.", show_alert=True)
         return
     group = data["groups"][gidx]
-    per = settings.RESULTS_PER_PAGE
+    per = int(await rt.aget_setting("RESULTS_PER_PAGE") or 10)
     page = gidx // per
     await query.answer()
     poster = None
@@ -173,7 +176,8 @@ async def _back(client: Client, query):
                                    page_start=start))
 
 
-async def _send_file(client: Client, target_id: int, f, uid: int):
+async def _send_file(client: Client, target_id: int, f, uid: int,
+                     group_id: int | None = None):
     """Send a File row to ``target_id`` via cached media.
 
     Shared by in-PM delivery, group→PM delivery, and the ``dl_``
@@ -183,18 +187,33 @@ async def _send_file(client: Client, target_id: int, f, uid: int):
     # tokens and download counters need the GLOBAL (shard-packed) id.
     from app.db_shard import encode_gid
     gid = encode_gid(getattr(f, "_shard_idx", 0), f.id)
+    # v10.14: per-group custom caption template (500+ tier).
+    caption_tpl = None
+    if group_id:
+        try:
+            from app.bot.handlers.groups import _get_group
+            _g = await _get_group(group_id)
+            caption_tpl = ((_g.settings or {}).get("caption_tpl")
+                           or "").strip() or None
+        except Exception:
+            caption_tpl = None
+    if caption_tpl:
+        caption = ui.render_caption_tpl(caption_tpl, f)
+    else:
+        caption = ui.file_caption({
+            "file_name": f.file_name, "quality": f.quality,
+            "language": f.language, "file_size": f.file_size})
     # send_cached_media (not send_document): send_document rejects
     # non-document file_ids ("Expected DOCUMENT, got VIDEO"), which
     # broke delivery for every video file.
     sent = await client.send_cached_media(
         target_id,
         file_id=f.file_id,
-        caption=ui.file_caption({
-            "file_name": f.file_name, "quality": f.quality,
-            "language": f.language, "file_size": f.file_size}),
+        caption=caption,
         parse_mode=ParseMode.HTML,
         reply_markup=v8_ui.v8_file_kb(gid, uid),
-        protect_content=settings.PROTECT_CONTENT,
+        # v10.14: live setting — admin panel toggle actually takes effect.
+        protect_content=bool(await rt.aget_setting("PROTECT_CONTENT")),
     )
     asyncio.create_task(log_event(
         "download", user_id=uid, chat_id=sent.chat.id,
@@ -242,6 +261,13 @@ async def _deliver(client: Client, query):
         return
     src = query.message.chat
     in_group = src.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    # v10.14: group-banned users can't pull files via this group.
+    if in_group:
+        from app.bot.handlers.groups import _is_gbanned
+        if await _is_gbanned(src.id, uid):
+            await query.answer("⛔ You are banned in this group.",
+                               show_alert=True)
+            return
     try:
         file_db_id = int(query.data.split(":")[1])
     except (ValueError, IndexError):
@@ -265,7 +291,9 @@ async def _deliver(client: Client, query):
     if not in_group:
         await _safe_edit(query.message, "📤 <i>Uploading…</i>")
     try:
-        await _send_file(client, target, f, uid)
+        # v10.14: pass the source group for its custom caption template.
+        await _send_file(client, target, f, uid,
+                         group_id=src.id if in_group else None)
     except PeerIdInvalid:
         # User never started the bot in PM — one-tap deep link that
         # delivers this exact file once they tap START.
@@ -335,7 +363,7 @@ async def _ait(client: Client, query):
     if action == "req":
         # save the original search as a movie request
         await query.answer("🎞 Saving as request…")
-        log.info("[s:%s] ai-choose: request instead %r", sid,
+        log.debug("[s:%s] ai-choose: request instead %r", sid,
                  original[:60])
         try:
             from app.bot.handlers.requests import submit_request
@@ -362,7 +390,7 @@ async def _ait(client: Client, query):
         await query.answer("⌛ Expired — search again.", show_alert=True)
         return
     await query.answer(f"🔍 {chosen[:40]}")
-    log.info("[s:%s] ai-choose: %r -> searching", sid, chosen[:60])
+    log.debug("[s:%s] ai-choose: %r -> searching", sid, chosen[:60])
     try:
         from app.bot.handlers import search as search_handlers
         if data.get("group"):
@@ -409,7 +437,7 @@ async def _ais(client: Client, query):
         await query.answer("⌛ Expired — search again.", show_alert=True)
         return
     await query.answer("🎞 Saving as request…")
-    log.info("[s:%s] ai-suggest: requesting %r", sid, wanted[:60])
+    log.debug("[s:%s] ai-suggest: requesting %r", sid, wanted[:60])
     try:
         from app.bot.handlers.requests import submit_request
         await submit_request(client, uid, query.message.chat.id, wanted)
@@ -545,10 +573,10 @@ async def _watch_join(client: Client, uid: int, message: Message,
             except Exception:
                 continue
             if not missing:
-                log.info("join watcher: user %d joined, continuing", uid)
+                log.debug("join watcher: user %d joined, continuing", uid)
                 await _do_post_join(client, uid, message)
                 return
-        log.info("join watcher: timed out for user %d", uid)
+        log.debug("join watcher: timed out for user %d", uid)
         try:
             await _safe_edit(
                 message,
@@ -604,7 +632,7 @@ async def _on_member_update(client: Client, update) -> None:
     except Exception:
         return
     if not missing:
-        log.info("member update: user %d joined, continuing", uid)
+        log.debug("member update: user %d joined, continuing", uid)
         item = _cancel_watch(uid)
         msg = item[1] if item else None
         if msg is not None:

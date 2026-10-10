@@ -120,17 +120,27 @@ def v8_file_kb(file_db_id: int, user_id: int):
     return InlineKeyboardMarkup(rows)
 
 
-def _clean_disp_name(name: str) -> str:
-    """Display-clean file name: full name, dots/underscores -> spaces."""
-    import re as _re
-    s = _re.sub(r"[._]+", " ", name or "").strip()
-    return _re.sub(r"\s+", " ", s)
+def sort_series_newest_first(files: list[dict]) -> list[dict]:
+    """Series results: newest season/episode first.
+
+    Stable sort by (-season, -episode) over the existing best-first order,
+    so files with no S/E tags keep their relative order at the end.
+    Movies (no S/E tags anywhere) are returned unchanged.
+    """
+    se = [file_season_episode(f.get("file_name")) for f in files]
+    if not any(s or e for s, e in se):
+        return files
+    return [f for _, f in sorted(
+        zip(se, files),
+        key=lambda p: (-(p[0][0] or 0), -(p[0][1] or 0)))]
 
 
 def _v8_file_line(idx: int, f: dict, user_id: int,
                   bot_username: str | None = None) -> str:
-    """One file as its own blockquote — full name + meta inside."""
-    name = _clean_disp_name(f.get("file_name") or "file")
+    """One file as its own blockquote — cleaned name + detailed meta."""
+    from app.textutil import clean_display_name
+    raw = f.get("file_name") or "file"
+    name = clean_display_name(raw)
     # Tapping the file name delivers the file (deep link -> dl_ handler).
     deep = file_deep_link(bot_username, f["id"])
     if deep:
@@ -138,14 +148,21 @@ def _v8_file_line(idx: int, f: dict, user_id: int,
     else:
         disp = f"<b>{esc(name)}</b>"
     icon = kind_icon(file_name=name)
-    meta = " · ".join(x for x in (
-        f.get("quality"), f.get("language"), fmt_size(f.get("file_size"))) if x)
-    s, e = file_season_episode(name)
+    # Season/episode parsed from the RAW name (cleaning may truncate).
+    s, e = file_season_episode(raw)
+    se = ""
     if s or e:
         se = f"S{s:02d}" if s else ""
         if e:
             se += f"E{e:02d}"
-        meta = se + (" · " + meta if meta else "")
+    dl = f.get("downloads") or 0
+    meta = " · ".join(x for x in (
+        se or None,
+        f.get("quality"),
+        f.get("language"),
+        fmt_size(f.get("file_size")),
+        f"⬇ {dl:,}" if dl else None,
+    ) if x)
     inner = f"{icon} {disp}"
     if meta:
         inner += f"\n<i>{esc(meta)}</i>"
@@ -178,7 +195,11 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
             plot = meta["plot"]
             parts.append(f"<i>{esc(plot[:170] + '…' if len(plot) > 170 else plot)}</i>")
         parts.append("")
-    bname = _clean_disp_name(best.get("file_name") or "")
+    from app.textutil import clean_display_name
+    # v10.14: series — newest season/episode first (idempotent: _build_v8
+    # already sorted the full list; this keeps single-page renders sane).
+    files = sort_series_newest_first(files)
+    bname = clean_display_name(best.get("file_name") or "")
     bdeep = file_deep_link(bot_username, best["id"])
     bq: list[str] = []
     if bdeep:

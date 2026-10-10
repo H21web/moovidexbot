@@ -147,16 +147,25 @@ async def _invite_url(client, ref: int | str, raw: str) -> tuple[str, bool]:
     return f"https://t.me/{str(raw).lstrip('@')}", False
 
 
-async def join_kb(client, channels: list[str]) -> InlineKeyboardMarkup:
+async def join_kb(client, channels: list[str],
+                  extra_url: str | None = None) -> InlineKeyboardMarkup:
     """v10.9.0: no channel ids in button text — just "Join Channel".
     No "I've joined" button either: the bot auto-detects the join
-    (chat_member update + a poll watcher) and continues by itself."""
+    (chat_member update + a poll watcher) and continues by itself.
+
+    v10.14: ``extra_url`` (a group's custom join channel) is appended
+    as its own button under the force-sub buttons.
+    """
     rows = []
     for ch in channels:
         url, is_jr = await _invite_url(client, _norm_ref(ch), ch)
         label = ("📩 Request to Join Channel" if is_jr
                  else "📢 Join Channel")
         rows.append([InlineKeyboardButton(label, url=url)])
+    if extra_url:
+        url = (extra_url if extra_url.lower().startswith("http")
+               else f"https://t.me/{extra_url.lstrip('@')}")
+        rows.append([InlineKeyboardButton("🔗 Join Group Channel", url=url)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -174,7 +183,27 @@ async def ensure_joined(client, user_id: int,
                       chat_id: int | None = None) -> InlineKeyboardMarkup | None:
     """None if the user joined everything, else a join keyboard."""
     missing = await missing_channels(client, user_id, chat_id)
-    return await join_kb(client, missing) if missing else None
+    if not missing:
+        return None
+    # v10.14: a group's custom join channel (3000+ tier) is appended
+    # under the force-sub buttons for that group's users.
+    extra = None
+    if chat_id and str(chat_id).startswith("-"):
+        try:
+            from sqlalchemy import select
+
+            from app.db import get_session_factory
+            from app.models import Group
+            factory = get_session_factory(settings.DATABASE_URL)
+            async with factory() as s:
+                g = (await s.execute(
+                    select(Group).where(Group.id == chat_id)
+                )).scalar_one_or_none()
+                extra = ((g.settings or {}).get("join_channel")
+                         or "").strip() or None
+        except Exception:
+            extra = None
+    return await join_kb(client, missing, extra)
 
 
 async def approve_pending(client, user_id: int,

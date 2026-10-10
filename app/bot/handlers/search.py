@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import secrets
 import time
 
@@ -21,10 +22,17 @@ from app import autodelete
 from app.analytics import log_event
 from app.bot import forcesub, ui, v8_ui
 from app.bot.handlers.common import track_user
-from app.bot.handlers.groups import effective_autodelete
+from app.bot.handlers.groups import (
+    _is_gbanned, effective_autodelete, group_ai_allowed,
+)
 from app.config import settings
 
 log = logging.getLogger(__name__)
+
+# v10.14: search-input guards.
+_URL_QUERY_RE = re.compile(r"https?://|www\.|t\.me/|telegram\.me", re.IGNORECASE)
+_MAX_QUERY_CHARS = 200
+_MAX_QUERY_WORDS = 30
 
 
 def _is_pm(chat_id: int) -> bool:
@@ -94,7 +102,7 @@ async def _no_results_pm(client: Client, message: Message, q: str,
     found nothing — show "no result found" + a Request Movie button
     carrying the ORIGINAL user message.
     """
-    log.info("[s:%s] flow: no-results card for %r", sid, q[:60])
+    log.debug("[s:%s] flow: no-results card for %r", sid, q[:60])
     if settings.REQUEST_CHANNEL:
         text = (f"📭 <b>No results found</b>\n\n"
                 f"<i>Nothing for \"<b>{ui.esc(q[:80])}</b>\" yet.</i>")
@@ -134,7 +142,7 @@ async def _ai_choose(client: Client, wait: Message, uid: int,
         await wait.delete()
     except Exception:
         pass
-    log.info("[s:%s] flow: choose among %d titles (original %r)", sid,
+    log.debug("[s:%s] flow: choose among %d titles (original %r)", sid,
              len(choices), original_q[:60])
     await wait.reply_text(
         "🎬 <b>Which one did you mean?</b>\n\n"
@@ -171,7 +179,7 @@ async def _ai_suggest(client: Client, wait: Message, uid: int,
         await wait.delete()
     except Exception:
         pass
-    log.info("[s:%s] flow: suggest %d titles (original %r)", sid,
+    log.debug("[s:%s] flow: suggest %d titles (original %r)", sid,
              len(suggestions), original_q[:60])
     await wait.reply_text(
         "🤔 <b>No files found</b>\n\n"
@@ -196,6 +204,8 @@ async def _build_v8(client: Client, token: str,
     files = v8_ui.apply_v8_filters(data["files"], data.get("filters") or {})
     best = data["best"]
     rest = [f for f in files if f.get("id") != best.get("id")]
+    # v10.14: series — newest season/episode first across ALL pages.
+    rest = v8_ui.sort_series_newest_first(rest)
     pages = max(1, math.ceil(len(rest) / v8_ui.V8_PAGE_SIZE))
     page = max(0, min(page, pages - 1))
     chunk = rest[page * v8_ui.V8_PAGE_SIZE:(page + 1) * v8_ui.V8_PAGE_SIZE]
@@ -349,7 +359,7 @@ async def _v9_search_flow(client: Client, message: Message,
     if res.get("status") == "suggest" and not _confirmed:
         return await _ai_suggest(client, wait, uid, res)
     if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
-        log.info("[s:%s] flow: no results -> request card", sid)
+        log.debug("[s:%s] flow: no results -> request card", sid)
         try:
             await wait.delete()
         except Exception:
@@ -357,7 +367,7 @@ async def _v9_search_flow(client: Client, message: Message,
         await _no_results_pm(client, message, q, uid, sid=sid)
         return True
 
-    log.info("[s:%s] flow: rendering %d files", sid, len(res["files"]))
+    log.debug("[s:%s] flow: rendering %d files", sid, len(res["files"]))
 
     ai_note = _verdict_line(res["best"], res["title"] or q)
     best = res["best"]
@@ -418,8 +428,9 @@ async def _search_and_send(client: Client, chat_id: int, uid: int,
     return True
 
 
-async def _group_imdb_enabled(chat_id: int) -> bool:
-    """Per-group IMDB info toggle (default ON)."""
+async def _group_setting_flag(chat_id: int, key: str,
+                             default: bool = True) -> bool:
+    """Per-group boolean toggle from groups.settings (default ON)."""
     try:
         from sqlalchemy import select
 
@@ -432,10 +443,20 @@ async def _group_imdb_enabled(chat_id: int) -> bool:
                 select(Group).where(Group.id == chat_id)
             )).scalar_one_or_none()
             if g and g.settings:
-                return bool(g.settings.get("imdb_enabled", True))
+                return bool(g.settings.get(key, default))
     except Exception:
         pass
-    return True
+    return default
+
+
+async def _group_imdb_enabled(chat_id: int) -> bool:
+    """Per-group IMDB info toggle (default ON)."""
+    return await _group_setting_flag(chat_id, "imdb_enabled", True)
+
+
+async def _group_poster_enabled(chat_id: int) -> bool:
+    """v10.14: per-group TMDB poster toggle (default ON)."""
+    return await _group_setting_flag(chat_id, "poster", True)
 
 
 async def _v9_search_flow_group(client: Client, message: Message,
@@ -449,7 +470,9 @@ async def _v9_search_flow_group(client: Client, message: Message,
     wait = await message.reply_text("🔍 <i>Searching…</i>",
                                     parse_mode=ParseMode.HTML)
     try:
-        res = await search_v9.smart_search(uid, q)
+        # v10.14: AI spell help only in the owner group / 3000+ groups.
+        ai_ok = await group_ai_allowed(client, int(message.chat.id))
+        res = await search_v9.smart_search(uid, q, ai_allowed=ai_ok)
     except Exception:  # noqa: BLE001
         log.exception("v10 group search failed")
         try:
@@ -500,18 +523,24 @@ async def _v9_search_flow_group(client: Client, message: Message,
         # v10.10.1: per-group IMDB toggle — skip posters/info when off.
         imdb_on = await _group_imdb_enabled(int(message.chat.id))
         if imdb_on:
+            # v10.14: poster toggle gates the poster attachment only.
+            poster_on = await _group_poster_enabled(int(message.chat.id))
             asyncio.create_task(_fill_meta(client, sent, token, uid,
                                            res["title"] or q,
-                                           res["parsed"].get("year")))
+                                           res["parsed"].get("year"),
+                                           with_poster=poster_on))
 
 
 async def _fill_meta(client: Client, message: Message, token: str,
-                     uid: int, title: str, year: int | None) -> None:
+                     uid: int, title: str, year: int | None,
+                     with_poster: bool = True) -> None:
     """Background enrich: add poster/info to an already-rendered result.
 
     Never raises; silently skips when enrich finds nothing, the results
     expired, or the user moved on. Re-renders the page the user is
     currently on so pagination/filtering is never clobbered.
+    v10.14: with_poster=False keeps the info text but drops the poster
+    attachment (per-group poster toggle).
     """
     try:
         from app import enrich as enrich_mod
@@ -521,6 +550,9 @@ async def _fill_meta(client: Client, message: Message, token: str,
         return
     if not meta:
         return
+    if not with_poster:
+        meta = {k: v for k, v in meta.items()
+                if k not in ("poster_url", "backdrop_url")}
     data = state.v8_get(token)
     if not data or data.get("meta"):
         return
@@ -546,6 +578,10 @@ async def _on_text(client: Client, message: Message):
     if user and user.is_banned:
         return
     uid = message.from_user.id
+    # v10.14: group-banned users are silently ignored in that group.
+    if not _is_pm(message.chat.id) and await _is_gbanned(message.chat.id,
+                                                         uid):
+        return
     kb = await forcesub.ensure_joined(client, uid, chat_id=message.chat.id)
     if kb:
         # v10.3: remember the query — auto-detect continues it after
@@ -557,6 +593,20 @@ async def _on_text(client: Client, message: Message):
         return
     q = message.text.strip()
     if len(q) < 2:
+        return
+    # v10.14: URL guard — links are not searchable.
+    if _URL_QUERY_RE.search(q):
+        await message.reply_text(
+            "🔗 <b>Links can't be searched.</b>\n"
+            "Please send just the movie or series name.",
+            parse_mode=ParseMode.HTML)
+        return
+    # v10.14: excess guard — pasted paragraphs are not queries.
+    if len(q) > _MAX_QUERY_CHARS or len(q.split()) > _MAX_QUERY_WORDS:
+        await message.reply_text(
+            "⚠️ <b>Query too long.</b>\n"
+            "Please send just the title — e.g. <i>Karma 2024</i>.",
+            parse_mode=ParseMode.HTML)
         return
     await _handle_text_query(client, message, uid, q)
 
@@ -577,7 +627,7 @@ async def _handle_text_query(client: Client, message: Message,
     # whether or not there are results; every message gets a real route.
     if pm:
         intent = await intent_mod.classify(uid, q)
-        log.info("v9 intent %r -> %s", q[:60], intent)
+        log.debug("v9 intent %r -> %s", q[:60], intent)
         if intent in ("movie_search", "other"):
             if await _v9_search_flow(client, message, uid, q):
                 return

@@ -212,3 +212,60 @@ def parse_query(raw: str) -> dict:
         "season": season,
         "episode": episode,
     }
+
+
+# ---------------------------------------------------------------------------
+# v10.14: display-name cleaning for result cards / captions.
+# ---------------------------------------------------------------------------
+_URL_TOKEN_RE = re.compile(r"https?://\S+|www\.\S+|t\.me/\S+", re.IGNORECASE)
+_SE_TAG_RE = re.compile(r"s\d+e\d+", re.IGNORECASE)
+
+
+def smart_title(text: str) -> str:
+    """Title-case a display name without shouting.
+
+    Only all-lowercase words are capitalized (``karma`` -> ``Karma``);
+    words that already have capitals are left alone. ``s01e02``-style
+    season/episode tags are uppercased (``S01E02``).
+    """
+    out = []
+    for w in text.split():
+        if _SE_TAG_RE.fullmatch(w):
+            out.append(w.upper())
+        elif w.islower():
+            out.append(w.capitalize())
+        else:
+            out.append(w)
+    return " ".join(out)
+
+
+def clean_display_name(name: str | None, max_length: int = 64) -> str:
+    """Turn a raw indexed filename into a clean display title.
+
+    Strips URLs, channel-spam tokens (``[Foo]``, ``@foo``, ``www.…``),
+    converts dots/underscores to spaces, title-cases, and truncates to
+    ``max_length`` with an ellipsis.
+    """
+    if not name:
+        return ""
+    # 1. strip URL-ish substrings anywhere in the name.
+    text = _URL_TOKEN_RE.sub(" ", name)
+    # 2. drop the file extension (display only).
+    text = EXT_RE.sub("", text)
+    # 3. dots/underscores -> space so spam tokens separate out.
+    text = re.sub(r"[._]+", " ", text)
+    # 4. drop whitespace-separated spam tokens (channel tags etc.).
+    kept = []
+    for tok in text.split():
+        low = tok.lower()
+        if (tok.startswith("[") or tok.startswith("@")
+                or low.startswith(("www.", "http", "t.me"))):
+            continue
+        kept.append(tok)
+    text = re.sub(r"\s+", " ", " ".join(kept)).strip()
+    # 5. title-case.
+    text = smart_title(text)
+    # 6. truncate.
+    if len(text) > max_length:
+        text = text[:max_length - 1].rstrip() + "…"
+    return text

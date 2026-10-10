@@ -75,6 +75,17 @@ def _parse_dl_arg(text: str | None) -> int | None:
     return None
 
 
+def _parse_grp_arg(text: str | None) -> int | None:
+    """v10.14: /start grp_<group_id> — group's custom start message."""
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("grp_"):
+        try:
+            return int(parts[1][4:])
+        except ValueError:
+            return None
+    return None
+
+
 async def _start(client: Client, message: Message):
     user = await track_user(message)
     if user and user.is_banned:
@@ -98,6 +109,30 @@ async def _start(client: Client, message: Message):
         state.pending_dl.pop(uid, None)
         await _deliver_deeplink(client, message, dl_id)
         return
+    grp_id = _parse_grp_arg(message.text)
+    if grp_id:
+        # v10.14: group's custom start message (+ optional button,
+        # unlocked at 1000+ members).
+        from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        from app.bot.handlers.groups import (
+            TIER_1000, _get_group, group_tier_ok,
+        )
+        g = await _get_group(grp_id)
+        s = (g.settings or {}) if g else {}
+        start_msg = (s.get("start_message") or "").strip()
+        if start_msg:
+            kb = None
+            btn_text = (s.get("start_btn_text") or "").strip()
+            btn_url = (s.get("start_btn_url") or "").strip()
+            if btn_text and btn_url and await group_tier_ok(
+                    client, grp_id, TIER_1000):
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(btn_text[:60], url=btn_url)]])
+            await message.reply_text(
+                start_msg, reply_markup=kb, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+            return
     text = await rt.aget_setting("WELCOME_PM") or START_TEXT
     await message.reply_text(text, reply_markup=ui.start_kb(),
                              parse_mode=ParseMode.HTML)

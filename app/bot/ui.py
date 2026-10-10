@@ -64,6 +64,28 @@ def movie_card(group: dict, poster_url: str | None = None,
     return "\n".join(lines)
 
 
+def credit_suffix() -> str:
+    """v10.14: the optional channel credit line ("" when disabled).
+
+    Sync cache read — no DB hit. Shared by file_caption and per-group
+    custom captions.
+    """
+    from app import runtime as rt
+    channel = (rt.get_setting("CREDIT_CHANNEL") or "").strip()
+    if not channel:
+        return ""
+    if channel.startswith("@") and len(channel) > 1:
+        link = (f'<a href="https://t.me/{esc(channel[1:])}">'
+                f"{esc(channel)}</a>")
+    elif channel.lower().startswith("http"):
+        link = f'<a href="{esc(channel)}">{esc(channel)}</a>'
+    else:
+        link = esc(channel)
+    line = (rt.get_setting("CREDIT_LINE")
+            or "\n\n📢 <b>Join our channel:</b> {channel}")
+    return line.replace("{channel}", link)
+
+
 def file_caption(f: dict) -> str:
     name = esc(f.get("file_name") or "File")
     bits = [f"📄 <b>{name}</b>"]
@@ -72,7 +94,20 @@ def file_caption(f: dict) -> str:
     if q or lang:
         bits.append(f"🎞 {q or '—'} · 🗣 {lang or '—'}")
     bits.append(f"💾 {fmt_size(f.get('file_size'))}")
-    return "\n".join(bits)
+    return "\n".join(bits) + credit_suffix()
+
+
+def render_caption_tpl(tpl: str, f) -> str:
+    """v10.14: render a group's custom caption template.
+
+    Placeholders: {name} {quality} {lang} {size}. Values are HTML
+    escaped; the credit line is still appended.
+    """
+    text = tpl.replace("{name}", esc(f.file_name or "File"))
+    text = text.replace("{quality}", esc(f.quality or "—"))
+    text = text.replace("{lang}", esc(f.language or "—"))
+    text = text.replace("{size}", esc(fmt_size(f.file_size)))
+    return text + credit_suffix()
 
 # ---------------------------------------------------------------- keyboards
 

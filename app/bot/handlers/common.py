@@ -1,10 +1,13 @@
-"""Shared handler helpers: admin gate, user tracking."""
+"""Shared handler helpers: admin gate, user tracking, broadcast core."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
 from pyrogram import Client
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked
 from pyrogram.types import Message
 from sqlalchemy import select
 
@@ -64,3 +67,36 @@ async def is_banned(user_id: int) -> bool:
             return bool(user and user.is_banned)
     except Exception:
         return False
+
+
+async def broadcast_to_users(client: Client, ids: list[int],
+                             text: str | None = None,
+                             src_msg: Message | None = None,
+                             progress_cb=None) -> tuple[int, int]:
+    """v10.14: shared broadcast core — send/copy to user ids.
+
+    Handles FloodWait, blocked/deleted users. ``progress_cb(sent,
+    failed, total)`` fires every 100 sends. Returns (sent, failed).
+    """
+    sent = failed = 0
+    total = len(ids)
+    for uid in ids:
+        try:
+            if src_msg:
+                await src_msg.copy(uid)
+            else:
+                await client.send_message(uid, text,
+                                          parse_mode=ParseMode.HTML)
+            sent += 1
+        except (UserIsBlocked, PeerIdInvalid):
+            failed += 1
+        except FloodWait as exc:
+            await asyncio.sleep(exc.value + 1)
+        except Exception:
+            failed += 1
+        if (sent + failed) % 100 == 0 and progress_cb:
+            try:
+                await progress_cb(sent, failed, total)
+            except Exception:
+                pass
+    return sent, failed

@@ -80,6 +80,23 @@ MANAGED: dict[str, dict] = {
         "hint": "Sent when bot joins a group. Empty = off.",
         "env": None, "default": "",
     },
+    "CREDIT_CHANNEL": {
+        "type": "str", "label": "Credit channel",
+        "hint": "@username or URL credited under delivered files. "
+                "Empty = off.",
+        "env": None, "default": "",
+    },
+    "CREDIT_LINE": {
+        "type": "text", "label": "Credit line",
+        "hint": "Appended to file captions. {channel} = channel link.",
+        "env": None, "default": "\n\n📢 <b>Join our channel:</b> {channel}",
+    },
+    "OWNER_GROUP_ID": {
+        "type": "str", "label": "Owner group id",
+        "hint": "Group with every feature unlocked. Set via /setmaingroup "
+                "inside the group.",
+        "env": None, "default": "",
+    },
 }
 
 _CACHE: dict[str, tuple[float, object]] = {}

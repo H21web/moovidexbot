@@ -240,6 +240,8 @@ async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
     warn = int(await rt.aget_setting("WARN_LIMIT") or 3)
     jr = bool(await rt.aget_setting("FSUB_JOIN_REQUEST"))
     aa = bool(await rt.aget_setting("FSUB_AUTO_APPROVE"))
+    cred_chan = (await rt.aget_setting("CREDIT_CHANNEL")) or ""
+    owner_grp = (await rt.aget_setting("OWNER_GROUP_ID")) or ""
     rows = []
     brow = [InlineKeyboardButton(
         f"{'✅' if v == auto_del else ''}{label}",
@@ -260,6 +262,11 @@ async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
                              callback_data="adm:set:FSUB_JOIN_REQUEST"),
         InlineKeyboardButton(f"✅ Auto-approve: {'ON' if aa else 'OFF'}",
                              callback_data="adm:set:FSUB_AUTO_APPROVE")])
+    rows.append([
+        InlineKeyboardButton(f"📢 Credit channel: {cred_chan or 'off'}",
+                             callback_data="adm:creditchan"),
+        InlineKeyboardButton("💬 Credit line",
+                             callback_data="adm:creditline")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:home")])
     text = ("⚙️ <b>Settings</b>\n\n"
             f"🗑 <b>File delete time:</b> {_fmt_dur(auto_del)}\n"
@@ -267,7 +274,10 @@ async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
             f"📄 <b>Results/page:</b> {rpp}\n"
             f"⚠️ <b>Warns before ban:</b> {warn}\n"
             f"📩 <b>Join-request links:</b> {'ON' if jr else 'OFF'}\n"
-            f"✅ <b>Auto-approve:</b> {'ON' if aa else 'OFF'}\n\n"
+            f"✅ <b>Auto-approve:</b> {'ON' if aa else 'OFF'}\n"
+            f"📢 <b>Credit channel:</b> {ui.esc(cred_chan) if cred_chan else 'off'}\n"
+            f"👑 <b>Owner group:</b> {ui.esc(owner_grp) if owner_grp else 'not set'}\n"
+            f"<i>Run /setmaingroup inside the group to set it.</i>\n\n"
             "<i>Advanced settings live in the 🌐 web dashboard.</i>")
     return text, InlineKeyboardMarkup(rows)
 
@@ -554,6 +564,20 @@ async def _adm_cb(client: Client, query) -> None:
         await query.answer("🗑 Cleared.")
         text, kb = await _fsub_panel()
         await _edit(text, kb)
+    elif action == "creditchan":
+        _pending[uid] = ("credit_chan", {})
+        await query.answer()
+        await _edit("📢 <b>Credit channel</b>\n\nSend <code>@username</code> or a URL "
+                    "to credit under delivered files.\nSend <code>off</code> to disable.\n"
+                    "<i>Send /cancel to abort.</i>", _back_kb())
+    elif action == "creditline":
+        _pending[uid] = ("credit_line", {})
+        await query.answer()
+        cur = (await rt.aget_setting("CREDIT_LINE")) or ""
+        await _edit("💬 <b>Credit line</b>\n\nCurrent:\n"
+                    f"<code>{ui.esc(cur)}</code>\n\nSend the new template — "
+                    "<code>{channel}</code> becomes the channel link.\n"
+                    "<i>Send /cancel to abort.</i>", _back_kb())
     elif action == "dbcheck":
         await query.answer()
         text = await _dbcheck_text()
@@ -675,6 +699,25 @@ async def _pending_input(client: Client, message: Message) -> None:
         else:
             await rt.set_setting("FORCE_SUB_CHANNELS", text)
         t, kb = await _fsub_panel()
+        await message.reply_text(t, reply_markup=kb,
+                                 parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+        message.stop_propagation()
+        return
+    if action == "credit_chan":
+        _pending.pop(uid, None)
+        await rt.set_setting("CREDIT_CHANNEL",
+                             "" if text.lower() == "off" else text)
+        t, kb = await _settings_panel()
+        await message.reply_text(t, reply_markup=kb,
+                                 parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+        message.stop_propagation()
+        return
+    if action == "credit_line":
+        _pending.pop(uid, None)
+        await rt.set_setting("CREDIT_LINE", text)
+        t, kb = await _settings_panel()
         await message.reply_text(t, reply_markup=kb,
                                  parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
@@ -982,29 +1025,21 @@ async def _broadcast(client: Client, message: Message):
         else:
             ids = (await s.execute(
                 select(User.id).where(User.is_banned.is_(False)))).scalars().all()
+    from app.bot.handlers.common import broadcast_to_users
     status = await message.reply_text(
         f"📢 Broadcasting to {len(ids):,} {target}…")
-    sent = failed = 0
-    for uid in ids:
+
+    async def _prog(sent: int, failed: int, total: int) -> None:
         try:
-            if src:
-                await src.copy(uid)
-            else:
-                await client.send_message(uid, text,
-                                          parse_mode=ParseMode.HTML)
-            sent += 1
-        except (UserIsBlocked, PeerIdInvalid):
-            failed += 1
-        except FloodWait as exc:
-            await asyncio.sleep(exc.value + 1)
+            await status.edit_text(
+                f"📢 {sent + failed:,}/{total:,}… ✅{sent} ❌{failed}")
         except Exception:
-            failed += 1
-        if (sent + failed) % 100 == 0:
-            try:
-                await status.edit_text(
-                    f"📢 {sent + failed:,}/{len(ids):,}… ✅{sent} ❌{failed}")
-            except Exception:
-                pass
+            pass
+
+    # v10.14: shared broadcast core (see common.broadcast_to_users).
+    sent, failed = await broadcast_to_users(
+        client, list(ids), text=text or None, src_msg=src,
+        progress_cb=_prog)
     await status.edit_text(f"📢 Done. ✅ {sent:,} sent, ❌ {failed:,} failed.")
 
 

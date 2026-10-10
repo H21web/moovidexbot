@@ -193,7 +193,8 @@ def _with_original_filters(new_parsed: dict, orig_parsed: dict) -> dict:
     return new_parsed
 
 
-async def smart_search(user_id: int | None, raw: str) -> dict:
+async def smart_search(user_id: int | None, raw: str,
+                       ai_allowed: bool = True) -> dict:
     """Run the v10.8 search pipeline.
 
     1. Clean the message, instant DB search (parallel sweeps + fuzzy
@@ -217,7 +218,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     t0 = _time.time()
     sid = secrets.token_hex(2)
     raw = (raw or "").strip()
-    log.info("[s:%s] \u25b6 query=%r uid=%s", sid, raw[:80], user_id)
+    log.debug("[s:%s] \u25b6 query=%r uid=%s", sid, raw[:80], user_id)
     parsed = parse_query(raw)
     parsed = await _ai_parse_if_needed(user_id, raw, parsed)
     title = (parsed.get("title") or raw).strip()
@@ -229,7 +230,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
     corrected_via: str | None = None  # "ai" | None
     score = _best_score(merged)
     el = lambda: int((_time.time() - t0) * 1000)
-    log.info("[s:%s] hot: %d files best=%.2f (%dms)", sid, len(merged),
+    log.debug("[s:%s] hot: %d files best=%.2f (%dms)", sid, len(merged),
              score, el())
 
     # --- 2. JustWatch title API (free, clean titles) ---------------------
@@ -259,7 +260,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                 t_parsed["year"] = jt["year"]
             retry = await _hot_sweeps(user_id, jt["title"], t_parsed,
                                       log_q=False)
-            log.info("[s:%s] justwatch: tried %r (%s) -> %d files "
+            log.debug("[s:%s] justwatch: tried %r (%s) -> %d files "
                      "(%dms)", sid, jt["title"][:50], jt.get("type"),
                      len(retry), el())
             if retry:
@@ -271,8 +272,10 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                                 "hits": retry, "parsed": t_parsed})
             else:
                 _suggest(jt["title"], jt.get("year"), jt.get("type"))
-        if not choices:
-            log.info("[s:%s] grok: asking (original query only) (%dms)",
+        # v10.14: Groq AI title extraction only where allowed (PM, owner
+        # group, 3000+ groups) — everyone else gets local spell only.
+        if not choices and ai_allowed:
+            log.debug("[s:%s] grok: asking (original query only) (%dms)",
                      sid, el())
             try:
                 from app import ai as ai_mod
@@ -291,7 +294,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
                     t_parsed["year"] = t["year"]
                 retry = await _hot_sweeps(user_id, t["title"], t_parsed,
                                           log_q=False)
-                log.info("[s:%s] grok: tried %r (%s) -> %d files (%dms)",
+                log.debug("[s:%s] grok: tried %r (%s) -> %d files (%dms)",
                          sid, t["title"][:50], t.get("type"),
                          len(retry), el())
                 if retry:
@@ -311,10 +314,10 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
             title = c["title"]
             corrected = c["title"]
             corrected_via = c["via"]
-            log.info("[s:%s] %s: single title %r -> using it (%dms)",
+            log.debug("[s:%s] %s: single title %r -> using it (%dms)",
                      sid, c["via"], title[:50], el())
         elif len(choices) > 1:
-            log.info("[s:%s] %s: %d titles -> asking user (%dms)", sid,
+            log.debug("[s:%s] %s: %d titles -> asking user (%dms)", sid,
                      choices[0]["via"], len(choices), el())
             return {"status": "choose", "files": [], "best": None,
                     "best_reasons": [], "title": title, "parsed": parsed,
@@ -328,7 +331,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
             # Titles were found (JustWatch/AI) but none have files —
             # show them as tappable buttons so the user can pick one
             # to request, instead of a dead "try a different spelling".
-            log.info("[s:%s] suggest: %d titles, no files (%dms)", sid,
+            log.debug("[s:%s] suggest: %d titles, no files (%dms)", sid,
                      len(suggestions), el())
             return {"status": "suggest", "files": [], "best": None,
                     "best_reasons": [], "title": title, "parsed": parsed,
@@ -338,7 +341,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
 
     items = list(merged.values())
     if not items:
-        log.info("[s:%s] \u25c0 status=no_results title=%r (%dms)",
+        log.debug("[s:%s] \u25c0 status=no_results title=%r (%dms)",
                  sid, title[:60], el())
         return {"status": "no_results", "files": [], "best": None,
                 "best_reasons": [], "title": title, "parsed": parsed,
@@ -373,7 +376,7 @@ async def smart_search(user_id: int | None, raw: str) -> dict:
 
     confidence = float(best.get("score") or 0.0)
     status = "ok" if confidence >= UNCERTAIN_SCORE else "uncertain"
-    log.info("[s:%s] \u25c0 status=%s title=%r via=%s files=%d "
+    log.debug("[s:%s] \u25c0 status=%s title=%r via=%s files=%d "
              "best=%r (%dms)",
              sid, status, title[:60], corrected_via, len(files),
              (best.get("file_name") or "")[:60], el())
