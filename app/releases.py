@@ -30,10 +30,11 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app import runtime as rt
+from app.bot.ui import esc
 from app.config import settings
 from app.enrich import _extract_offers, _format_ott
 from app.models import File
-from app.textutil import esc, title_key
+from app.textutil import title_key
 
 log = logging.getLogger(__name__)
 
