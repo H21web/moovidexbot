@@ -1,17 +1,16 @@
 """New-release announcements (v10.15).
 
-Simple and efficient: every ``SWEEP_HOURS``, pull trending /
-now-playing / on-the-air titles from TMDB (three cheap REST calls),
-check which ones the bot already has indexed (one indexed
-``title_key`` lookup per shard, stops at first hit), and announce the
-unannounced ones on the update channel with poster + details + a
-search button.
+Simple and efficient: every ``SWEEP_HOURS``, pull currently-popular
+recent titles from JustWatch India, keep the ones actually streaming
+on subscription OTT, check which ones the bot already has indexed
+(one indexed ``title_key`` lookup per shard, stops at first hit), and
+announce the unannounced ones on the update channel with poster +
+details + a search button.
 
-Why TMDB and not JustWatch for the "what's new" list: JustWatch only
-exposes new releases through complex GraphQL browse queries, while
-TMDB gives trending/now-playing in one REST call each. The "📺
-Available on" OTT line in the announcement still comes from
-JustWatch (via ``enrich_title``).
+Why JustWatch (not TMDB) for the "what's new" list: TMDB trending is
+popularity-based and its OTT data is patchy; JustWatch IS the OTT
+authority — titles, streaming offers and title URLs all come from one
+response.
 
 Dedup lives in the ``announced_releases`` bot setting (JSON list of
 title_keys, capped at 1000). No per-upload hook — the sweep covers
@@ -26,12 +25,13 @@ import asyncio
 import base64
 import json
 import logging
-from urllib.parse import quote_plus
+from datetime import datetime
 
 from sqlalchemy import select
 
 from app import runtime as rt
 from app.config import settings
+from app.enrich import _extract_offers, _format_ott
 from app.models import File
 from app.textutil import esc, title_key
 
@@ -41,71 +41,72 @@ SWEEP_HOURS = 6
 _MAX_RELEASES = 60
 _ANNOUNCE_KEY = "announced_releases"
 _ANNOUNCE_CAP = 1000
-_POSTER_BASE = "https://image.tmdb.org/t/p/w500"
 
 
-# ---------- TMDB "what's new" ----------
+# ---------- JustWatch: latest OTT releases ----------
+
+def _jw_popular_sync(count: int, min_year: int) -> list:
+    """Blocking JustWatch popular-titles fetch (runs in a thread)."""
+    from simplejustwatchapi.justwatch import popular as jw_popular
+    return jw_popular(country="IN", language="en", count=count,
+                      best_only=False, min_release_year=min_year)
+
 
 async def fetch_new_releases() -> list[dict]:
-    """Trending + now playing + on the air from TMDB.
+    """Latest OTT releases via JustWatch India.
 
-    Returns [{title, year, kind, poster, overview, rating}].
-    Empty list when TMDB is unconfigured or unreachable. Never raises.
+    The library has no "new releases" sort, so we take
+    currently-popular titles from the last two release years and keep
+    only ones with a subscription (FLATRATE) streaming offer — that is
+    exactly "latest released on OTT". Never raises.
     """
-    if not settings.TMDB_API_KEY:
+    min_year = datetime.now().year - 1
+    try:
+        entries = await asyncio.to_thread(_jw_popular_sync,
+                                          _MAX_RELEASES, min_year)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("releases: justwatch popular failed: %s", exc)
         return []
-    from app.tmdb import _get_client
 
     out: list[dict] = []
     seen: set[str] = set()
-    client = _get_client()
-
-    async def _get(path: str, **params) -> list[dict]:
-        try:
-            p = {"api_key": settings.TMDB_API_KEY, "language": "en-US",
-                 "page": 1, **params}
-            r = await client.get(path, params=p)
-            r.raise_for_status()
-            return r.json().get("results") or []
-        except Exception as exc:  # noqa: BLE001
-            log.debug("releases TMDB %s failed: %s", path, exc)
-            return []
-
-    # Trending across movies + TV this week.
-    for m in await _get("/trending/all/week"):
-        _add(out, seen, m, m.get("media_type"))
-    # In cinemas now (India).
-    for m in await _get("/movie/now_playing", region="IN"):
-        _add(out, seen, m, "movie")
-    # Series currently airing.
-    for m in await _get("/tv/on_the_air"):
-        _add(out, seen, m, "tv")
-    return out[:_MAX_RELEASES]
-
-
-def _add(out: list[dict], seen: set[str], m: dict, media_type: str | None):
-    title = (m.get("title") or m.get("name") or "").strip()
-    if not title:
-        return
-    key = title_key(title)
-    if not key or key in seen:
-        return
-    seen.add(key)
-    date = m.get("release_date") or m.get("first_air_date") or ""
-    try:
-        year = int(str(date)[:4]) if str(date)[:4].isdigit() else None
-    except (TypeError, ValueError):
-        year = None
-    poster = m.get("poster_path") or ""
-    out.append({
-        "key": key,
-        "title": title,
-        "year": year,
-        "kind": "series" if media_type == "tv" else "movie",
-        "poster": f"{_POSTER_BASE}{poster}" if poster else "",
-        "overview": (m.get("overview") or "").strip(),
-        "rating": m.get("vote_average") or 0,
-    })
+    for e in entries or []:
+        title = (e.title or "").strip()
+        if not title:
+            continue
+        key = title_key(title)
+        if not key or key in seen:
+            continue
+        # OTT-only: must be streaming on subscription in India.
+        offers = _extract_offers(e)
+        if not any(o["type"] == "FLATRATE" for o in offers):
+            continue
+        seen.add(key)
+        scoring = getattr(e, "scoring", None)
+        rating = 0
+        if scoring is not None:
+            rating = (getattr(scoring, "imdb_score", None)
+                      or getattr(scoring, "tmdb_score", None) or 0)
+        jw_url = (getattr(e, "url", "") or "").strip()
+        if not jw_url.startswith("http"):
+            from urllib.parse import quote_plus
+            jw_url = ("https://www.justwatch.com/in/search?q="
+                      + quote_plus(title))
+        backdrops = list(getattr(e, "backdrops", None) or [])
+        out.append({
+            "key": key,
+            "title": title,
+            "year": e.release_year,
+            "kind": ("series"
+                     if (e.object_type or "").upper() == "SHOW" else "movie"),
+            "poster": e.poster or "",
+            "backdrop": backdrops[-1] if backdrops else "",
+            "overview": (getattr(e, "short_description", "") or "").strip(),
+            "rating": rating,
+            "ott": _format_ott(offers)[:2],
+            "ott_url": jw_url,
+        })
+    return out
 
 
 # ---------- DB: do we have it indexed? ----------
@@ -172,17 +173,6 @@ async def announce(client, rel: dict) -> bool:
         log.warning("releases: could not resolve bot username")
         return False
 
-    # OTT "available on" via the JustWatch-backed enrich (cached).
-    ott_line = ""
-    try:
-        from app import enrich as enrich_mod
-        meta = await enrich_mod.enrich_title(rel["title"], rel.get("year"))
-        ott = (meta or {}).get("ott") or []
-        if ott:
-            ott_line = f"\n📺 <i>Available on: {esc(', '.join(ott[:2]))}</i>"
-    except Exception as exc:  # noqa: BLE001
-        log.debug("releases enrich failed: %s", exc)
-
     kind_icon = "📺" if rel["kind"] == "series" else "🎬"
     head = f"{kind_icon} <b>{esc(rel['title'])}</b>"
     if rel.get("year"):
@@ -193,8 +183,12 @@ async def announce(client, rel: dict) -> bool:
     if rel.get("overview"):
         ov = rel["overview"]
         lines.append(f"<i>{esc(ov[:220] + '…' if len(ov) > 220 else ov)}</i>")
-    if ott_line:
-        lines.append(ott_line)
+    ott = rel.get("ott") or []
+    if ott:
+        ott_url = rel.get("ott_url") or ""
+        links = ", ".join(
+            f'<a href="{esc(ott_url)}">{esc(p)}</a>' for p in ott)
+        lines.append(f"\n📺 <i>Available on: {links}</i>")
     lines.append("\n✅ <b>Now available in the bot!</b>")
     caption = "\n".join(lines)
 
