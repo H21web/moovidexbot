@@ -534,7 +534,12 @@ async def subs_send(token: str, sub_id: str, to: str = ""):
     if not client:
         return {"ok": False, "error": "bot not ready"}
     try:
-        await client.send_document(data["u"], document=sdata,
+        # v10.15.7: Pyrogram needs a binary file object, not raw bytes
+        # ("Invalid file" error) — wrap in BytesIO.
+        import io as _io
+        bio = _io.BytesIO(sdata)
+        bio.name = name
+        await client.send_document(data["u"], document=bio,
                                    file_name=name,
                                    caption=f"📝 {name}")
     except Exception as exc:  # noqa: BLE001
