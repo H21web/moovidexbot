@@ -172,6 +172,14 @@ async def _hot_sweeps(user_id: int | None, raw: str, parsed: dict,
             if fid is None or fid in merged:
                 continue
             merged[fid] = it
+    # v10.15.8: junk gate — weak fuzzy-only matches (best score below the
+    # "uncertain" bar) are worse than no results: they'd show irrelevant
+    # files for descriptive queries ("mohanlal new movie"). Drop them so
+    # the query falls through to JustWatch, then AI, instead.
+    if merged and _best_score(merged) < UNCERTAIN_SCORE:
+        log.debug("v9 junk gate: dropping %d weak hits for %r",
+                  len(merged), raw[:60])
+        merged = {}
     return merged
 
 

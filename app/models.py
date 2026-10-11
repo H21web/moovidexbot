@@ -319,3 +319,35 @@ class AiQuota(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     day: Mapped[date] = mapped_column(Date, primary_key=True)
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class NotifiedTitle(Base):
+    """Titles already announced to the update channel (v10.15.8).
+
+    Nova-Filter-Bot's ``notified_media`` pattern: the UNIQUE constraints
+    make the "is this title new?" check a single atomic INSERT ...
+    ON CONFLICT DO NOTHING — no read-modify-write race, no duplicate
+    posts. ``provider_id`` (IMDb id from enrichment) catches filename
+    variants of the same movie; (title_key, year) is the fallback.
+    Lives on the primary DB (settings DB), not the file shards.
+    """
+
+    __tablename__ = "notified_titles"
+
+    __table_args__ = (
+        UniqueConstraint("title_key", "year",
+                         name="uq_notified_title_year"),
+        UniqueConstraint("provider_id",
+                         name="uq_notified_provider_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True,
+                                    autoincrement=True)
+    title_key: Mapped[str] = mapped_column(Text, nullable=False)
+    year: Mapped[int] = mapped_column(Integer, nullable=False,
+                                     server_default="0", default=0)
+    provider_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    announced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

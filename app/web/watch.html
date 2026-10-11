@@ -323,14 +323,23 @@
       if (!list.length) return;
       var names = {eng:"English", mal:"Malayalam", hin:"Hindi", tam:"Tamil",
                    tel:"Telugu", kan:"Kannada"};
-      var seen = {}, src = [];
+      var seen = {}, src = [], langs = [];
       list.forEach(function(s){
         var lang = (s.lang || "?").toLowerCase();
         if (seen[lang]) return;
         seen[lang] = 1;
+        langs.push(lang);
         src.push({ name: (names[lang] || lang.toUpperCase()),
-                   src: "/subs/file/" + encodeURIComponent(s.id) });
+                   src: "/subs/file/" + encodeURIComponent(s.id),
+                   type: "srt" });
       });
+      /* v10.15.8: OPlayer's subtitle plugin only fetches when exactly one
+         source is marked default, and it sniffs the format from the URL —
+         our /subs/file/<id> URLs carry no extension, so declare srt
+         explicitly. Prefer English, else the first (most-downloaded). */
+      var di = langs.indexOf("eng");
+      if (di < 0) di = 0;
+      if (src.length) src[di].default = true;
       var ui = window._opl && window._opl.context && window._opl.context.ui;
       if (ui && ui.subtitle && ui.subtitle.changeSource) {
         ui.subtitle.changeSource(src);
