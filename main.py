@@ -68,8 +68,6 @@ async def amain() -> None:
     ad_task = autodelete.start()
     prune_task = analytics.start_prune_task()  # v10.8.10: activity log 30d
     ka_task = keepalive.start()  # v10.11.10: DB idle-sleep keepalive
-    from app import releases as releases_mod
-    rel_task = releases_mod.start(bot)  # v10.15: new-release announcements
     try:
         await server.serve()
     finally:
@@ -78,7 +76,6 @@ async def amain() -> None:
         ad_task.cancel()
         prune_task.cancel()
         ka_task.cancel()
-        rel_task.cancel()
         try:
             await ad_task
         except asyncio.CancelledError:
@@ -97,12 +94,6 @@ async def amain() -> None:
             pass
         except Exception as exc:  # noqa: BLE001
             log.debug("keepalive shutdown: %s", exc)
-        try:
-            await rel_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            log.debug("releases shutdown: %s", exc)
         # Close shared httpx clients and the DB pool.
         try:
             from app import ai as ai_mod

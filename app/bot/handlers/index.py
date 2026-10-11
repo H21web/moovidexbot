@@ -477,6 +477,15 @@ async def _auto_index(client: Client, message: Message):
             stmt = pg_insert(File).values(rec).on_conflict_do_nothing()
             await session.execute(stmt)
             await session.commit()
+        # v10.15.6: Nova-style "new content added" post for live uploads.
+        # announce_title derives clean title/year and dedups internally;
+        # it never raises and returns immediately.
+        try:
+            from app import releases as releases_mod
+            releases_mod.announce_title(
+                client, rec.get("file_name") or "", rec.get("language"))
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:
         # P2#35: a DB outage must not silently drop live posts — count
         # consecutive failures per channel and escalate loudly.
