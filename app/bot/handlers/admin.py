@@ -240,6 +240,8 @@ async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
     warn = int(await rt.aget_setting("WARN_LIMIT") or 3)
     jr = bool(await rt.aget_setting("FSUB_JOIN_REQUEST"))
     aa = bool(await rt.aget_setting("FSUB_AUTO_APPROVE"))
+    # v10.15.10: new-release update posts (default ON).
+    nru = bool(await rt.aget_setting("NEW_RELEASE_UPDATES"))
     cred_chan = (await rt.aget_setting("CREDIT_CHANNEL")) or ""
     owner_grp = (await rt.aget_setting("OWNER_GROUP_ID")) or ""
     rows = []
@@ -251,6 +253,10 @@ async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton(
             f"🛡 Protect content: {'ON' if protect else 'OFF'}",
             callback_data="adm:set:PROTECT_CONTENT")])
+    rows.append([
+        InlineKeyboardButton(
+            f"🆕 New-release updates: {'ON' if nru else 'OFF'}",
+            callback_data="adm:set:NEW_RELEASE_UPDATES")])
     rows.append([InlineKeyboardButton(
         f"{'✅' if v == rpp else ''}{v}/page",
         callback_data=f"adm:setrpp:{v}") for v in _RPP_PRESETS])
@@ -271,6 +277,7 @@ async def _settings_panel() -> tuple[str, InlineKeyboardMarkup]:
     text = ("⚙️ <b>Settings</b>\n\n"
             f"🗑 <b>File delete time:</b> {_fmt_dur(auto_del)}\n"
             f"🛡 <b>Protect content:</b> {'ON' if protect else 'OFF'}\n"
+            f"🆕 <b>New-release updates:</b> {'ON' if nru else 'OFF'}\n"
             f"📄 <b>Results/page:</b> {rpp}\n"
             f"⚠️ <b>Warns before ban:</b> {warn}\n"
             f"📩 <b>Join-request links:</b> {'ON' if jr else 'OFF'}\n"

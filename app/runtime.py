@@ -97,6 +97,12 @@ MANAGED: dict[str, dict] = {
                 "inside the group.",
         "env": None, "default": "",
     },
+    "NEW_RELEASE_UPDATES": {
+        "type": "bool", "label": "New-release update posts",
+        "hint": "Post new-release cards to the update channel when fresh "
+                "movies/series are indexed. Off = silent.",
+        "env": None, "default": True,
+    },
 }
 
 _CACHE: dict[str, tuple[float, object]] = {}

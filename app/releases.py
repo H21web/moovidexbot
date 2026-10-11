@@ -191,6 +191,12 @@ async def trigger_update_if_new(client, title: str,
     try:
         if not (settings.UPDATE_CHANNEL_ID or 0):
             return
+        # v10.15.10: admin on/off toggle (default ON).
+        try:
+            if not await rt.aget_setting("NEW_RELEASE_UPDATES"):
+                return
+        except Exception:  # noqa: BLE001
+            pass
         title = (title or "").strip()
         if not title:
             return
