@@ -515,11 +515,19 @@ async def subs_send(token: str, sub_id: str, to: str = ""):
         return {"ok": False, "error": "bad token"}
     from app import subs
     to = re.sub(r"[^a-z]", "", (to or "").lower())[:5]
+    # v10.15.9: name the .srt after the movie file, not the subtitle id.
+    try:
+        _f = await _get_file(token)
+        movie_base = ((_f.file_name or "subtitle").rsplit(".", 1)[0]
+                      or "subtitle")
+    except Exception:  # noqa: BLE001
+        movie_base = "subtitle"
     if to:
         # v10.15.5: translate to bytes directly (the old path read
         # .body off the Response and handed Pyrogram text).
         try:
-            sdata, name = await translate_subtitle_data(sub_id, to)
+            sdata, _ = await translate_subtitle_data(sub_id, to)
+            name = f"{movie_base}.{to}.srt"
         except HTTPException as exc:
             return {"ok": False, "error": exc.detail}
         except Exception as exc:  # noqa: BLE001
@@ -529,7 +537,8 @@ async def subs_send(token: str, sub_id: str, to: str = ""):
         got = await subs.download_subtitle(sub_id)
         if not got or not got[0]:
             return {"ok": False, "error": "download failed"}
-        sdata, name = got
+        sdata = got[0]
+        name = f"{movie_base}.srt"
     client = bot_app.bot
     if not client:
         return {"ok": False, "error": "bot not ready"}
