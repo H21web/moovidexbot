@@ -770,7 +770,6 @@ async def _dlhelp(client: Client, query):
 
 async def _v8view(client: Client, query):
     """v11: toggle search results between list view and button view."""
-    from app import personalize
     uid = query.from_user.id
     try:
         _, token, view = query.data.split(":")
@@ -784,11 +783,14 @@ async def _v8view(client: Client, query):
                            show_alert=True)
         return
     await personalize.set_manual_pref(uid, "result_view", view)
+    # v11.3: render_v8_results was never imported here — the NameError
+    # was swallowed and the message never refreshed.
+    from app.bot.handlers.search import render_v8_results
     try:
         await render_v8_results(client, query.message, token, uid,
                                 page=data.get("page", 0))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("v8 view toggle render failed: %s", exc)
     await query.answer("🔲 Button view" if view == "buttons"
                        else "📋 List view")
 

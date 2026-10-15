@@ -43,7 +43,10 @@ class Settings(BaseSettings):
     # v11: bandwidth saver — ON = web "Download" buttons redirect users to
     # Telegram delivery instead of proxying bytes through this server.
     # The web player itself still works (explicit user choice).
-    BANDWIDTH_SAVER: bool = True
+    # v11.3: default OFF — Hari wants the web download link back
+    # instead of bandwidth saving. When True, delivered files show a
+    # hint instead of the web download URL button.
+    BANDWIDTH_SAVER: bool = False
     WEB_SECRET: str = "change-me"  # signs /watch and /dl tokens
     PORT: int = 8000
     ADMIN_PASSWORD: str = ""       # admin dashboard login (required for /admin)

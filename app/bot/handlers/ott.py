@@ -1,132 +1,393 @@
-"""OTT discovery (v11): /ott /latest /today /upcoming.
+"""v11.3 OTT / Latest / Today / Upcoming commands — TMDB backend.
 
-Adapted from standalone plugins into Moovidex's architecture:
-- no ``utils.temp`` / ``info.py`` / ``plugins.Extra`` — sessions live in
-  module dicts with TTL, admin/channel come from ``app.config``.
-- inline buttons everywhere (no reply keyboards).
-- deep links reuse the built-in ``srch_`` search links.
-- /today was an empty file — implemented via the ottplay new-release
-  API filtered to today.
+The binged.com and ottplay APIs were unusable (binged returns HTTP 403
+to datacenter IPs including Render; ottplay returned empty result sets),
+so this module is rebuilt on the TMDB API the bot already uses
+(TMDB_API_KEY). Same UX as v11.1/11.2: lists edit in place, tapping a
+title opens the download card (web download + Play + Telegram).
+
+v11.1 lesson kept: handlers register on the bot instance inside
+register(bot) — never class-level @Client.on_* decorators.
 """
 from __future__ import annotations
 
-import asyncio
-import html
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 
 import httpx
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto,
-)
+from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
+                            InlineKeyboardMarkup, Message)
 
 from app import state, tmdb as tmdb_mod
 from app.bot import forcesub
 from app.bot.handlers.common import is_banned, track_user
+from app.bot.ui import esc
 from app.config import settings
 from app.db import get_session_factory
 from app.models import MovieAlert
-from app.ott_cards import generate_status_image
-from app.releases import search_deep_link
 from app.textutil import title_key
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("ott")
 
-BINGED_UA = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.binged.com/",
-    "Origin": "https://www.binged.com",
-}
-OTTPLAY_UA = {
-    "User-Agent": BINGED_UA["User-Agent"],
-    "Accept": "application/json",
-    "Referer": "https://www.ottplay.com/",
-    "Origin": "https://www.ottplay.com",
-}
-WHATS_STREAMING = "https://www.binged.com/wp-json/binged-api/v1/whats-streaming"
-BINGED_MOVIES = "https://www.binged.com/wp-json/binged-api/v1/movies"
-OTTPLAY_NEW = "https://api2.ottplay.com/api/v4.7/web/new-release"
+TMDB_IMG = "https://image.tmdb.org/t/p"
+_SESSION_TTL = 900  # 15 min
+_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
 
-PLATFORM_IMAGES = {
-    "amazon": "https://envs.sh/FI0.jpg",
-    "netflix": "https://envs.sh/FIS.jpg",
-    "zee5": "https://envs.sh/FIW.jpg",
-    "aha video": "https://envs.sh/FIB.jpg",
-    "hoichoi": "https://envs.sh/FII.jpg",
-    "jio cinema": "https://envs.sh/FIn.jpg",
-    "sun nxt": "https://envs.sh/FIT.jpg",
-}
-
-_SESS_TTL = 600  # 10 min per interactive session
+# message_id -> session dict (per list type)
+_OTT: dict[int, dict] = {}   # platform picker: {providers, uid, ts}
+_OTT_T: dict[int, dict] = {}  # platform titles: {items, pname, pid, page, uid, ts}
+_LT: dict[int, dict] = {}
+_TD: dict[int, dict] = {}
+_UP: dict[int, dict] = {}
+_OTT_DL: dict[int, dict] = {}  # download card: {title, uid, ts}
 
 
-def clean_text(text):
-    if not text:
-        return text
-    text = html.unescape(text)
-    for k, v in {"\u2019": "'", "\u2018": "'", "\u201c": '"',
-                 "\u201d": '"', "\u2013": "-", "\u2014": "-",
-                 "\u2026": "..."}.items():
-        text = text.replace(k, v)
-    return text.strip()
+# ---------------------------------------------------------------- data layer
 
-
-_bot_username: str | None = None
-
-
-async def _username(client: Client) -> str | None:
-    global _bot_username
-    if _bot_username:
-        return _bot_username
+async def _tmdb(path: str, params: dict | None = None) -> dict | None:
+    """GET TMDB. Returns parsed JSON or None on any failure."""
+    if not settings.TMDB_API_KEY:
+        return None
+    p = {"api_key": settings.TMDB_API_KEY, "language": "en-US"}
+    if params:
+        p.update(params)
     try:
-        me = await client.get_me()
-        _bot_username = me.username or None
-    except Exception:  # noqa: BLE001
-        pass
-    return _bot_username
-
-
-def _prune(store: dict):
-    now = time.time()
-    for k in [k for k, v in store.items()
-              if now - v.get("ts", 0) > _SESS_TTL]:
-        store.pop(k, None)
-
-
-async def _fetch_json(url, headers, params=None, timeout=12):
-    try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers,
-                                     trust_env=False) as s:
-            r = await s.get(url, params=params)
+        async with httpx.AsyncClient(timeout=20, headers=_UA) as c:
+            r = await c.get(f"https://api.themoviedb.org/3{path}", params=p)
             if r.status_code == 200:
                 return r.json()
-            log.debug("ott fetch %d: %s", r.status_code, url)
+            log.warning("tmdb %s -> %s", path, r.status_code)
     except Exception as exc:  # noqa: BLE001
-        log.debug("ott fetch failed: %s", exc)
+        log.warning("tmdb %s failed: %s", path, exc)
     return None
 
 
-def _close_kb(cb: str):
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Close", callback_data=cb)]])
+def _item(m: dict) -> dict:
+    title = m.get("title") or m.get("name") or "?"
+    dstr = m.get("release_date") or m.get("first_air_date") or ""
+    media = m.get("media_type")
+    if media not in ("movie", "tv"):
+        media = "tv" if m.get("first_air_date") and not m.get("title") else "movie"
+    pp = m.get("poster_path")
+    return {
+        "id": m.get("id"),
+        "title": title,
+        "year": dstr[:4],
+        "date": dstr,
+        "overview": (m.get("overview") or "").strip(),
+        "rating": m.get("vote_average"),
+        "media": media,
+        "pop": m.get("popularity") or 0,
+        "poster": f"{TMDB_IMG}/w500{pp}" if pp else None,
+    }
 
 
-async def _ott_search(client: Client, query, title: str):
-    """v11.1: one-tap download — run the bot search IN this chat.
+def _sweep(d: dict) -> None:
+    now = time.time()
+    for k in [k for k, v in d.items()
+              if now - v.get("ts", 0) > _SESSION_TTL]:
+        d.pop(k, None)
 
-    Shows the v8 results card with download options right here instead
-    of deep-linking out to PM.
+
+# ---------------------------------------------------------------- list UI
+
+def _list_text(heading: str, items: list[dict], page: int,
+               per: int = 10) -> tuple[str, list[dict]]:
+    start = page * per
+    chunk = items[start:start + per]
+    lines = [f"<b>{esc(heading)}</b>\n"]
+    for i, it in enumerate(chunk, start + 1):
+        yr = f" ({it['year']})" if it.get("year") else ""
+        tag = "📺" if it["media"] == "tv" else "🎬"
+        lines.append(f"{i}. {tag} <b>{esc(it['title'])}</b>{yr}")
+    return "\n".join(lines), chunk
+
+
+def _list_kb(chunk: list[dict], start: int, prefix: str, page: int,
+             total_pages: int, back_cb: str | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    for i, it in enumerate(chunk, start + 1):
+        yr = f" ({it['year']})" if it.get("year") else ""
+        label = f"{i}. {it['title']}{yr}"[:60]
+        rows.append([InlineKeyboardButton(label,
+                                          callback_data=f"{prefix}:s:{i}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}:pg:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}:pg:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if back_cb:
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="ot:x")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_list(client: Client, chat_id: int, heading: str, items: list[dict],
+                     store: dict, prefix: str, session: dict,
+                     back_cb: str | None = None) -> Message | None:
+    if not items:
+        await client.send_message(chat_id,
+                                  f"⚠️ No titles found for <b>{esc(heading)}</b>.",
+                                  parse_mode=ParseMode.HTML)
+        return None
+    text, chunk = _list_text(heading, items, 0)
+    total_pages = max(1, -(-len(items) // 10))
+    msg = await client.send_message(
+        chat_id, text,
+        reply_markup=_list_kb(chunk, 0, prefix, 0, total_pages, back_cb),
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    session.update({"items": items, "heading": heading, "ts": time.time()})
+    store[msg.id] = session
+    return msg
+
+
+async def _edit_list(client: Client, query: CallbackQuery, store: dict,
+                     prefix: str, page: int,
+                     back_cb: str | None = None) -> None:
+    s = store.get(query.message.id)
+    if not s:
+        await query.answer("⌛ Expired — run the command again.",
+                           show_alert=True)
+        return
+    items, heading = s["items"], s["heading"]
+    total_pages = max(1, -(-len(items) // 10))
+    page = max(0, min(page, total_pages - 1))
+    text, chunk = _list_text(heading, items, page)
+    try:
+        await query.message.edit_text(
+            text, reply_markup=_list_kb(chunk, page * 10, prefix, page,
+                                        total_pages, back_cb),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:  # noqa: BLE001
+        pass
+    await query.answer()
+
+
+# ---------------------------------------------------------------- /ott
+
+async def ott_cmd(client: Client, message: Message):
+    """/ott — pick an OTT platform (India), then browse its titles."""
+    uid = message.from_user.id
+    if await is_banned(uid):
+        return
+    await track_user(message)
+    _sweep(_OTT)
+    data = await _tmdb("/watch/providers/movie", {"watch_region": "IN"})
+    provs = (data or {}).get("results") or []
+    if not provs:
+        await message.reply_text("⚠️ Couldn't load OTT platforms right now.")
+        return
+    provs = sorted(provs, key=lambda p: p.get("display_priority", 99))[:12]
+    rows = []
+    for i in range(0, len(provs), 2):
+        row = []
+        for p in provs[i:i + 2]:
+            row.append(InlineKeyboardButton(
+                p.get("provider_name", "?")[:28],
+                callback_data=f"ot:p:{p.get('provider_id')}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="ot:x")])
+    msg = await message.reply_text(
+        "<b>📺 Choose an OTT platform</b>\n<i>India catalogue</i>",
+        reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    _OTT[msg.id] = {"providers": {str(p.get("provider_id")): p.get("provider_name")
+                                  for p in provs},
+                    "uid": uid, "ts": time.time()}
+
+
+async def _ott_platform_titles(client: Client, query: CallbackQuery,
+                               pid: str, pname: str, page: int = 0):
+    """Discover movies + series on one platform, merged by popularity."""
+    await query.answer("⏳ Loading titles…")
+    params = {"with_watch_providers": pid, "watch_region": "IN",
+              "sort_by": "popularity.desc", "page": 1}
+    mv = await _tmdb("/discover/movie", params) or {}
+    tv = await _tmdb("/discover/tv", params) or {}
+    items = sorted((_item(m) for m in (mv.get("results") or []) +
+                    (tv.get("results") or [])),
+                   key=lambda x: x["pop"], reverse=True)[:40]
+    _sweep(_OTT_T)
+    msg = await _send_list(client, query.message.chat.id, pname, items,
+                           _OTT_T, "otp",
+                           {"uid": query.from_user.id, "pid": pid,
+                            "pname": pname})
+    if msg:
+        await query.answer()
+    # keep the platform picker message tidy
+    try:
+        await query.message.edit_reply_markup(None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------- /latest
+
+async def latest_cmd(client: Client, message: Message):
+    """/latest — this week's trending movies & shows (TMDB)."""
+    uid = message.from_user.id
+    if await is_banned(uid):
+        return
+    await track_user(message)
+    _sweep(_LT)
+    data = await _tmdb("/trending/all/week") or {}
+    items = [_item(m) for m in (data.get("results") or [])
+             if (m.get("title") or m.get("name"))][:40]
+    await _send_list(client, message.chat.id, "🔥 Trending this week", items,
+                     _LT, "lt", {"uid": uid})
+
+
+# ---------------------------------------------------------------- /today
+
+async def today_cmd(client: Client, message: Message):
+    """/today — movies & shows released today (India)."""
+    uid = message.from_user.id
+    if await is_banned(uid):
+        return
+    await track_user(message)
+    _sweep(_TD)
+    today = date.today().isoformat()
+    mv = await _tmdb("/discover/movie",
+                     {"primary_release_date.gte": today,
+                      "primary_release_date.lte": today,
+                      "region": "IN", "sort_by": "popularity.desc"}) or {}
+    tv = await _tmdb("/discover/tv",
+                     {"first_air_date.gte": today, "first_air_date.lte": today,
+                      "sort_by": "popularity.desc"}) or {}
+    items = sorted((_item(m) for m in (mv.get("results") or []) +
+                    (tv.get("results") or [])),
+                   key=lambda x: x["pop"], reverse=True)[:40]
+    await _send_list(client, message.chat.id, "📅 Released today", items,
+                     _TD, "td", {"uid": uid})
+
+
+# ---------------------------------------------------------------- /upcoming
+
+async def upcoming_cmd(client: Client, message: Message):
+    """/upcoming — upcoming movies (India), with details + notify."""
+    uid = message.from_user.id
+    if await is_banned(uid):
+        return
+    await track_user(message)
+    _sweep(_UP)
+    data = await _tmdb("/movie/upcoming", {"region": "IN", "page": 1}) or {}
+    items = [_item(m) for m in (data.get("results") or [])][:40]
+    await _send_list(client, message.chat.id, "🔜 Coming soon", items,
+                     _UP, "up", {"uid": uid})
+
+
+async def _upcoming_detail(client: Client, query: CallbackQuery, idx: int):
+    """Poster + overview + release date, with Notify + Download."""
+    s = _UP.get(query.message.id)
+    if not s or s["uid"] != query.from_user.id:
+        await query.answer("⌛ Expired — run /upcoming again.",
+                           show_alert=True)
+        return
+    items = s["items"]
+    if not 1 <= idx <= len(items):
+        return
+    it = items[idx - 1]
+    key = title_key(f"{it['title']} {it['year']}".strip())
+    # already notified?
+    notified = False
+    try:
+        sf = get_session_factory(0)
+        async with sf() as db:
+            from sqlalchemy import select as _sel
+            r = await db.execute(
+                _sel(MovieAlert).where(MovieAlert.user_id == query.from_user.id,
+                                       MovieAlert.title_key == key))
+            notified = r.scalar_one_or_none() is not None
+    except Exception:  # noqa: BLE001
+        pass
+    yr = f" ({it['year']})" if it.get("year") else ""
+    rating = f"⭐ {it['rating']:.1f}/10" if it.get("rating") else ""
+    rel = it.get("date") or "TBA"
+    ov = (it["overview"][:350] + "…") if len(it["overview"]) > 350 else it["overview"]
+    text = (f"🎬 <b>{esc(it['title'])}</b>{yr}\n"
+            f"{rating}   📅 <b>{esc(rel)}</b>\n\n"
+            f"<i>{esc(ov)}</i>" if ov else
+            f"🎬 <b>{esc(it['title'])}</b>{yr}\n{rating}   📅 <b>{esc(rel)}</b>")
+    rows = [[InlineKeyboardButton("🌐 Download", callback_data=f"up:dl:{idx}")]]
+    if notified:
+        rows.append([InlineKeyboardButton("🔕 Stop alerts",
+                                          callback_data=f"up:un:{idx}")])
+    else:
+        rows.append([InlineKeyboardButton("🔔 Notify me on release",
+                                          callback_data=f"up:n:{idx}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="up:back")])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="ot:x")])
+    kb = InlineKeyboardMarkup(rows)
+    try:
+        if it.get("poster"):
+            await client.send_photo(query.message.chat.id, it["poster"],
+                                    caption=text, reply_markup=kb,
+                                    parse_mode=ParseMode.HTML)
+        else:
+            await client.send_message(query.message.chat.id, text,
+                                      reply_markup=kb,
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
+    except Exception:  # noqa: BLE001
+        pass
+    await query.answer()
+
+
+async def _upcoming_notify(client: Client, query: CallbackQuery, idx: int,
+                           subscribe: bool):
+    s = _UP.get(query.message.id)
+    if not s or s["uid"] != query.from_user.id:
+        await query.answer("⌛ Expired.", show_alert=True)
+        return
+    items = s["items"]
+    if not 1 <= idx <= len(items):
+        return
+    it = items[idx - 1]
+    key = title_key(f"{it['title']} {it['year']}".strip())
+    uid = query.from_user.id
+    try:
+        sf = get_session_factory(0)
+        async with sf() as db:
+            from sqlalchemy import select as _sel, delete as _del
+            if subscribe:
+                r = await db.execute(
+                    _sel(MovieAlert).where(MovieAlert.user_id == uid,
+                                           MovieAlert.title_key == key))
+                if r.scalar_one_or_none() is None:
+                    db.add(MovieAlert(user_id=uid, title_key=key,
+                                      title=it["title"][:200],
+                                      year=int(it["year"]) if it.get("year") and
+                                      it["year"].isdigit() else None))
+                    await db.commit()
+                await query.answer("🔔 I'll ping you when it's out!",
+                                   show_alert=True)
+            else:
+                await db.execute(_del(MovieAlert).where(
+                    MovieAlert.user_id == uid, MovieAlert.title_key == key))
+                await db.commit()
+                await query.answer("🔕 Alerts off.", show_alert=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("notify toggle failed: %s", exc)
+        await query.answer("⚠️ Try again later.", show_alert=True)
+
+
+# ---------------------------------------------------------------- download card
+
+async def _ott_download_card(client: Client, query, title: str):
+    """v11.2: download card — best file with a WEB download option.
+
+    "Download option" = file download through the web (/dl link),
+    plus Play (web player) and in-Telegram delivery choices.
     """
-    from app.bot.handlers.search import _search_and_send
+    from app import search_v9
+    from app.web.tokens import dl_url, watch_url
+    from app.bot.ui import fmt_size
+    from app.textutil import clean_display_name
     uid = query.from_user.id
     chat_id = query.message.chat.id
     title = (title or "").strip()
@@ -141,707 +402,178 @@ async def _ott_search(client: Client, query, title: str):
                                chat_id=chat_id)
         await query.answer()
         return
+    await query.answer("🔍 Finding file…")
+    try:
+        res = await search_v9.smart_search(uid, title)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ott dl-card search failed for %r: %s", title, exc)
+        res = {}
+    if res.get("status") not in ("ok", "uncertain") or not res.get("best"):
+        await query.answer("❌ No files found for this title yet.",
+                           show_alert=True)
+        return
+    best = res["best"]
+    gid = best["id"]
+    name = clean_display_name(best.get("file_name") or title)
+    meta = " · ".join(x for x in (
+        best.get("quality"), best.get("language"),
+        fmt_size(best.get("file_size"))) if x)
+    text = (f"🎬 <b>{esc(name)}</b>\n"
+            + (f"<i>{esc(meta)}</i>\n" if meta else "")
+            + "\n<i>Choose how to get it:</i>")
+    rows = []
+    w = watch_url(gid, uid)
+    d = dl_url(gid, uid)
+    web_row = []
+    if d:
+        web_row.append(InlineKeyboardButton("🌐 Download", url=d))
+    if w:
+        from pyrogram.types import WebAppInfo
+        web_row.append(InlineKeyboardButton("▶ Play",
+                                            web_app=WebAppInfo(url=w)))
+    if web_row:
+        rows.append(web_row)
+    rows.append([InlineKeyboardButton("📲 Get in Telegram",
+                                      callback_data=f"dl:{gid}")])
+    _OTT_DL[query.message.id] = {"title": title, "uid": uid,
+                                 "ts": time.time()}
+    rows.append([InlineKeyboardButton("🔍 More files",
+                                      callback_data="ot:more")])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="ot:x")])
+    await client.send_message(chat_id, text,
+                              reply_markup=InlineKeyboardMarkup(rows),
+                              parse_mode=ParseMode.HTML,
+                              disable_web_page_preview=True)
+
+
+async def _ott_more_files(client: Client, query):
+    """'🔍 More files' — full v8 results card for the stored title."""
+    from app.bot.handlers.search import _search_and_send
+    uid = query.from_user.id
+    s = _OTT_DL.get(query.message.id)
+    if not s or s["uid"] != uid:
+        await query.answer("⚠️ Session expired.", show_alert=True)
+        return
+    chat_id = query.message.chat.id
+    title = (s["title"] or "").strip()
+    kb = await forcesub.ensure_joined(client, uid, chat_id=chat_id)
+    if kb:
+        state.pending_search[uid] = title
+        from app.bot.handlers.callbacks import send_join_prompt
+        await send_join_prompt(client, query.message, uid, kb,
+                               chat_id=chat_id)
+        await query.answer()
+        return
     await query.answer("🔍 Searching…")
     try:
         sent = await _search_and_send(client, chat_id, uid, title)
     except Exception as exc:  # noqa: BLE001
-        log.warning("ott search failed for %r: %s", title, exc)
+        log.warning("ott more-files search failed for %r: %s", title, exc)
         sent = None
     if not sent:
         await query.answer("❌ No files found for this title yet.",
                            show_alert=True)
 
 
-# ---------------------------------------------------------------- /ott ----
+# ---------------------------------------------------------------- callbacks
 
-_OTT: dict[int, dict] = {}  # message_id -> session
-
-
-async def _ott_platforms():
-    data = await _fetch_json(WHATS_STREAMING, BINGED_UA)
-    if not isinstance(data, dict):
-        return None
-    return list(data.values())
-
-
-async def ott_cmd(client: Client, message):
-    await track_user(message)
-    if message.from_user and await is_banned(message.from_user.id):
-        return
-    wait = await message.reply_text("📺 <i>Loading platforms…</i>",
-                                    parse_mode=ParseMode.HTML)
-    platforms = await _ott_platforms()
-    if not platforms:
-        await wait.edit_text("⚠️ Couldn't load OTT platforms. Try again later.")
-        return
-    _prune(_OTT)
-    rows = [[InlineKeyboardButton(clean_text(p.get("title", "?"))[:40],
-                                  callback_data=f"ot:p:{i}")]
-            for i, p in enumerate(platforms)]
-    rows.append([InlineKeyboardButton("❌ Close", callback_data="ot:x")])
-    await wait.edit_text("📺 <b>Select a platform:</b>",
-                         reply_markup=InlineKeyboardMarkup(rows),
-                         parse_mode=ParseMode.HTML)
-    _OTT[wait.id] = {"uid": message.from_user.id, "platforms": platforms,
-                     "ts": time.time()}
-
-
-async def _ott_show_platform(client, query, sess, page=0):
-    msg = query.message
-    plat = sess["platform"]
-    movies = plat.get("movies", [])
-    title = plat.get("title", "Platform")
-    per, pages = 8, max(1, -(-len(movies) // 8))
-    page = max(0, min(page, pages - 1))
-    chunk = movies[page * per:(page + 1) * per]
-    sess["titles"] = [clean_text(m.get("title", "Untitled"))[:40]
-                      for m in chunk]
-    rows = []
-    for i, mt in enumerate(sess["titles"]):
-        rows.append([InlineKeyboardButton(
-            f"🎬 {mt}", callback_data=f"ot:s:{i}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev",
-                                        callback_data=f"ot:pg:{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️",
-                                        callback_data=f"ot:pg:{page + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("🔙 Platforms",
-                                      callback_data="ot:back")])
-    kb = InlineKeyboardMarkup(rows)
-    caption = (f"🎬 <b>{html.escape(title)}</b>\n"
-               f"<i>Page {page + 1}/{pages}</i>")
-    logo = PLATFORM_IMAGES.get(title.lower().strip(), "")
-    # Always delete + resend: works for both text and photo messages
-    # (edit_text on a photo message fails — the original bug).
-    try:
-        await msg.delete()
-    except Exception:  # noqa: BLE001
-        pass
-    if logo:
-        try:
-            sent = await client.send_photo(msg.chat.id, photo=logo,
-                                           caption=caption,
-                                           reply_markup=kb,
-                                           parse_mode=ParseMode.HTML)
-        except Exception:  # noqa: BLE001
-            sent = await client.send_message(msg.chat.id, caption,
-                                             reply_markup=kb,
-                                             parse_mode=ParseMode.HTML)
-    else:
-        sent = await client.send_message(msg.chat.id, caption,
-                                         reply_markup=kb,
-                                         parse_mode=ParseMode.HTML)
-    _OTT.pop(msg.id, None)
-    sess["page"] = page
-    sess["ts"] = time.time()
-    _OTT[sent.id] = sess
-
-
-async def ott_cb(client: Client, query):
+async def ott_cb(client: Client, query: CallbackQuery):
+    """/ott + /latest + /today + /upcoming callback router."""
     data = query.data or ""
-    _prune(_OTT)
+    uid = query.from_user.id
+
     if data == "ot:x":
-        _OTT.pop(query.message.id, None)
+        for d in (_OTT, _OTT_T, _LT, _TD, _UP, _OTT_DL):
+            d.pop(query.message.id, None)
         try:
             await query.message.delete()
         except Exception:  # noqa: BLE001
             pass
         await query.answer()
         return
-    sess = _OTT.get(query.message.id)
-    if not sess or sess["uid"] != query.from_user.id:
-        await query.answer("⚠️ Session expired — send /ott again.",
-                           show_alert=True)
+    if data == "ot:more":
+        await _ott_more_files(client, query)
         return
-    if data.startswith("ot:s:"):
-        # v11.1: tap a movie -> search + download options in this chat.
-        try:
-            idx = int(data.split(":")[2])
-            title = (sess.get("titles") or [])[idx]
-        except (ValueError, IndexError):
-            await query.answer("⚠️ Invalid selection.", show_alert=True)
-            return
-        await _ott_search(client, query, title)
-        return
+
+    # /ott platform pick
     if data.startswith("ot:p:"):
-        try:
-            idx = int(data.split(":")[2])
-            sess["platform"] = sess["platforms"][idx]
-        except (ValueError, IndexError):
-            await query.answer("⚠️ Invalid selection.", show_alert=True)
-            return
-        await query.answer()
-        await _ott_show_platform(client, query, sess, page=0)
-    elif data.startswith("ot:pg:"):
-        try:
-            await _ott_show_platform(client, query, sess,
-                                     page=int(data.split(":")[2]))
-        except ValueError:
-            pass
-        await query.answer()
-    elif data == "ot:back":
-        rows = [[InlineKeyboardButton(
-            clean_text(p.get("title", "?"))[:40],
-            callback_data=f"ot:p:{i}")]
-            for i, p in enumerate(sess["platforms"])]
-        rows.append([InlineKeyboardButton("❌ Close",
-                                          callback_data="ot:x")])
-        try:
-            await query.message.delete()
-        except Exception:  # noqa: BLE001
-            pass
-        sent = await client.send_message(
-            query.message.chat.id, "📺 <b>Select a platform:</b>",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML)
-        _OTT.pop(query.message.id, None)
-        sess["ts"] = time.time()
-        _OTT[sent.id] = sess
-        await query.answer()
-
-
-# -------------------------------------------------------------- /latest ----
-
-_LATEST: dict[int, dict] = {}  # user_id -> {page, total, movies, ts}
-
-
-async def _latest_page(page=1):
-    data = await _fetch_json(f"{BINGED_MOVIES}?page={page}", BINGED_UA)
-    if not data:
-        return [], 1
-    return data.get("data", []), data.get("pagination", {}).get(
-        "total_pages", 1)
-
-
-async def _latest_render(client, chat_id, uid, edit_id=None):
-    _prune(_LATEST)
-    s = _LATEST.get(uid)
-    if not s:
-        return None
-    titles = [clean_text(m.get("title", "Untitled"))[:40]
-              for m in s["movies"][:12]]
-    s["titles"] = titles
-    rows = []
-    for i, t in enumerate(titles):
-        rows.append([InlineKeyboardButton(
-            f"🎬 {t}", callback_data=f"lt:s:{i}")])
-    nav = []
-    if s["page"] > 1:
-        nav.append(InlineKeyboardButton("⬅️ Prev",
-                                        callback_data="lt:pg:prev"))
-    if s["page"] < s["total"]:
-        nav.append(InlineKeyboardButton("Next ➡️",
-                                        callback_data="lt:pg:next"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("❌ Close", callback_data="lt:x")])
-    text = (f"🎬 <b>Latest streaming movies</b>\n"
-            f"<i>Page {s['page']}/{s['total']} — tap a title to search it:</i>")
-    kb = InlineKeyboardMarkup(rows)
-    if edit_id:
-        try:
-            await client.edit_message_text(chat_id, edit_id, text,
-                                           reply_markup=kb,
-                                           parse_mode=ParseMode.HTML,
-                                           disable_web_page_preview=True)
-            return edit_id
-        except Exception:  # noqa: BLE001
-            pass
-    sent = await client.send_message(chat_id, text, reply_markup=kb,
-                                     parse_mode=ParseMode.HTML,
-                                     disable_web_page_preview=True)
-    return sent.id
-
-
-async def latest_cmd(client: Client, message):
-    await track_user(message)
-    if message.from_user and await is_banned(message.from_user.id):
-        return
-    wait = await message.reply_text("🎬 <i>Loading latest movies…</i>",
-                                    parse_mode=ParseMode.HTML)
-    movies, total = await _latest_page(1)
-    if not movies:
-        await wait.edit_text("⚠️ Couldn't load movies. Try again later.")
-        return
-    _prune(_LATEST)
-    _LATEST[message.from_user.id] = {"page": 1, "total": total,
-                                     "movies": movies, "ts": time.time()}
-    try:
-        await wait.delete()
-    except Exception:  # noqa: BLE001
-        pass
-    await _latest_render(client, message.chat.id, message.from_user.id)
-
-
-async def latest_cb(client: Client, query):
-    data = query.data or ""
-    uid = query.from_user.id
-    _prune(_LATEST)
-    s = _LATEST.get(uid)
-    if data == "lt:x":
-        _LATEST.pop(uid, None)
-        try:
-            await query.message.delete()
-        except Exception:  # noqa: BLE001
-            pass
-        await query.answer()
-        return
-    if not s:
-        await query.answer("⚠️ Session expired — send /latest again.",
-                           show_alert=True)
-        return
-    if data.startswith("lt:s:"):
-        # v11.1: tap a movie -> search + download options in this chat.
-        try:
-            idx = int(data.split(":")[2])
-            title = (s.get("titles") or [])[idx]
-        except (ValueError, IndexError):
-            await query.answer("⚠️ Invalid selection.", show_alert=True)
-            return
-        await _ott_search(client, query, title)
-        return
-    if data == "lt:pg:next" and s["page"] < s["total"]:
-        movies, _ = await _latest_page(s["page"] + 1)
-        if movies:
-            s["page"] += 1
-            s["movies"] = movies
-    elif data == "lt:pg:prev" and s["page"] > 1:
-        movies, _ = await _latest_page(s["page"] - 1)
-        if movies:
-            s["page"] -= 1
-            s["movies"] = movies
-    s["ts"] = time.time()
-    await _latest_render(client, query.message.chat.id, uid,
-                         edit_id=query.message.id)
-    await query.answer()
-
-
-# ------------------------------------------------------- /today /upcoming ----
-
-_UPCOMING: dict[str, tuple[float, list]] = {}  # key -> (ts, movies)
-_UP_DETAIL: dict[str, dict] = {}  # f"{uid}:{mid}" -> processed
-
-
-def _upcoming_cached(key="upcoming"):
-    hit = _UPCOMING.get(key)
-    if hit and time.time() - hit[0] < 1800:
-        return hit[1]
-    return None
-
-
-async def _fetch_upcoming(from_date, to_date, limit=50, cache_key="upcoming"):
-    cached = _upcoming_cached(cache_key)
-    if cached is not None:
-        return cached
-    params = {"limit": limit, "from_date": from_date, "to_date": to_date,
-              "content_type": "all", "language": "", "provider": ""}
-    data = await _fetch_json(OTTPLAY_NEW, OTTPLAY_UA, params=params,
-                             timeout=15)
-    movies = []
-    if data:
-        movies = data.get("result") or data.get("data") or []
-    _UPCOMING[cache_key] = (time.time(), movies)
-    return movies
-
-
-def _movie_date(m):
-    d = m.get("release_date")
-    if not d and m.get("where_to_watch"):
-        d = m.get("where_to_watch")[0].get("available_from")
-    return d
-
-
-def _fmt_date(d):
-    if not d:
-        return "N/A"
-    try:
-        return datetime.fromisoformat(
-            d.replace("Z", "+00:00")).strftime("%d %b %Y")
-    except Exception:  # noqa: BLE001
-        return d[:10]
-
-
-async def _process_movie(m):
-    title = clean_text(m.get("name", "Untitled"))
-    year = m.get("release_year")
-    ct = m.get("content_type", "movie")
-    type_str = "Series" if ct != "movie" else "Movie"
-    lang = (m.get("primary_language") or {}).get("logo_text", "")
-    provs = []
-    logos = []
-    for p in m.get("where_to_watch", [])[:4]:
-        prov = p.get("provider", {})
-        pn = prov.get("name")
-        lg = prov.get("logo_url") or prov.get("icon_url")
-        if lg:
-            logos.append(lg)
-        link = p.get("movie_url") or p.get("show_url")
-        if not link and pn and p.get("partner_title_id"):
-            ptid = p.get("partner_title_id")
-            pl = pn.lower()
-            if "netflix" in pl:
-                link = f"https://www.netflix.com/title/{ptid}"
-            elif "zee5" in pl:
-                link = f"https://www.zee5.com/global/content/{ptid}"
-        if link and not link.startswith("http"):
-            link = None
-        if pn:
-            provs.append(f'<a href="{html.escape(link)}">{html.escape(pn)}</a>'
-                         if link else html.escape(pn))
-    tm = await tmdb_mod.get_movie(title, year)
-    rating = (tm.get("rating") if tm else None) or "N/A"
-    plot = (tm.get("plot") if tm else None) or "No description available."
-    posters = m.get("posters", [])
-    return {
-        "title": title, "year": year, "type_str": type_str,
-        "lang": lang, "providers": provs, "provider_logos": logos,
-        "rating": rating, "plot": plot,
-        "r_date": _fmt_date(_movie_date(m)),
-        "poster": posters[0] if posters else (tm.get("poster_url")
-                                              if tm else None),
-        "backdrop": (tm.get("poster_url") if tm else None),
-        "mid": str(m.get("_id", "")),
-    }
-
-
-_UP_LIST: dict[int, dict] = {}  # message_id -> {movies, heading, prefix, uid, ts}
-
-
-async def _detail_card(client, query, d, prefix, notify=True):
-    """Show the detail card by EDITING the list message in place.
-
-    v11.1: stays on the current page (edit_media/edit_text) instead of
-    delete + resend.
-    """
-    msg = query.message
-    text = (f"🔜 <b>{html.escape(d['title'])}</b> · {d['year'] or ''} · "
-            f"<i>{d['type_str']}</i>\n\n")
-    if d["lang"]:
-        text += f"🉑 #{d['lang'].replace(' ', '')}\n"
-    if d["providers"]:
-        text += f"📺 {', '.join(d['providers'][:3])}\n"
-    text += (f"📅 {html.escape(d['r_date'])}\n"
-             f"⭐ {html.escape(str(d['rating']))}\n\n")
-    text += f"<i>{html.escape(d['plot'][:220])}</i>"
-
-    kb_rows = [[InlineKeyboardButton(
-        "⬇️ Download", callback_data=f"{prefix}:q:{d['mid']}")]]
-    if notify:
-        kb_rows.append([InlineKeyboardButton(
-            "🔔 Notify me", callback_data=f"up:n:{d['mid']}")])
-    kb_rows.append([
-        InlineKeyboardButton("🔙 Back", callback_data=f"{prefix}:back"),
-        InlineKeyboardButton("❌ Close", callback_data=f"{prefix}:x"),
-    ])
-    kb = InlineKeyboardMarkup(kb_rows)
-
-    card = None
-    if d["poster"]:
-        try:
-            card = await generate_status_image(
-                d["backdrop"], d["poster"], d["provider_logos"],
-                d["title"], d["year"], d["rating"], "",
-                d["plot"], is_upcoming=True, release_date=d["r_date"])
-        except Exception as exc:  # noqa: BLE001
-            log.debug("card gen failed: %s", exc)
-    try:
-        if card:
-            await msg.edit_media(
-                InputMediaPhoto(card, caption=text,
-                                parse_mode=ParseMode.HTML),
-                reply_markup=kb)
-        elif d["poster"]:
-            await msg.edit_media(
-                InputMediaPhoto(d["poster"], caption=text,
-                                parse_mode=ParseMode.HTML),
-                reply_markup=kb)
-        else:
-            await msg.edit_text(text, reply_markup=kb,
-                                parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True)
-    except Exception:  # noqa: BLE001
-        # Edit failed (e.g. message too old) — fall back to resend.
-        try:
-            await msg.delete()
-        except Exception:  # noqa: BLE001
-            pass
-        if card or d["poster"]:
-            await client.send_photo(msg.chat.id, photo=card or d["poster"],
-                                    caption=text, reply_markup=kb,
-                                    parse_mode=ParseMode.HTML)
-        else:
-            await client.send_message(msg.chat.id, text, reply_markup=kb,
-                                      parse_mode=ParseMode.HTML,
-                                      disable_web_page_preview=True)
-
-
-async def _render_list(client, chat_id, message_id, uid):
-    """(Re)render an upcoming/today list message in place."""
-    _prune(_UP_DETAIL)
-    s = _UP_LIST.get(message_id)
-    if not s or s["uid"] != uid:
-        return False
-    rows = []
-    for m in s["movies"][:25]:
-        t = clean_text(m.get("name", "Untitled"))[:34]
-        ds = _fmt_date(_movie_date(m))
-        mid = str(m.get("_id", ""))
-        rows.append([InlineKeyboardButton(
-            f"{t} ({ds})"[:60],
-            callback_data=f"{s['prefix']}:d:{mid}")])
-    rows.append([InlineKeyboardButton("❌ Close",
-                                      callback_data=f"{s['prefix']}:x")])
-    try:
-        await client.edit_message_text(
-            chat_id, message_id,
-            f"{s['heading']}\n<i>Tap a title for details:</i>",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-async def _list_releases(client, message, movies, heading, prefix, uid):
-    _prune(_UP_DETAIL)
-    _UP_LIST[message.id] = {"movies": movies[:25], "heading": heading,
-                            "prefix": prefix, "uid": uid,
-                            "ts": time.time()}
-    # prune old list sessions
-    for k in [k for k, v in _UP_LIST.items()
-              if time.time() - v.get("ts", 0) > _SESS_TTL]:
-        _UP_LIST.pop(k, None)
-    await _render_list(client, message.chat.id, message.id, uid)
-
-
-async def upcoming_cmd(client: Client, message):
-    await track_user(message)
-    if message.from_user and await is_banned(message.from_user.id):
-        return
-    wait = await message.reply_text("🗓 <i>Fetching upcoming releases…</i>",
-                                    parse_mode=ParseMode.HTML)
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    future = (datetime.now() + timedelta(days=41)).strftime("%Y-%m-%d")
-    movies = await _fetch_upcoming(tomorrow, future)
-    if not movies:
-        await wait.edit_text("🚫 No upcoming releases found.")
-        return
-    movies.sort(key=lambda m: _movie_date(m) or "9999")
-    await _list_releases(client, wait, movies,
-                         "🗓 <b>Upcoming OTT releases</b>", "up",
-                         message.from_user.id)
-
-
-async def today_cmd(client: Client, message):
-    await track_user(message)
-    if message.from_user and await is_banned(message.from_user.id):
-        return
-    wait = await message.reply_text("📅 <i>Checking today's releases…</i>",
-                                    parse_mode=ParseMode.HTML)
-    today = datetime.now().strftime("%Y-%m-%d")
-    movies = await _fetch_upcoming(today, today, cache_key="today")
-    if not movies:
-        await wait.edit_text(
-            "📅 <b>No OTT releases today.</b>\n"
-            "<i>Try /upcoming for what's coming next.</i>",
-            parse_mode=ParseMode.HTML)
-        return
-    await _list_releases(client, wait, movies,
-                         "📅 <b>Releasing today</b>", "td",
-                         message.from_user.id)
-
-
-async def _release_detail(client, query, prefix):
-    data = query.data or ""
-    parts = data.split(":")
-    if len(parts) != 3:
-        return
-    mid = parts[2]
-    uid = query.from_user.id
-    key = f"{uid}:{mid}"
-    _prune(_UP_DETAIL)
-    d = _UP_DETAIL.get(key)
-    if not d:
-        # re-fetch the list (cached 30 min) and find the movie
-        movies = _upcoming_cached("upcoming" if prefix == "up" else "today") or []
-        m = next((x for x in movies if str(x.get("_id")) == mid), None)
-        if not m:
-            # fetch fresh for the right window
-            if prefix == "up":
-                tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-                future = (datetime.now() + timedelta(days=41)).strftime("%Y-%m-%d")
-                movies = await _fetch_upcoming(tomorrow, future,
-                                               cache_key="upcoming")
-            else:
-                today = datetime.now().strftime("%Y-%m-%d")
-                movies = await _fetch_upcoming(today, today,
-                                               cache_key="today")
-            m = next((x for x in movies if str(x.get("_id")) == mid), None)
-        if not m:
-            await query.answer("⚠️ Details expired — run the command again.",
+        s = _OTT.get(query.message.id)
+        if not s or s["uid"] != uid:
+            await query.answer("⌛ Expired — run /ott again.",
                                show_alert=True)
             return
-        await query.answer("⏳ Loading details…")
-        d = await _process_movie(m)
-        d["ts"] = time.time()
-        _UP_DETAIL[key] = d
-    else:
-        await query.answer()
-    await _detail_card(client, query, d, prefix)
-
-
-async def _release_close(client, query, prefix):
-    _UP_LIST.pop(query.message.id, None)
-    try:
-        await query.message.delete()
-    except Exception:  # noqa: BLE001
-        pass
-    await query.answer()
-
-
-async def upcoming_cb(client: Client, query):
-    data = query.data or ""
-    uid = query.from_user.id
-    if data == "up:x":
-        await _release_close(client, query, "up")
+        pid = data.split(":", 2)[2]
+        pname = s["providers"].get(pid, "OTT")
+        await _ott_platform_titles(client, query, pid, pname)
         return
-    if data == "up:back":
-        if await _render_list(client, query.message.chat.id,
-                              query.message.id, uid):
-            await query.answer()
-        else:
-            await query.answer("⚠️ Session expired — send /upcoming again.",
+
+    # generic title-tap: <prefix>:s:<n>  (otp/lt/td)
+    m = re.match(r"^(otp|lt|td):s:(\d+)$", data)
+    if m:
+        prefix, idx = m.group(1), int(m.group(2))
+        store = {"otp": _OTT_T, "lt": _LT, "td": _TD}[prefix]
+        s = store.get(query.message.id)
+        if not s or s["uid"] != uid:
+            await query.answer("⌛ Expired — run the command again.",
                                show_alert=True)
-        return
-    if data.startswith("up:q:"):
-        # v11.1: ⬇️ Download -> search + download options in this chat.
-        mid = data.split(":")[2]
-        d = _UP_DETAIL.get(f"{uid}:{mid}")
-        if not d:
-            await query.answer("⚠️ Session expired.", show_alert=True)
             return
-        await _ott_search(client, query, d["title"])
-        return
-    if data.startswith("up:d:"):
-        await _release_detail(client, query, "up")
-        return
-    if data.startswith("up:n:"):
-        mid = data.split(":")[2]
-        uid = query.from_user.id
-        key = f"{uid}:{mid}"
-        d = _UP_DETAIL.get(key)
-        if not d:
-            await query.answer("⚠️ Session expired.", show_alert=True)
+        items = s["items"]
+        if not 1 <= idx <= len(items):
             return
-        tk = title_key(d["title"])
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as s:
-            from sqlalchemy import select as _select
-            exists = (await s.execute(
-                _select(MovieAlert).where(
-                    MovieAlert.user_id == uid,
-                    MovieAlert.title_key == tk))).scalar_one_or_none()
-            if exists:
-                await query.answer("🔔 Already subscribed!",
-                                   show_alert=True)
-                return
-            s.add(MovieAlert(user_id=uid, title_key=tk,
-                             title=d["title"][:256]))
-            await s.commit()
-        await query.answer(f"✅ You'll be notified when "
-                           f"“{d['title'][:30]}” drops!",
-                           show_alert=True)
-
-
-async def today_cb(client: Client, query):
-    data = query.data or ""
-    uid = query.from_user.id
-    if data == "td:x":
-        await _release_close(client, query, "td")
+        it = items[idx - 1]
+        q = it["title"] + (f" {it['year']}" if it.get("year") else "")
+        await _ott_download_card(client, query, q)
         return
-    if data == "td:back":
-        if await _render_list(client, query.message.chat.id,
-                              query.message.id, uid):
-            await query.answer()
-        else:
-            await query.answer("⚠️ Session expired — send /today again.",
-                               show_alert=True)
+
+    # generic pagination: <prefix>:pg:<page>
+    m = re.match(r"^(otp|lt|td):pg:(\d+)$", data)
+    if m:
+        prefix, page = m.group(1), int(m.group(2))
+        store = {"otp": _OTT_T, "lt": _LT, "td": _TD}[prefix]
+        s = store.get(query.message.id)
+        if not s or s["uid"] != uid:
+            await query.answer("⌛ Expired.", show_alert=True)
+            return
+        back = "ot:back" if prefix == "otp" else None
+        await _edit_list(client, query, store, prefix, page, back)
         return
-    if data.startswith("td:q:"):
-        mid = data.split(":")[2]
-        d = _UP_DETAIL.get(f"{uid}:{mid}")
-        if not d:
-            await query.answer("⚠️ Session expired.", show_alert=True)
-            return
-        await _ott_search(client, query, d["title"])
+
+    # /upcoming title tap -> detail card
+    m = re.match(r"^up:s:(\d+)$", data)
+    if m:
+        await _upcoming_detail(client, query, int(m.group(1)))
         return
-    if data.startswith("td:d:"):
-        await _release_detail(client, query, "td")
-
-
-# ------------------------------------------------- notify-me fan-out ----
-
-async def notify_release_drop(title: str):
-    """DM users who tapped 🔔 Notify me when this title gets indexed.
-
-    Called from the release announcer after a title is announced.
-    Sends a search deep link (user picks their file) — best-effort,
-    never breaks announcing.
-    """
-    try:
-        from sqlalchemy import select as _select
-        tk = title_key(title)
-        factory = get_session_factory(settings.DATABASE_URL)
-        async with factory() as s:
-            rows = (await s.execute(
-                _select(MovieAlert).where(
-                    MovieAlert.title_key == tk))).scalars().all()
-            uids = [r.user_id for r in rows]
-            for r in rows:
-                await s.delete(r)
-            await s.commit()
-        if not uids:
+    m = re.match(r"^up:pg:(\d+)$", data)
+    if m:
+        await _edit_list(client, query, _UP, "up", int(m.group(1)))
+        return
+    m = re.match(r"^up:dl:(\d+)$", data)
+    if m:
+        s = _UP.get(query.message.id)
+        if not s or s["uid"] != uid:
+            await query.answer("⌛ Expired.", show_alert=True)
             return
-        from app.bot import app as bot_app
-        from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-        client = bot_app.bot
-        if not client:
-            return
-        uname = await _username(client)
-        for uid in uids[:200]:  # sanity cap
-            try:
-                kb = None
-                if uname:
-                    kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            "🔍 Search now",
-                            url=search_deep_link(uname, title))]])
-                await client.send_message(
-                    uid,
-                    f"🔔 <b>{html.escape(title)}</b> just dropped on "
-                    f"MooviDex! 🎬",
-                    reply_markup=kb, parse_mode=ParseMode.HTML)
-                await asyncio.sleep(0.4)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("notify drop failed for %d: %s", uid, exc)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("notify_release_drop failed: %s", exc)
+        it = s["items"][int(m.group(1)) - 1]
+        q = it["title"] + (f" {it['year']}" if it.get("year") else "")
+        await _ott_download_card(client, query, q)
+        return
+    m = re.match(r"^up:n:(\d+)$", data)
+    if m:
+        await _upcoming_notify(client, query, int(m.group(1)), True)
+        return
+    m = re.match(r"^up:un:(\d+)$", data)
+    if m:
+        await _upcoming_notify(client, query, int(m.group(1)), False)
+        return
 
+
+# ---------------------------------------------------------------- register
 
 def register(bot: Client) -> None:
-    # NOTE: handlers are registered on the bot INSTANCE here.
-    # Class-level @Client.on_* decorators do NOT register in this bot
-    # (Pyrogram 2.x attaches them to func.handlers for plugin loading,
-    # which we don't use) — that's why v11.0's OTT buttons were dead.
     bot.on_message(filters.command("ott"))(ott_cmd)
     bot.on_message(filters.command("latest"))(latest_cmd)
     bot.on_message(filters.command("today"))(today_cmd)
     bot.on_message(filters.command("upcoming"))(upcoming_cmd)
-    bot.on_callback_query(filters.regex(r"^ot:"))(ott_cb)
-    bot.on_callback_query(filters.regex(r"^lt:"))(latest_cb)
-    bot.on_callback_query(filters.regex(r"^up:"))(upcoming_cb)
-    bot.on_callback_query(filters.regex(r"^td:"))(today_cb)
+    bot.on_callback_query(filters.regex(r"^(ot:|otp:|lt:|td:|up:)"))(ott_cb)
+    # legacy v11.0 prefixes (kept so old buttons don't die silently)
+    bot.on_callback_query(filters.regex(r"^ott_"))(ott_cb)
