@@ -157,10 +157,19 @@ async def _bot_username(client: Client) -> str | None:
 # ---------- helpers ----------
 
 async def _get_group(gid: int) -> Group | None:
+    # v11: hot-cache group rows (60s) — _send_file hits this on every
+    # delivery; a DB round-trip per file is pure latency.
+    from app import state as _state
+    ck = f"grp:{gid}"
+    hit = _state.hot_get(ck)
+    if hit is not None:
+        return hit
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
-        return (await s.execute(
+        g = (await s.execute(
             select(Group).where(Group.id == gid))).scalar_one_or_none()
+    _state.hot_set(ck, g)
+    return g
 
 
 async def _save_group(gid: int, title: str | None,
@@ -181,6 +190,9 @@ async def _save_group(gid: int, title: str | None,
         if mutate:
             g.settings = mutate(dict(g.settings or {}))
         await s.commit()
+        # v11: drop the hot-cache entry so settings changes apply now.
+        from app import state as _state
+        _state.hot_set(f"grp:{gid}", g)
         return g
 
 

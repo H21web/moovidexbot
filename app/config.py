@@ -40,6 +40,10 @@ class Settings(BaseSettings):
 
     # --- Web ---
     WEB_URL: str = ""              # public base URL, e.g. https://moovidex.run.place
+    # v11: bandwidth saver — ON = web "Download" buttons redirect users to
+    # Telegram delivery instead of proxying bytes through this server.
+    # The web player itself still works (explicit user choice).
+    BANDWIDTH_SAVER: bool = True
     WEB_SECRET: str = "change-me"  # signs /watch and /dl tokens
     PORT: int = 8000
     ADMIN_PASSWORD: str = ""       # admin dashboard login (required for /admin)

@@ -19,3 +19,6 @@ pydantic>=2.6
 pydantic-settings>=2.2
 httpx>=0.27
 simple-justwatch-python-api>=1.4.0  # direct JustWatch GraphQL (posters/search)
+
+# v11: OTT status cards (/upcoming, /today)
+Pillow>=10.0

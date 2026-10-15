@@ -758,11 +758,48 @@ async def _rfilter(client: Client, query) -> None:
     data["filters"] = new_filters
     await render_v8_results(client, query.message, token, uid, 0)
 
+
+async def _dlhelp(client: Client, query):
+    """v11 bandwidth saver: the file is already in this chat — explain
+    why re-downloading via the web server is pointless."""
+    await query.answer(
+        "👆 Your file is right above — download it directly from "
+        "Telegram, it's faster and saves server bandwidth ❤",
+        show_alert=True)
+
+
+async def _v8view(client: Client, query):
+    """v11: toggle search results between list view and button view."""
+    from app import personalize
+    uid = query.from_user.id
+    try:
+        _, token, view = query.data.split(":")
+    except ValueError:
+        return
+    if view not in ("list", "buttons"):
+        return
+    data = state.v8_get(token)
+    if not data or (not data.get("group") and data.get("user_id") != uid):
+        await query.answer("⌛ Results expired — search again.",
+                           show_alert=True)
+        return
+    await personalize.set_manual_pref(uid, "result_view", view)
+    try:
+        await render_v8_results(client, query.message, token, uid,
+                                page=data.get("page", 0))
+    except Exception:
+        pass
+    await query.answer("🔲 Button view" if view == "buttons"
+                       else "📋 List view")
+
+
 def register(bot: Client) -> None:
     bot.on_callback_query(filters.regex(r"^pg:"))(_pg)
     bot.on_callback_query(filters.regex(r"^mv:"))(_movie)
     bot.on_callback_query(filters.regex(r"^bk:"))(_back)
     bot.on_callback_query(filters.regex(r"^dl:"))(_deliver)
+    bot.on_callback_query(filters.regex(r"^dlhelp:"))(_dlhelp)
+    bot.on_callback_query(filters.regex(r"^v8v:"))(_v8view)
     bot.on_callback_query(filters.regex(r"^fsub_retry$"))(_fsub_retry)
     bot.on_callback_query(filters.regex(r"^ait:"))(_ait)
     bot.on_callback_query(filters.regex(r"^ais:"))(_ais)

@@ -93,6 +93,7 @@ def sort_best_first(files: list[dict]) -> list[dict]:
 def v8_file_kb(file_db_id: int, user_id: int):
     """Tech VJ style file buttons: Play (web app) + Download (direct link)."""
     from app.web.tokens import dl_url, watch_url
+    from app.config import settings as _settings
     rows = []
     w = watch_url(file_db_id, user_id)
     d = dl_url(file_db_id, user_id)
@@ -100,7 +101,14 @@ def v8_file_kb(file_db_id: int, user_id: int):
     if w:
         row.append(InlineKeyboardButton("▶ Play", web_app=WebAppInfo(url=w)))
     if d:
-        row.append(InlineKeyboardButton("⬇ Download", url=d))
+        # v11 bandwidth saver (default ON): the file is ALREADY in this
+        # chat — re-downloading it through the web server burns server
+        # bandwidth for zero benefit. The button explains that instead.
+        if getattr(_settings, "BANDWIDTH_SAVER", True):
+            row.append(InlineKeyboardButton(
+                "⬇ Download", callback_data=f"dlhelp:{file_db_id}"))
+        else:
+            row.append(InlineKeyboardButton("⬇ Download", url=d))
     if row:
         rows.append(row)
     if not rows:
@@ -173,7 +181,8 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
                     page: int, pages: int, total: int,
                     filters: dict, user_id: int,
                     ai_note: str | None = None,
-                    bot_username: str | None = None) -> str:
+                    bot_username: str | None = None,
+                    view: str = "list") -> str:
     parts: list[str] = []
     if meta:
         icon = kind_icon(meta)
@@ -229,7 +238,8 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
                  "</blockquote>")
     parts.append("")
     # v8.1: no other files besides the best pick -> skip the list section.
-    if files:
+    # v11: button view — files render as tappable buttons, not text.
+    if files and view == "list":
         flt = " · ".join(
             f"{dict(V8_FILTERS).get(k, k)}: {v}" for k, v in filters.items() if v)
         head = f"📋 <b>All files ({total})</b>"
@@ -241,6 +251,8 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
         for i, f in enumerate(files, start=start + 1):
             parts.append(_v8_file_line(i, f, user_id, bot_username))
             parts.append("")  # v10.10.2: breathing room between files
+    elif files:
+        parts.append(f"👇 <b>Tap a file to get it</b> ({total}):")
     text = "\n".join(parts)
     # Telegram hard limit: 4096 chars. Never cut mid-HTML-tag (Telegram
     # rejects the edit) — cut back to the last complete ">" before the
@@ -251,11 +263,32 @@ def v8_results_text(meta: dict | None, best: dict, files: list[dict],
     return text
 
 
+def _v8_file_btn_label(f: dict) -> str:
+    """Compact label for button view: '🎬 Name (1080p · 1.2 GB)'."""
+    from app.textutil import clean_display_name
+    name = clean_display_name(f.get("file_name") or "file")
+    bits = [x for x in (f.get("quality"), f.get("language")) if x]
+    size = fmt_size(f.get("file_size"))
+    if size:
+        bits.append(size)
+    suffix = f" ({' · '.join(bits)})" if bits else ""
+    label = f"{kind_icon(file_name=name)} {name}{suffix}"
+    return label[:60]
+
+
 def v8_results_kb(token: str, user_id: int,
-                  page: int, pages: int, filters: dict):
+                  page: int, pages: int, filters: dict,
+                  view: str = "list", files: list | None = None):
     rows: list[list] = []
     # v10.4: no Play / Download buttons on the result card — files are
     # delivered in Telegram when a quality button is tapped.
+    # v11: button view — one tappable button per file (zero-bandwidth
+    # in-Telegram delivery via the dl: callback).
+    if view == "buttons" and files:
+        for f in files:
+            rows.append([InlineKeyboardButton(
+                _v8_file_btn_label(f),
+                callback_data=f"dl:{f['id']}")])
     # Pagination.
     if pages > 1:
         prow: list = []
@@ -279,6 +312,13 @@ def v8_results_kb(token: str, user_id: int,
             frow = []
     if frow:
         rows.append(frow)
+    # v11: view toggle.
+    if view == "buttons":
+        rows.append([InlineKeyboardButton(
+            "📋 List view", callback_data=f"v8v:{token}:list")])
+    else:
+        rows.append([InlineKeyboardButton(
+            "🔲 Button view", callback_data=f"v8v:{token}:buttons")])
     return InlineKeyboardMarkup(rows)
 
 

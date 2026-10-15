@@ -230,6 +230,14 @@ async def trigger_update_if_new(client, title: str,
                                     ctitle):
             return  # duplicate — already announced
 
+        # v11: "notify me" fan-out for /upcoming subscribers.
+        try:
+            from app.bot.handlers.ott import notify_release_drop
+            asyncio.create_task(notify_release_drop(ctitle),
+                                name=f"notify-drop-{tkey[:32]}")
+        except Exception:  # noqa: BLE001
+            pass
+
         # 4. send the card in the background
         asyncio.create_task(
             send_update(client, ctitle, int(eff_year), language, meta),

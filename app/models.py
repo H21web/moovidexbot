@@ -351,3 +351,25 @@ class NotifiedTitle(Base):
     announced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class MovieAlert(Base):
+    """v11: "Notify me" subscriptions from /upcoming.
+
+    When a newly indexed file's title matches ``title_key``, the bot DMs
+    the user. Rows are deleted after firing (one-shot).
+    Lives on the primary DB (settings DB), not the file shards.
+    """
+
+    __tablename__ = "movie_alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True,
+                                    autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True,
+                                         nullable=False)
+    title_key: Mapped[str] = mapped_column(String(128), index=True,
+                                           nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

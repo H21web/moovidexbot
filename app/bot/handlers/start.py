@@ -39,6 +39,11 @@ HELP_TEXT = (
     "See what everyone is searching this week.\n\n"
     "🎞 <b>Request</b>\n"
     "<code>/request Movie Name 2024</code> — we'll try to add it.\n\n"
+    "📺 <b>OTT Discovery</b>\n"
+    "<code>/ott</code> — browse what's streaming by platform\n"
+    "<code>/latest</code> — latest streaming movies\n"
+    "<code>/today</code> — releasing today\n"
+    "<code>/upcoming</code> — coming soon (🔔 notify me!)\n\n"
     "👤 <b>My Account</b>\n"
     "Your stats, saved files and taste preferences.\n\n"
     "💡 <b>Tip:</b> the more you download, the smarter your "
@@ -321,10 +326,14 @@ async def _acc_cb(client: Client, query):
     if action == "set":
         key = parts[2] if len(parts) > 2 else ""
         val = parts[3] if len(parts) > 3 else ""
-        if key in ("language", "quality"):
+        if key in ("language", "quality", "view"):
             from app import personalize
+            if key == "view" and val not in ("list", "buttons"):
+                await query.answer("⚠️ Invalid view.", show_alert=True)
+                return
             await personalize.set_manual_pref(
-                uid, key, None if val == "auto" else val)
+                uid, "result_view" if key == "view" else key,
+                None if val == "auto" else val)
             await query.answer(f"✅ {key.title()}: "
                                f"{val if val != 'auto' else 'Auto'}")
         text, kb = await _prefs_panel(uid)
@@ -332,6 +341,25 @@ async def _acc_cb(client: Client, query):
             await query.message.edit_text(text, reply_markup=kb,
                                           parse_mode=ParseMode.HTML,
                                           disable_web_page_preview=True)
+        except Exception:
+            pass
+        return
+    if action == "view":
+        await query.answer()
+        from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 List view",
+                                  callback_data="acc:set:view:list"),
+             InlineKeyboardButton("🔲 Button view",
+                                  callback_data="acc:set:view:buttons")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="acc:prefs")],
+        ])
+        try:
+            await query.message.edit_text(
+                "🖥 <b>Results view</b>\n\n"
+                "📋 <b>List</b> — file names as text, tap to get.\n"
+                "🔲 <b>Buttons</b> — one tappable button per file.",
+                reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception:
             pass
         return
@@ -395,6 +423,7 @@ async def _prefs_panel(uid: int):
     manual = prefs.get("manual") or {}
     m_lang = manual.get("language")
     m_qual = manual.get("quality")
+    m_view = manual.get("result_view") or "list"
 
     def fmt(cat: str, mval):
         if mval:
@@ -404,14 +433,17 @@ async def _prefs_panel(uid: int):
             return "<i>learning…</i>"
         return ", ".join(f"{ui.esc(k)} ({v})" for k, v in top)
 
+    view_label = "🔲 Buttons" if m_view == "buttons" else "📋 List"
     text = ("🎨 <b>Your Taste</b>\n\n"
             f"🌐 Language: {fmt('language', m_lang)}\n"
-            f"🎞 Quality: {fmt('quality', m_qual)}\n\n"
+            f"🎞 Quality: {fmt('quality', m_qual)}\n"
+            f"🖥 Results view: {view_label}\n\n"
             "<i>Results rank themselves by your taste as you download. "
             "Set a preference to lock it in.</i>")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 Language", callback_data="acc:lang"),
          InlineKeyboardButton("🎞 Quality", callback_data="acc:qual")],
+        [InlineKeyboardButton("🖥 Results view", callback_data="acc:view")],
         [InlineKeyboardButton("⬅️ Back", callback_data="acc")],
     ])
     return text, kb

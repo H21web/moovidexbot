@@ -189,6 +189,16 @@ async def _ai_suggest(client: Client, wait: Message, uid: int,
     return True
 
 
+async def _result_view(uid: int) -> str:
+    """v11: per-user results view — 'buttons' or 'list' (default)."""
+    try:
+        prefs = await personalize.get_prefs(uid)
+        v = (prefs.get("manual") or {}).get("result_view")
+        return "buttons" if v == "buttons" else "list"
+    except Exception:
+        return "list"
+
+
 async def _build_v8(client: Client, token: str,
                   uid: int, page: int = 0) -> tuple[str, object] | tuple[None, None]:
     """Build the (text, keyboard) for a v8 results session.
@@ -201,6 +211,7 @@ async def _build_v8(client: Client, token: str,
         return None, None
     if not data.get("group") and data.get("user_id") != uid:
         return None, None
+    view = await _result_view(uid)
     files = v8_ui.apply_v8_filters(data["files"], data.get("filters") or {})
     best = data["best"]
     rest = [f for f in files if f.get("id") != best.get("id")]
@@ -212,12 +223,14 @@ async def _build_v8(client: Client, token: str,
     username = await _get_bot_username(client)
     text = v8_ui.v8_results_text(
         data.get("meta"), best, chunk, page, pages, len(rest),
-        data.get("filters") or {}, uid, data.get("ai_note"), username)
+        data.get("filters") or {}, uid, data.get("ai_note"), username,
+        view=view)
     if data.get("corrected"):
         text = (f"🔤 Showing results for "
                 f"<b>{ui.esc(data['corrected'])}</b>\n\n" + text)
     kb = v8_ui.v8_results_kb(token, uid, page, pages,
-                             data.get("filters") or {})
+                             data.get("filters") or {},
+                             view=view, files=chunk)
     data["page"] = page
     return text, kb
 
@@ -662,6 +675,8 @@ def register(bot: Client) -> None:
                                          "users", "settings", "requests",
                                          "connect", "groups", "cancel",
                                          "saved", "mystats", "admin",
-                                         "deltimer", "dbcheck", "debug", "ping"])
+                                         "deltimer", "dbcheck", "debug",
+                                         "ott", "latest", "today",
+                                         "upcoming"])
         & ~filters.channel
     )(_on_text)

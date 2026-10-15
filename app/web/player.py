@@ -61,6 +61,51 @@ _bot_username: str | None = None
 _bot_username_failed = False
 
 
+# v11 bandwidth saver: files at/below the Bot API download cap are
+# served with a 302 to Telegram's own file servers instead of being
+# proxied through this server (zero Render bandwidth).
+_BOTAPI_MAX_BYTES = 20 * 1024 * 1024
+_tgfile_cache: dict[str, tuple[float, str | None]] = {}
+_TGFILE_TTL = 3600
+
+
+async def _tg_direct_url(file_id: str) -> str | None:
+    """Bot API file URL for small files (None = use the MTProto proxy).
+
+    ``getFile`` + the ``/file/bot<token>/`` URL are served by Telegram
+    itself — the bytes never touch this server. Result cached 1h.
+    """
+    import time as _time
+
+    import httpx
+
+    token = settings.BOT_TOKEN
+    if not token:
+        return None
+    hit = _tgfile_cache.get(file_id)
+    if hit and _time.time() - hit[0] < _TGFILE_TTL:
+        return hit[1]
+    url = None
+    try:
+        async with httpx.AsyncClient(timeout=15) as hc:
+            r = await hc.post(
+                f"https://api.telegram.org/bot{token}/getFile",
+                json={"file_id": file_id})
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("ok"):
+                    path = (j.get("result") or {}).get("file_path")
+                    if path:
+                        url = (f"https://api.telegram.org/file/bot{token}/"
+                               f"{path}")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("getFile redirect failed: %s", exc)
+    if len(_tgfile_cache) > 2000:
+        _tgfile_cache.clear()
+    _tgfile_cache[file_id] = (_time.time(), url)
+    return url
+
+
 def _template() -> str:
     global _watch_template
     if _watch_template is None:
@@ -266,6 +311,11 @@ async def watch(token: str, request: Request):
 
     username = _BOT_USERNAME_ENV or await _bot_username()
     bot_url = f"https://telegram.me/{username}" if username else "#"
+    # v11: "Get in Telegram" deep link — delivers this exact file via the
+    # bot (zero server bandwidth, no buffering).
+    _tok = parse_watch_token(token) or {}
+    tg_dl_url = (f"https://t.me/{username}?start=dl_{_tok['f']}"
+                 if username and _tok.get("f") else bot_url)
 
     html_page = _template().replace("__TITLE__", escape(name))
     # JS-string-safe filename: a full JSON string literal is valid JS.
@@ -285,7 +335,8 @@ async def watch(token: str, request: Request):
                  .replace("__LANGUAGE__", escape(language))
                  .replace("__FORMAT__", escape(fmt))
                  .replace("__POSTER__", escape(poster))
-                 .replace("__FILENAME_JSON__", js_name))
+                 .replace("__FILENAME_JSON__", js_name)
+                 .replace("__TG_DL_URL__", tg_dl_url))
     return HTMLResponse(html_page,
                         headers={"Cache-Control": "no-store",
                                  "X-Content-Type-Options": "nosniff"})
@@ -695,6 +746,14 @@ async def download(token: str, request: Request):
     size = f.file_size or 0
     if size <= 0:
         raise HTTPException(404, "unknown file size")
+
+    # v11 bandwidth saver: small files are 302-redirected to Telegram's
+    # own file servers — zero bytes through this server. Falls back to
+    # the MTProto proxy when the Bot API can't serve the file.
+    if size <= _BOTAPI_MAX_BYTES:
+        tg_url = await _tg_direct_url(f.file_id)
+        if tg_url:
+            return Response(status_code=302, headers={"Location": tg_url})
 
     etag = _etag(f, size)
     range_header = request.headers.get("range")
