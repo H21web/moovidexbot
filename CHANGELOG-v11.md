@@ -1,8 +1,21 @@
-# MooviDex v11 — "Bandwidth Saver" release
+# MooviDex v11.1 — "Bandwidth Saver" release
 
 Built on v10.15.10. Full deployable tree.
 
-## 🌐 Bandwidth fixes (the big one)
+## 🐛 v11.1 hotfix (2026-10-15)
+
+- **OTT buttons dead on arrival — FIXED.** The OTT module used
+  class-level `@Client.on_*` decorators, which Pyrogram 2.x silently
+  ignores outside plugin loading. All 8 handlers now register on the
+  bot instance.
+- **One-tap download.** Tapping a movie in `/ott`, `/latest`,
+  `/today`, `/upcoming` now runs the search **in the current chat**
+  and shows the results card with download options — no more
+  deep-link round-trip to PM.
+- **Stays on the current page.** Detail cards edit the list message
+  in place (with 🔙 Back), instead of delete + resend.
+
+## 🌐 Bandwidth fixes
 
 The web player used to proxy **every byte** through Render
 (Telegram → Render → user). v11 cuts that hard:

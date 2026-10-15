@@ -23,9 +23,11 @@ from pyrogram.enums import ParseMode
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
 )
 
-from app import tmdb as tmdb_mod
+from app import state, tmdb as tmdb_mod
+from app.bot import forcesub
 from app.bot.handlers.common import is_banned, track_user
 from app.config import settings
 from app.db import get_session_factory
@@ -118,6 +120,38 @@ def _close_kb(cb: str):
         [[InlineKeyboardButton("❌ Close", callback_data=cb)]])
 
 
+async def _ott_search(client: Client, query, title: str):
+    """v11.1: one-tap download — run the bot search IN this chat.
+
+    Shows the v8 results card with download options right here instead
+    of deep-linking out to PM.
+    """
+    from app.bot.handlers.search import _search_and_send
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
+    title = (title or "").strip()
+    if not title:
+        await query.answer("⚠️ No title.", show_alert=True)
+        return
+    kb = await forcesub.ensure_joined(client, uid, chat_id=chat_id)
+    if kb:
+        state.pending_search[uid] = title
+        from app.bot.handlers.callbacks import send_join_prompt
+        await send_join_prompt(client, query.message, uid, kb,
+                               chat_id=chat_id)
+        await query.answer()
+        return
+    await query.answer("🔍 Searching…")
+    try:
+        sent = await _search_and_send(client, chat_id, uid, title)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ott search failed for %r: %s", title, exc)
+        sent = None
+    if not sent:
+        await query.answer("❌ No files found for this title yet.",
+                           show_alert=True)
+
+
 # ---------------------------------------------------------------- /ott ----
 
 _OTT: dict[int, dict] = {}  # message_id -> session
@@ -130,7 +164,6 @@ async def _ott_platforms():
     return list(data.values())
 
 
-@Client.on_message(filters.command("ott"))
 async def ott_cmd(client: Client, message):
     await track_user(message)
     if message.from_user and await is_banned(message.from_user.id):
@@ -161,16 +194,12 @@ async def _ott_show_platform(client, query, sess, page=0):
     per, pages = 8, max(1, -(-len(movies) // 8))
     page = max(0, min(page, pages - 1))
     chunk = movies[page * per:(page + 1) * per]
-    uname = await _username(client)
+    sess["titles"] = [clean_text(m.get("title", "Untitled"))[:40]
+                      for m in chunk]
     rows = []
-    for m in chunk:
-        mt = clean_text(m.get("title", "Untitled"))[:40]
-        if uname:
-            rows.append([InlineKeyboardButton(
-                f"🎬 {mt}", url=search_deep_link(uname, mt))])
-        else:
-            rows.append([InlineKeyboardButton(f"🎬 {mt}",
-                                              callback_data="ot:noop")])
+    for i, mt in enumerate(sess["titles"]):
+        rows.append([InlineKeyboardButton(
+            f"🎬 {mt}", callback_data=f"ot:s:{i}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev",
@@ -212,13 +241,9 @@ async def _ott_show_platform(client, query, sess, page=0):
     _OTT[sent.id] = sess
 
 
-@Client.on_callback_query(filters.regex(r"^ot:"))
 async def ott_cb(client: Client, query):
     data = query.data or ""
     _prune(_OTT)
-    if data == "ot:noop":
-        await query.answer()
-        return
     if data == "ot:x":
         _OTT.pop(query.message.id, None)
         try:
@@ -231,6 +256,16 @@ async def ott_cb(client: Client, query):
     if not sess or sess["uid"] != query.from_user.id:
         await query.answer("⚠️ Session expired — send /ott again.",
                            show_alert=True)
+        return
+    if data.startswith("ot:s:"):
+        # v11.1: tap a movie -> search + download options in this chat.
+        try:
+            idx = int(data.split(":")[2])
+            title = (sess.get("titles") or [])[idx]
+        except (ValueError, IndexError):
+            await query.answer("⚠️ Invalid selection.", show_alert=True)
+            return
+        await _ott_search(client, query, title)
         return
     if data.startswith("ot:p:"):
         try:
@@ -287,13 +322,13 @@ async def _latest_render(client, chat_id, uid, edit_id=None):
     s = _LATEST.get(uid)
     if not s:
         return None
-    uname = await _username(client)
+    titles = [clean_text(m.get("title", "Untitled"))[:40]
+              for m in s["movies"][:12]]
+    s["titles"] = titles
     rows = []
-    for m in s["movies"][:12]:
-        t = clean_text(m.get("title", "Untitled"))[:40]
-        if uname:
-            rows.append([InlineKeyboardButton(
-                f"🎬 {t}", url=search_deep_link(uname, t))])
+    for i, t in enumerate(titles):
+        rows.append([InlineKeyboardButton(
+            f"🎬 {t}", callback_data=f"lt:s:{i}")])
     nav = []
     if s["page"] > 1:
         nav.append(InlineKeyboardButton("⬅️ Prev",
@@ -322,7 +357,6 @@ async def _latest_render(client, chat_id, uid, edit_id=None):
     return sent.id
 
 
-@Client.on_message(filters.command("latest"))
 async def latest_cmd(client: Client, message):
     await track_user(message)
     if message.from_user and await is_banned(message.from_user.id):
@@ -343,7 +377,6 @@ async def latest_cmd(client: Client, message):
     await _latest_render(client, message.chat.id, message.from_user.id)
 
 
-@Client.on_callback_query(filters.regex(r"^lt:"))
 async def latest_cb(client: Client, query):
     data = query.data or ""
     uid = query.from_user.id
@@ -360,6 +393,16 @@ async def latest_cb(client: Client, query):
     if not s:
         await query.answer("⚠️ Session expired — send /latest again.",
                            show_alert=True)
+        return
+    if data.startswith("lt:s:"):
+        # v11.1: tap a movie -> search + download options in this chat.
+        try:
+            idx = int(data.split(":")[2])
+            title = (s.get("titles") or [])[idx]
+        except (ValueError, IndexError):
+            await query.answer("⚠️ Invalid selection.", show_alert=True)
+            return
+        await _ott_search(client, query, title)
         return
     if data == "lt:pg:next" and s["page"] < s["total"]:
         movies, _ = await _latest_page(s["page"] + 1)
@@ -465,28 +508,35 @@ async def _process_movie(m):
     }
 
 
-async def _detail_card(client, chat_id, uid, d, edit_id=None,
-                       notify=True):
-    uname = await _username(client)
-    msg = (f"🔜 <b>{html.escape(d['title'])}</b> · {d['year'] or ''} · "
-           f"<i>{d['type_str']}</i>\n\n")
-    if d["lang"]:
-        msg += f"🉑 #{d['lang'].replace(' ', '')}\n"
-    if d["providers"]:
-        msg += f"📺 {', '.join(d['providers'][:3])}\n"
-    msg += f"📅 {html.escape(d['r_date'])}\n⭐ {html.escape(str(d['rating']))}\n\n"
-    msg += f"<i>{html.escape(d['plot'][:220])}</i>"
+_UP_LIST: dict[int, dict] = {}  # message_id -> {movies, heading, prefix, uid, ts}
 
-    kb_rows = []
-    if uname:
-        kb_rows.append([InlineKeyboardButton(
-            "🔍 Search this title",
-            url=search_deep_link(uname, d["title"]))])
+
+async def _detail_card(client, query, d, prefix, notify=True):
+    """Show the detail card by EDITING the list message in place.
+
+    v11.1: stays on the current page (edit_media/edit_text) instead of
+    delete + resend.
+    """
+    msg = query.message
+    text = (f"🔜 <b>{html.escape(d['title'])}</b> · {d['year'] or ''} · "
+            f"<i>{d['type_str']}</i>\n\n")
+    if d["lang"]:
+        text += f"🉑 #{d['lang'].replace(' ', '')}\n"
+    if d["providers"]:
+        text += f"📺 {', '.join(d['providers'][:3])}\n"
+    text += (f"📅 {html.escape(d['r_date'])}\n"
+             f"⭐ {html.escape(str(d['rating']))}\n\n")
+    text += f"<i>{html.escape(d['plot'][:220])}</i>"
+
+    kb_rows = [[InlineKeyboardButton(
+        "⬇️ Download", callback_data=f"{prefix}:q:{d['mid']}")]]
     if notify:
         kb_rows.append([InlineKeyboardButton(
             "🔔 Notify me", callback_data=f"up:n:{d['mid']}")])
-    kb_rows.append([InlineKeyboardButton("❌ Close",
-                                         callback_data="up:x")])
+    kb_rows.append([
+        InlineKeyboardButton("🔙 Back", callback_data=f"{prefix}:back"),
+        InlineKeyboardButton("❌ Close", callback_data=f"{prefix}:x"),
+    ])
     kb = InlineKeyboardMarkup(kb_rows)
 
     card = None
@@ -499,41 +549,75 @@ async def _detail_card(client, chat_id, uid, d, edit_id=None,
         except Exception as exc:  # noqa: BLE001
             log.debug("card gen failed: %s", exc)
     try:
-        if edit_id:
-            await client.delete_messages(chat_id, edit_id)
+        if card:
+            await msg.edit_media(
+                InputMediaPhoto(card, caption=text,
+                                parse_mode=ParseMode.HTML),
+                reply_markup=kb)
+        elif d["poster"]:
+            await msg.edit_media(
+                InputMediaPhoto(d["poster"], caption=text,
+                                parse_mode=ParseMode.HTML),
+                reply_markup=kb)
+        else:
+            await msg.edit_text(text, reply_markup=kb,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True)
     except Exception:  # noqa: BLE001
-        pass
-    if card:
-        return await client.send_photo(chat_id, photo=card, caption=msg,
-                                       reply_markup=kb,
-                                       parse_mode=ParseMode.HTML)
-    if d["poster"]:
-        return await client.send_photo(chat_id, photo=d["poster"],
-                                       caption=msg, reply_markup=kb,
-                                       parse_mode=ParseMode.HTML)
-    return await client.send_message(chat_id, msg, reply_markup=kb,
-                                     parse_mode=ParseMode.HTML,
-                                     disable_web_page_preview=True)
+        # Edit failed (e.g. message too old) — fall back to resend.
+        try:
+            await msg.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        if card or d["poster"]:
+            await client.send_photo(msg.chat.id, photo=card or d["poster"],
+                                    caption=text, reply_markup=kb,
+                                    parse_mode=ParseMode.HTML)
+        else:
+            await client.send_message(msg.chat.id, text, reply_markup=kb,
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
 
 
-async def _list_releases(client, message, movies, heading, prefix):
+async def _render_list(client, chat_id, message_id, uid):
+    """(Re)render an upcoming/today list message in place."""
     _prune(_UP_DETAIL)
+    s = _UP_LIST.get(message_id)
+    if not s or s["uid"] != uid:
+        return False
     rows = []
-    for m in movies[:25]:
+    for m in s["movies"][:25]:
         t = clean_text(m.get("name", "Untitled"))[:34]
         ds = _fmt_date(_movie_date(m))
         mid = str(m.get("_id", ""))
         rows.append([InlineKeyboardButton(
-            f"{t} ({ds})"[:60], callback_data=f"{prefix}:d:{mid}")])
+            f"{t} ({ds})"[:60],
+            callback_data=f"{s['prefix']}:d:{mid}")])
     rows.append([InlineKeyboardButton("❌ Close",
-                                      callback_data=f"{prefix}:x")])
-    await message.edit_text(
-        f"{heading}\n<i>Tap a title for details:</i>",
-        reply_markup=InlineKeyboardMarkup(rows),
-        parse_mode=ParseMode.HTML)
+                                      callback_data=f"{s['prefix']}:x")])
+    try:
+        await client.edit_message_text(
+            chat_id, message_id,
+            f"{s['heading']}\n<i>Tap a title for details:</i>",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
-@Client.on_message(filters.command("upcoming"))
+async def _list_releases(client, message, movies, heading, prefix, uid):
+    _prune(_UP_DETAIL)
+    _UP_LIST[message.id] = {"movies": movies[:25], "heading": heading,
+                            "prefix": prefix, "uid": uid,
+                            "ts": time.time()}
+    # prune old list sessions
+    for k in [k for k, v in _UP_LIST.items()
+              if time.time() - v.get("ts", 0) > _SESS_TTL]:
+        _UP_LIST.pop(k, None)
+    await _render_list(client, message.chat.id, message.id, uid)
+
+
 async def upcoming_cmd(client: Client, message):
     await track_user(message)
     if message.from_user and await is_banned(message.from_user.id):
@@ -548,10 +632,10 @@ async def upcoming_cmd(client: Client, message):
         return
     movies.sort(key=lambda m: _movie_date(m) or "9999")
     await _list_releases(client, wait, movies,
-                         "🗓 <b>Upcoming OTT releases</b>", "up")
+                         "🗓 <b>Upcoming OTT releases</b>", "up",
+                         message.from_user.id)
 
 
-@Client.on_message(filters.command("today"))
 async def today_cmd(client: Client, message):
     await track_user(message)
     if message.from_user and await is_banned(message.from_user.id):
@@ -567,7 +651,8 @@ async def today_cmd(client: Client, message):
             parse_mode=ParseMode.HTML)
         return
     await _list_releases(client, wait, movies,
-                         "📅 <b>Releasing today</b>", "td")
+                         "📅 <b>Releasing today</b>", "td",
+                         message.from_user.id)
 
 
 async def _release_detail(client, query, prefix):
@@ -606,19 +691,40 @@ async def _release_detail(client, query, prefix):
         _UP_DETAIL[key] = d
     else:
         await query.answer()
-    await _detail_card(client, query.message.chat.id, uid, d,
-                       edit_id=query.message.id)
+    await _detail_card(client, query, d, prefix)
 
 
-@Client.on_callback_query(filters.regex(r"^up:"))
+async def _release_close(client, query, prefix):
+    _UP_LIST.pop(query.message.id, None)
+    try:
+        await query.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    await query.answer()
+
+
 async def upcoming_cb(client: Client, query):
     data = query.data or ""
+    uid = query.from_user.id
     if data == "up:x":
-        try:
-            await query.message.delete()
-        except Exception:  # noqa: BLE001
-            pass
-        await query.answer()
+        await _release_close(client, query, "up")
+        return
+    if data == "up:back":
+        if await _render_list(client, query.message.chat.id,
+                              query.message.id, uid):
+            await query.answer()
+        else:
+            await query.answer("⚠️ Session expired — send /upcoming again.",
+                               show_alert=True)
+        return
+    if data.startswith("up:q:"):
+        # v11.1: ⬇️ Download -> search + download options in this chat.
+        mid = data.split(":")[2]
+        d = _UP_DETAIL.get(f"{uid}:{mid}")
+        if not d:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+        await _ott_search(client, query, d["title"])
         return
     if data.startswith("up:d:"):
         await _release_detail(client, query, "up")
@@ -651,19 +757,29 @@ async def upcoming_cb(client: Client, query):
                            show_alert=True)
 
 
-@Client.on_callback_query(filters.regex(r"^td:"))
 async def today_cb(client: Client, query):
     data = query.data or ""
+    uid = query.from_user.id
     if data == "td:x":
-        try:
-            await query.message.delete()
-        except Exception:  # noqa: BLE001
-            pass
-        await query.answer()
+        await _release_close(client, query, "td")
+        return
+    if data == "td:back":
+        if await _render_list(client, query.message.chat.id,
+                              query.message.id, uid):
+            await query.answer()
+        else:
+            await query.answer("⚠️ Session expired — send /today again.",
+                               show_alert=True)
+        return
+    if data.startswith("td:q:"):
+        mid = data.split(":")[2]
+        d = _UP_DETAIL.get(f"{uid}:{mid}")
+        if not d:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+        await _ott_search(client, query, d["title"])
         return
     if data.startswith("td:d:"):
-        # reuse the upcoming detail machinery (no notify button dup)
-        query.data = "up:d:" + data.split(":")[2]
         await _release_detail(client, query, "td")
 
 
@@ -717,7 +833,15 @@ async def notify_release_drop(title: str):
 
 
 def register(bot: Client) -> None:
+    # NOTE: handlers are registered on the bot INSTANCE here.
+    # Class-level @Client.on_* decorators do NOT register in this bot
+    # (Pyrogram 2.x attaches them to func.handlers for plugin loading,
+    # which we don't use) — that's why v11.0's OTT buttons were dead.
     bot.on_message(filters.command("ott"))(ott_cmd)
     bot.on_message(filters.command("latest"))(latest_cmd)
     bot.on_message(filters.command("today"))(today_cmd)
     bot.on_message(filters.command("upcoming"))(upcoming_cmd)
+    bot.on_callback_query(filters.regex(r"^ot:"))(ott_cb)
+    bot.on_callback_query(filters.regex(r"^lt:"))(latest_cb)
+    bot.on_callback_query(filters.regex(r"^up:"))(upcoming_cb)
+    bot.on_callback_query(filters.regex(r"^td:"))(today_cb)
